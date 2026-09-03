@@ -64,6 +64,18 @@ export function wholeShillingsSigned(name: string, column: unknown) {
 }
 
 /**
+ * Divisible by 100 and strictly positive — for payments.
+ *
+ * A zero-shilling receipt is not a payment; it is either a mistake or an
+ * attempt to express a reversal, and reversals have their own columns. A
+ * negative one would be a refund pretending to be a payment, which makes
+ * "how much has this family paid" unanswerable by summation.
+ */
+export function wholeShillingsPositive(name: string, column: unknown) {
+  return check(name, sql`${column} % 100 = 0 AND ${column} > 0`);
+}
+
+/**
  * A foreign key to the Better Auth user table.
  *
  * `text`, NOT `uuid`. Better Auth generates its own string ids and declares
@@ -405,6 +417,187 @@ export const enrollments = pgTable("enrollments", {
   // it is added by hand in the migration. See 0003.
 ]);
 
+// ---------------------------------------------------------------------------
+// 5.7 Fees
+// ---------------------------------------------------------------------------
+
+/**
+ * What one kind of pupil pays for one term.
+ *
+ * A template, not a record. Fees differ by grade level (junior school costs
+ * more) and by whether a child boards, so the key is the three of them
+ * together.
+ */
+export const feeStructures = pgTable("fee_structures", {
+  id: uuid().primaryKey().defaultRandom(),
+  schoolId: uuid().notNull().references(() => schools.id),
+  termId: uuid().notNull(),
+  gradeLevelId: uuid().notNull(),
+  boardingStatus: text().$type<"day" | "boarder">().notNull(),
+}, t => [
+  unique().on(t.termId, t.gradeLevelId, t.boardingStatus),
+  unique("fee_structures_school_id_id_key").on(t.schoolId, t.id),
+  foreignKey({
+    columns: [t.schoolId, t.termId],
+    foreignColumns: [terms.schoolId, terms.id],
+    name: "fee_structures_school_term_fk",
+  }),
+  foreignKey({
+    columns: [t.schoolId, t.gradeLevelId],
+    foreignColumns: [gradeLevels.schoolId, gradeLevels.id],
+    name: "fee_structures_school_grade_level_fk",
+  }),
+]);
+
+export const feeItems = pgTable("fee_items", {
+  id: uuid().primaryKey().defaultRandom(),
+  schoolId: uuid().notNull().references(() => schools.id),
+  feeStructureId: uuid().notNull(),
+  name: text().notNull(),
+  amountCents: integer().notNull(),
+  /**
+   * Not billed automatically.
+   *
+   * Transport and lunch are the usual cases: real charges, but only for the
+   * families that take them. Including them in a bulk run would invoice every
+   * child for a bus they do not ride, and a parent who spots that stops
+   * trusting every other figure on the sheet. Added per student instead.
+   */
+  isOptional: boolean().default(false).notNull(),
+}, t => [
+  unique("fee_items_school_id_id_key").on(t.schoolId, t.id),
+  foreignKey({
+    columns: [t.schoolId, t.feeStructureId],
+    foreignColumns: [feeStructures.schoolId, feeStructures.id],
+    name: "fee_items_school_structure_fk",
+  }),
+  index().on(t.schoolId, t.feeStructureId),
+  wholeShillings("fee_items_amount_whole", t.amountCents),
+]);
+
+/**
+ * What one child owes for one term.
+ *
+ * One per student per term, which is what makes "have they been billed yet"
+ * answerable and a re-run of the generator harmless.
+ */
+export const invoices = pgTable("invoices", {
+  id: uuid().primaryKey().defaultRandom(),
+  schoolId: uuid().notNull().references(() => schools.id),
+  studentId: uuid().notNull(),
+  termId: uuid().notNull(),
+  /**
+   * The frozen total, maintained to equal the sum of the lines.
+   *
+   * Stored rather than derived because an invoice is a printed document
+   * (CLAUDE.md §3 rule 7) — reprinting a 2026 invoice in 2028 must produce the
+   * same figure even if someone later corrects a line. Balances, by contrast,
+   * are always derived (rule 4); see lib/balances.ts.
+   */
+  totalCents: integer().notNull(),
+  issuedOn: date().notNull(),
+  dueOn: date(),
+  /** Voided, never deleted. A cancelled invoice still has to be explicable. */
+  voidedAt: timestamp({ withTimezone: true }),
+  voidReason: text(),
+}, t => [
+  unique().on(t.studentId, t.termId),
+  unique("invoices_school_id_id_key").on(t.schoolId, t.id),
+  foreignKey({
+    columns: [t.schoolId, t.studentId],
+    foreignColumns: [students.schoolId, students.id],
+    name: "invoices_school_student_fk",
+  }),
+  foreignKey({
+    columns: [t.schoolId, t.termId],
+    foreignColumns: [terms.schoolId, terms.id],
+    name: "invoices_school_term_fk",
+  }),
+  index().on(t.schoolId, t.studentId),
+  index().on(t.schoolId, t.termId),
+  // Signed: a bursary larger than the fees leaves a credit, which is a real
+  // outcome and not one to refuse at the constraint.
+  wholeShillingsSigned("invoices_total_whole", t.totalCents),
+  check(
+    "invoices_void_has_reason",
+    sql`(${t.voidedAt} IS NULL) = (${t.voidReason} IS NULL)`,
+  ),
+  check(
+    "invoices_due_after_issue",
+    sql`${t.dueOn} IS NULL OR ${t.dueOn} >= ${t.issuedOn}`,
+  ),
+]);
+
+/**
+ * The line items, COPIED from the fee structure at generation time.
+ *
+ * Copied, not joined. When a school raises tuition mid-year, every invoice
+ * already issued must keep saying what it said — a parent holding a printed
+ * sheet and a bursar reading the screen have to see the same number. Joining
+ * back to `fee_items` at read time would silently rewrite history.
+ */
+export const invoiceLines = pgTable("invoice_lines", {
+  id: uuid().primaryKey().defaultRandom(),
+  schoolId: uuid().notNull().references(() => schools.id),
+  invoiceId: uuid().notNull(),
+  description: text().notNull(),
+  /** Negative = bursary or discount. */
+  amountCents: integer().notNull(),
+}, t => [
+  foreignKey({
+    columns: [t.schoolId, t.invoiceId],
+    foreignColumns: [invoices.schoolId, invoices.id],
+    name: "invoice_lines_school_invoice_fk",
+  }),
+  index().on(t.schoolId, t.invoiceId),
+  wholeShillingsSigned("invoice_lines_amount_whole", t.amountCents),
+]);
+
+/**
+ * A ledger entry against a student.
+ *
+ * M-Pesa is one method among four. The reconciliation machinery that turns a
+ * raw Daraja confirmation into one of these arrives in step 5; cash, bank and
+ * cheque need none of it, and a bursar recording a cash receipt is the same
+ * ledger entry either way.
+ */
+export const payments = pgTable("payments", {
+  id: uuid().primaryKey().defaultRandom(),
+  schoolId: uuid().notNull().references(() => schools.id),
+  studentId: uuid().notNull(),
+  /** Null = a credit on account, not yet applied to a particular term. */
+  invoiceId: uuid(),
+  method: text().$type<"mpesa" | "bank" | "cash" | "cheque">().notNull(),
+  amountCents: integer().notNull(),
+  reference: text(),
+  recordedBy: userRef("recorded_by").references(() => user.id),
+  /** An instant, not a day — when the money actually arrived. */
+  receivedAt: timestamp({ withTimezone: true }).notNull(),
+  /** Reversed, never deleted: "where did this KES 15,000 go" stays answerable. */
+  reversedAt: timestamp({ withTimezone: true }),
+  reversalReason: text(),
+  createdAt: createdAt(),
+}, t => [
+  unique("payments_school_id_id_key").on(t.schoolId, t.id),
+  foreignKey({
+    columns: [t.schoolId, t.studentId],
+    foreignColumns: [students.schoolId, students.id],
+    name: "payments_school_student_fk",
+  }),
+  foreignKey({
+    columns: [t.schoolId, t.invoiceId],
+    foreignColumns: [invoices.schoolId, invoices.id],
+    name: "payments_school_invoice_fk",
+  }),
+  index().on(t.schoolId, t.studentId),
+  index().on(t.schoolId, t.invoiceId),
+  wholeShillingsPositive("payments_amount_whole", t.amountCents),
+  check(
+    "payments_reversal_has_reason",
+    sql`(${t.reversedAt} IS NULL) = (${t.reversalReason} IS NULL)`,
+  ),
+]);
+
 /**
  * Every tenant-scoped table, for the migration that puts RLS on them.
  *
@@ -422,6 +615,11 @@ export const TENANT_TABLES = [
   "guardians",
   "student_guardians",
   "enrollments",
+  "fee_structures",
+  "fee_items",
+  "invoices",
+  "invoice_lines",
+  "payments",
 ] as const;
 
 // ---------------------------------------------------------------------------
@@ -498,6 +696,45 @@ export const studentGuardiansRelations = relations(studentGuardians, ({ one }) =
     fields: [studentGuardians.guardianId],
     references: [guardians.id],
   }),
+}));
+
+export const feeStructuresRelations = relations(feeStructures, ({ one, many }) => ({
+  school: one(schools, { fields: [feeStructures.schoolId], references: [schools.id] }),
+  term: one(terms, { fields: [feeStructures.termId], references: [terms.id] }),
+  gradeLevel: one(gradeLevels, {
+    fields: [feeStructures.gradeLevelId],
+    references: [gradeLevels.id],
+  }),
+  items: many(feeItems),
+}));
+
+export const feeItemsRelations = relations(feeItems, ({ one }) => ({
+  structure: one(feeStructures, {
+    fields: [feeItems.feeStructureId],
+    references: [feeStructures.id],
+  }),
+}));
+
+export const invoicesRelations = relations(invoices, ({ one, many }) => ({
+  school: one(schools, { fields: [invoices.schoolId], references: [schools.id] }),
+  student: one(students, { fields: [invoices.studentId], references: [students.id] }),
+  term: one(terms, { fields: [invoices.termId], references: [terms.id] }),
+  lines: many(invoiceLines),
+  payments: many(payments),
+}));
+
+export const invoiceLinesRelations = relations(invoiceLines, ({ one }) => ({
+  invoice: one(invoices, {
+    fields: [invoiceLines.invoiceId],
+    references: [invoices.id],
+  }),
+}));
+
+export const paymentsRelations = relations(payments, ({ one }) => ({
+  school: one(schools, { fields: [payments.schoolId], references: [schools.id] }),
+  student: one(students, { fields: [payments.studentId], references: [students.id] }),
+  invoice: one(invoices, { fields: [payments.invoiceId], references: [invoices.id] }),
+  recordedByUser: one(user, { fields: [payments.recordedBy], references: [user.id] }),
 }));
 
 export const enrollmentsRelations = relations(enrollments, ({ one }) => ({

@@ -3,6 +3,7 @@ import type { AppOpenAPI } from "@/lib/types";
 import configureOpenAPI from "@/lib/configure-open-api";
 import createApp from "@/lib/create-app";
 import academic from "@/routes/academic/academic.index";
+import fees from "@/routes/fees/fees.index";
 import health from "@/routes/health.route";
 import index from "@/routes/index.route";
 import students from "@/routes/students/students.index";
@@ -43,6 +44,7 @@ const unscopedRoutes = [
 const tenantRoutes = [
   academic,
   students,
+  fees,
 ] as unknown as readonly AppOpenAPI[];
 
 [...unscopedRoutes, ...tenantRoutes].forEach((route) => {

@@ -466,6 +466,12 @@ export const invoiceLines = pgTable('invoice_lines', {
 
 **Copy line items onto the invoice at generation time.** Do not join back to the fee structure at read time — when the school raises tuition mid-year, historical invoices must not silently change.
 
+`invoices.total_cents` is stored rather than derived, because an invoice is a printed document (rule 7). It is recomputed from its lines inside the same transaction as any line change, so "stored" never means "stale". Balances, by contrast, are always derived — see `lib/balances.ts`, which is the only place the formula is written.
+
+**Optional fee items are not billed in bulk.** Transport and lunch are real charges but only for the families that take them; invoicing every child for a bus they do not ride costs more trust than it collects. They are added per student.
+
+**Rule 5 protects records, not configuration.** `fee_structures` and `fee_items` are templates an invoice is generated *from*, and the invoice carries its own copies — so those two are the only fee tables the runtime role may `DELETE` from. Invoices void; payments reverse; neither deletes.
+
 ### 5.8 Payments and M-Pesa reconciliation
 
 Two tables, and the separation is the entire feature.
@@ -546,7 +552,7 @@ Two more are needed before v1 ships and are not yet built:
 1. ~~Fork the existing scaffold. Strip domain, keep auth, rate limiting, Docker dev/test databases, CI.~~ **Done.**
 2. ~~Tenancy + academic spine + RLS + superadmin plane (§4, §5.1, §5.2).~~ **Done.**
 3. ~~Students, guardians, enrollment (§5.3).~~ **Done.**
-4. Fees: structures → invoice generation for one term (§5.7).
+4. ~~Fees: structures → invoice generation for one term (§5.7).~~ **Done.**
 5. Daraja C2B against sandbox + reconciliation queue (§5.8).
 6. Bursar dashboard: outstanding balances per class.
 7. **Put it in front of one real school before writing anything else.**

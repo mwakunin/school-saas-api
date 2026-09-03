@@ -8,10 +8,15 @@ import app from "@/app";
 import db, { pool } from "@/db";
 import {
   academicYears,
+  enrollments,
   gradeLevels,
+  invoiceLines,
+  invoices,
   memberships,
+  payments,
   schools,
   streams,
+  students,
   terms,
   user,
 } from "@/db/schema";
@@ -362,4 +367,106 @@ export async function makeStream(
     .returning();
 
   return row;
+}
+
+// ---------------------------------------------------------------------------
+// Students and fees
+// ---------------------------------------------------------------------------
+
+type SeededSchool = Awaited<ReturnType<typeof makeSchool>>;
+
+/** A student on the register, optionally placed in a class. */
+export async function makeStudent(
+  school: SeededSchool,
+  admissionNumber: string,
+  overrides: {
+    givenName?: string;
+    familyName?: string;
+    streamId?: string;
+    boardingStatus?: "day" | "boarder";
+  } = {},
+) {
+  const [student] = await db
+    .insert(students)
+    .values({
+      schoolId: school.id,
+      admissionNumber,
+      givenName: overrides.givenName ?? "Wanjiku",
+      familyName: overrides.familyName ?? "Njoroge",
+      admittedOn: "2026-01-06",
+      status: "active",
+    })
+    .returning();
+
+  if (overrides.streamId) {
+    await db.insert(enrollments).values({
+      schoolId: school.id,
+      studentId: student.id,
+      streamId: overrides.streamId,
+      boardingStatus: overrides.boardingStatus ?? "day",
+      startedOn: "2026-01-06",
+    });
+  }
+
+  return student;
+}
+
+/**
+ * An invoice with a matching line, so the stored total and the lines agree.
+ *
+ * `termIndex` picks which of the school's three seeded terms to bill, because
+ * one invoice per student per term is a unique constraint — a test wanting two
+ * invoices for one child must put them in different terms.
+ */
+export async function makeInvoice(
+  school: SeededSchool,
+  student: { id: string },
+  options: { totalCents: number; termIndex?: number; issuedOn?: string },
+) {
+  const term = school.terms[options.termIndex ?? 0];
+
+  const [invoice] = await db
+    .insert(invoices)
+    .values({
+      schoolId: school.id,
+      studentId: student.id,
+      termId: term.id,
+      totalCents: options.totalCents,
+      issuedOn: options.issuedOn ?? "2026-01-06",
+    })
+    .returning();
+
+  await db.insert(invoiceLines).values({
+    schoolId: school.id,
+    invoiceId: invoice.id,
+    description: "Tuition",
+    amountCents: options.totalCents,
+  });
+
+  return invoice;
+}
+
+export async function makePayment(
+  school: SeededSchool,
+  student: { id: string },
+  options: {
+    amountCents: number;
+    invoiceId?: string;
+    method?: "mpesa" | "bank" | "cash" | "cheque";
+    receivedAt?: Date;
+  },
+) {
+  const [payment] = await db
+    .insert(payments)
+    .values({
+      schoolId: school.id,
+      studentId: student.id,
+      invoiceId: options.invoiceId,
+      method: options.method ?? "cash",
+      amountCents: options.amountCents,
+      receivedAt: options.receivedAt ?? new Date(),
+    })
+    .returning();
+
+  return payment;
 }
