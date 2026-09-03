@@ -638,6 +638,67 @@ describe("fees", () => {
       expect(res.invoices.every((i: { outstandingCents: number }) => i.outstandingCents > 0)).toBe(true);
     });
 
+    it("agrees with lib/balances about which invoices are outstanding", async () => {
+      const { bursar, term1, setFees } = await seed("alpha");
+      await setFees([TUITION]);
+      await post("/invoices/generate", {
+        termId: term1.id,
+        issuedOn: "2026-01-06",
+      }, jsonHeaders("alpha", bursar));
+
+      const [settled, partial, voided] = await db.select().from(invoices);
+
+      await post("/payments", {
+        studentId: settled.studentId,
+        invoiceId: settled.id,
+        method: "cash",
+        amountCents: 1_800_000,
+      }, jsonHeaders("alpha", bursar));
+
+      await post("/payments", {
+        studentId: partial.studentId,
+        invoiceId: partial.id,
+        method: "cash",
+        amountCents: 800_000,
+      }, jsonHeaders("alpha", bursar));
+
+      // Paid in full and then voided: outstanding must be zero, not negative.
+      await post("/payments", {
+        studentId: voided.studentId,
+        invoiceId: voided.id,
+        method: "cash",
+        amountCents: 1_800_000,
+      }, jsonHeaders("alpha", bursar));
+      await post(`/invoices/${voided.id}/void`, { reason: "duplicate" }, jsonHeaders("alpha", bursar));
+
+      const filtered = await (await app.request("/invoices?outstandingOnly=true", {
+        headers: tenantHeaders("alpha", bursar),
+      })).json();
+
+      /*
+       * The filter moved into SQL for paging; `lib/balances` still computes the
+       * figure the response reports. Those are two expressions of one rule, and
+       * the failure mode if they drift is silent — an invoice listed as
+       * outstanding showing zero outstanding, or a debt missing from the list a
+       * bursar works through.
+       */
+      expect(filtered.invoices.map((i: { id: string }) => i.id)).toEqual([partial.id]);
+      expect(filtered.total).toBe(1);
+      expect(filtered.invoices[0].outstandingCents).toBe(1_000_000);
+
+      // And every invoice the filter excluded really does owe nothing.
+      const everything = await (await app.request("/invoices?includeVoided=true", {
+        headers: tenantHeaders("alpha", bursar),
+      })).json();
+
+      const excluded = everything.invoices.filter(
+        (i: { id: string }) => i.id !== partial.id,
+      );
+      expect(excluded).toHaveLength(2);
+      for (const invoice of excluded)
+        expect(invoice.outstandingCents).toBe(0);
+    });
+
     it("422s a payment against another school's student", async () => {
       const { bursar } = await billed("alpha");
       const betaSeed = await seed("beta");

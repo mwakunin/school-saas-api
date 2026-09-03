@@ -86,10 +86,22 @@ async function sourceFiles(dir: string): Promise<string[]> {
  */
 function dbImportsIn(source: string): string[] {
   const names: string[] = [];
-  // The clause cannot contain a quote, so there is exactly one way to match —
-  // which keeps this linear rather than backtracking.
+  /*
+   * `import` may be followed by no whitespace at all — `import{pool}from"@/db"`
+   * is valid JavaScript, and requiring a space missed it. The lookahead is what
+   * keeps that from also matching the word `imported`: only whitespace, a
+   * brace, a star or a quote can follow the keyword in a real import.
+   *
+   * The clause is `[^;"']+?` with no `\s*` in front. Both would match
+   * whitespace, and a quantifier that can consume the same characters two ways
+   * backtracks polynomially on a hostile input. `+?` rather than `*?` because
+   * the lookahead already guarantees a character follows the keyword.
+   *
+   * `\bfrom` keeps an identifier like `fromCache` from ending the clause early;
+   * no closing `\b` is needed, since the `["']` that must follow provides it.
+   */
   const pattern
-    = /import\s([^;"']*)from\s*["'](?:@\/db|\.\.?\/(?:\.\.\/)*db)(?:\/index)?["']/g;
+    = /\bimport(?=[\s{*"'])([^;"']+?)\bfrom\s*["'](?:@\/db|\.\.?\/(?:\.\.\/)*db)(?:\/index)?["']/g;
 
   for (const match of source.matchAll(pattern)) {
     const clause = match[1];
@@ -101,6 +113,15 @@ function dbImportsIn(source: string): string[] {
     // `import { default as ownerDb } from "@/db"` — the same thing, renamed.
     if (/\bdefault\s+as\s+\w+/.test(clause))
       names.push("default");
+
+    /*
+     * `import * as dbMod from "@/db"` reaches everything the module exports —
+     * `dbMod.default` and `dbMod.pool` included — so a namespace import is
+     * treated as taking all of them. Reported under every name rather than a
+     * new one, so both allowlists judge it the way they judge a direct import.
+     */
+    if (/^\s*\*\s*as\s+\w+/.test(clause))
+      names.push("default", "pool", "appDb", "appPool");
 
     for (const named of clause.matchAll(/\b(pool|appDb|appPool)\b/g))
       names.push(named[1]);
@@ -191,5 +212,31 @@ describe("database access", () => {
     // `@/db/schema` and `@/db-errors` are not the connection module.
     expect(dbImportsIn(`import { schools } from "@/db/schema";`)).toEqual([]);
     expect(dbImportsIn(`import { pgErrorCode } from "@/lib/db-errors";`)).toEqual([]);
+  });
+
+  it("matches an import written without whitespace", () => {
+    // Valid JavaScript, and what a minifier or a deliberate bypass produces.
+    expect(dbImportsIn(`import{pool}from"@/db";`)).toContain("pool");
+    expect(dbImportsIn(`import{appDb}from'@/db/index';`)).toContain("appDb");
+    expect(dbImportsIn(`import{default as x}from"@/db";`)).toContain("default");
+  });
+
+  it("treats a namespace import as taking everything", () => {
+    // `dbMod.default` and `dbMod.pool` are both reachable through it.
+    const names = dbImportsIn(`import * as dbMod from "@/db";`);
+    expect(names).toContain("default");
+    expect(names).toContain("pool");
+    expect(names).toContain("appDb");
+  });
+
+  it("does not mistake an identifier ending in `import` for one", () => {
+    // The lookahead exists for this: allowing zero whitespace after the
+    // keyword must not start matching the middle of a longer word.
+    expect(dbImportsIn(`const imported = collectFrom("@/db");`)).toEqual([]);
+    expect(dbImportsIn(`reimported from "@/db"`)).toEqual([]);
+  });
+
+  it("is not confused by an identifier containing `from` in the clause", () => {
+    expect(dbImportsIn(`import { fromCache, pool } from "@/db";`)).toContain("pool");
   });
 });

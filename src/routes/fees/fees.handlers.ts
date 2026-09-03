@@ -1,4 +1,4 @@
-import { and, asc, count, desc, eq, inArray, isNull } from "drizzle-orm";
+import { and, asc, count, desc, eq, inArray, isNotNull, isNull, sql } from "drizzle-orm";
 import * as HttpStatusCodes from "stoker/http-status-codes";
 import * as HttpStatusPhrases from "stoker/http-status-phrases";
 
@@ -78,28 +78,59 @@ async function structureDetail(db: AppDb, structureId: string) {
 }
 
 async function invoiceDetail(db: AppDb, invoiceId: string) {
-  const [invoice] = await db
+  const [detail] = await invoiceDetailsFor(db, [invoiceId]);
+  return detail ?? null;
+}
+
+/**
+ * Full detail for a set of invoices, in a fixed number of queries.
+ *
+ * Four queries whether the set holds one invoice or fifty. Called per invoice
+ * instead, a page of fifty cost a hundred and fifty round trips — which is
+ * what `listInvoices` was doing, and for the whole term rather than the page.
+ *
+ * Order follows `invoiceIds`, so a caller that has already sorted and paged
+ * does not have to sort again.
+ */
+async function invoiceDetailsFor(db: AppDb, invoiceIds: string[]) {
+  if (invoiceIds.length === 0)
+    return [];
+
+  const rows = await db
     .select()
     .from(invoices)
-    .where(eq(invoices.id, invoiceId));
-
-  if (!invoice)
-    return null;
+    .where(inArray(invoices.id, invoiceIds));
 
   const lines = await db
     .select()
     .from(invoiceLines)
-    .where(eq(invoiceLines.invoiceId, invoiceId));
+    .where(inArray(invoiceLines.invoiceId, invoiceIds));
 
-  const balances = await invoiceBalancesFor(db, [invoiceId]);
-  const balance = balances.get(invoiceId)!;
+  const balances = await invoiceBalancesFor(db, invoiceIds);
 
-  return {
-    ...invoice,
-    lines,
-    paidCents: balance.paidCents,
-    outstandingCents: balance.outstandingCents,
-  };
+  const linesByInvoice = new Map<string, typeof lines>();
+  for (const line of lines) {
+    const list = linesByInvoice.get(line.invoiceId) ?? [];
+    list.push(line);
+    linesByInvoice.set(line.invoiceId, list);
+  }
+
+  const byId = new Map(rows.map(r => [r.id, r]));
+
+  return invoiceIds.flatMap((id) => {
+    const invoice = byId.get(id);
+    if (!invoice)
+      return [];
+
+    const balance = balances.get(id)!;
+
+    return [{
+      ...invoice,
+      lines: linesByInvoice.get(id) ?? [],
+      paidCents: balance.paidCents,
+      outstandingCents: balance.outstandingCents,
+    }];
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -458,45 +489,68 @@ export const listInvoices: TenantRouteHandler<ListInvoicesRoute> = async (c) => 
   const where = filters.length > 0 ? and(...filters) : undefined;
 
   /*
-   * `outstandingOnly` has to be applied BEFORE paging, not after.
+   * `outstandingOnly` is applied in SQL, before paging.
    *
-   * "Outstanding" is derived from payments, so it is not a column the query can
-   * filter on (CLAUDE.md §3 rule 4 — a stored balance would drift). The first
-   * version paged first and filtered the page, which produced two wrong
-   * things at once: a "page" of 50 that came back holding 3 rows, and a `total`
-   * counting invoices the filter had just excluded. A bursar reconciling
-   * against that total would be chasing a figure no screen agrees with.
+   * "Outstanding" is derived rather than stored (CLAUDE.md §3 rule 4), but
+   * derived does not mean it has to be computed in JavaScript. Filtering the
+   * page after fetching it returned a short page beside a total counting rows
+   * the filter had removed; filtering in memory before paging fixed the
+   * figures but loaded every invoice in the term to do it — a few hundred
+   * invoices costing several hundred queries to render fifty.
    *
-   * So the filtered path resolves the whole matching set, filters it, and pages
-   * in memory. Bounded by one term's invoices — a few hundred rows for a school
-   * of this size — and honest, which the alternative was not.
+   * The subquery below sums the non-reversed payments allocated to each
+   * invoice, so Postgres does the filtering and only the page is expanded.
+   * A voided invoice is excluded outright: it owes nothing by definition, so
+   * it can never be outstanding.
    */
-  const matchingIds = await db
-    .select({ id: invoices.id })
-    .from(invoices)
-    .where(where)
-    .orderBy(desc(invoices.issuedOn));
+  if (query.outstandingOnly) {
+    const paidPerInvoice = db
+      .select({
+        invoiceId: payments.invoiceId,
+        paid: sql<string>`sum(${payments.amountCents})`.as("paid"),
+      })
+      .from(payments)
+      .where(and(isNull(payments.reversedAt), isNotNull(payments.invoiceId)))
+      .groupBy(payments.invoiceId)
+      .as("paid_per_invoice");
 
-  if (!query.outstandingOnly) {
-    const page = matchingIds.slice(query.offset, query.offset + query.limit);
-    const detailed = await Promise.all(page.map(r => invoiceDetail(db, r.id)));
+    const matching = await db
+      .select({ id: invoices.id })
+      .from(invoices)
+      .leftJoin(paidPerInvoice, eq(paidPerInvoice.invoiceId, invoices.id))
+      .where(and(
+        where,
+        isNull(invoices.voidedAt),
+        sql`${invoices.totalCents} - coalesce(${paidPerInvoice.paid}, 0) > 0`,
+      ))
+      .orderBy(desc(invoices.issuedOn));
+
+    const page = matching.slice(query.offset, query.offset + query.limit);
 
     return c.json({
-      invoices: detailed.filter(i => i !== null),
-      total: matchingIds.length,
+      invoices: await invoiceDetailsFor(db, page.map(r => r.id)),
+      // Counts what the filter matched, so paging terminates where the caller
+      // expects rather than where the unfiltered count says.
+      total: matching.length,
     }, HttpStatusCodes.OK);
   }
 
-  const all = await Promise.all(matchingIds.map(r => invoiceDetail(db, r.id)));
-  const outstanding = all
-    .filter(i => i !== null)
-    .filter(i => i.outstandingCents > 0);
+  const [{ total }] = await db
+    .select({ total: count() })
+    .from(invoices)
+    .where(where);
+
+  const page = await db
+    .select({ id: invoices.id })
+    .from(invoices)
+    .where(where)
+    .orderBy(desc(invoices.issuedOn))
+    .limit(query.limit)
+    .offset(query.offset);
 
   return c.json({
-    invoices: outstanding.slice(query.offset, query.offset + query.limit),
-    // Counts what the filter actually matched, so paging through it terminates
-    // where the caller expects.
-    total: outstanding.length,
+    invoices: await invoiceDetailsFor(db, page.map(r => r.id)),
+    total,
   }, HttpStatusCodes.OK);
 };
 
