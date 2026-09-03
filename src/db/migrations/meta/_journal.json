@@ -36,6 +36,13 @@
       "when": 1788465514837,
       "tag": "0004_fees_and_payments",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1788469852012,
+      "tag": "0005_payment_invoice_student_fk",
+      "breakpoints": true
     }
   ]
 }

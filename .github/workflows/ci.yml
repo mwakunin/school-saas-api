@@ -172,6 +172,7 @@ jobs:
         run: |
           docker run -d --name api-smoke -p 9999:9999 \
             -e DATABASE_URL=postgresql://nobody:nobody@127.0.0.1:1/none \
+            -e APP_DATABASE_URL=postgresql://nobody_app:nobody@127.0.0.1:1/none \
             -e REDIS_URL=redis://127.0.0.1:6379 \
             -e BETTER_AUTH_SECRET=ci-only-secret-that-is-long-enough-32 \
             -e BETTER_AUTH_URL=https://example.test \

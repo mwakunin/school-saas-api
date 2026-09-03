@@ -503,6 +503,15 @@ export const invoices = pgTable("invoices", {
 }, t => [
   unique().on(t.studentId, t.termId),
   unique("invoices_school_id_id_key").on(t.schoolId, t.id),
+  /*
+   * Lets `payments` reference (school_id, invoice_id, student_id).
+   *
+   * Without the student in the reference, a payment can name one child and
+   * point at another child's invoice: both two-column keys are satisfied,
+   * because each is individually true. That is money credited to the wrong
+   * family, and it reads as correct on both screens.
+   */
+  unique("invoices_school_id_id_student_id_key").on(t.schoolId, t.id, t.studentId),
   foreignKey({
     columns: [t.schoolId, t.studentId],
     foreignColumns: [students.schoolId, students.id],
@@ -584,10 +593,21 @@ export const payments = pgTable("payments", {
     foreignColumns: [students.schoolId, students.id],
     name: "payments_school_student_fk",
   }),
+  /*
+   * The invoice reference carries the student, not just the school.
+   *
+   * A two-column (school_id, invoice_id) key would let a payment name child A
+   * and settle child B's invoice — each key true on its own, the pair wrong.
+   * Including student_id makes that unrepresentable.
+   *
+   * `invoice_id` is nullable for a credit on account. Under the default MATCH
+   * SIMPLE, a NULL in any referencing column switches the constraint off for
+   * that row, which is exactly the behaviour a credit needs.
+   */
   foreignKey({
-    columns: [t.schoolId, t.invoiceId],
-    foreignColumns: [invoices.schoolId, invoices.id],
-    name: "payments_school_invoice_fk",
+    columns: [t.schoolId, t.invoiceId, t.studentId],
+    foreignColumns: [invoices.schoolId, invoices.id, invoices.studentId],
+    name: "payments_school_invoice_student_fk",
   }),
   index().on(t.schoolId, t.studentId),
   index().on(t.schoolId, t.invoiceId),

@@ -4,7 +4,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import db, { appDb, appPool, pool } from "@/db";
 import { TENANT_TABLES } from "@/db/schema";
 import { pgErrorCode } from "@/lib/db-errors";
-import { makeSchool, resetDb } from "@/test/helpers";
+import { makeInvoice, makeSchool, makeStudent, resetDb } from "@/test/helpers";
 
 /**
  * Postgres reports an RLS refusal as insufficient_privilege.
@@ -58,6 +58,37 @@ describe("row-level security", () => {
       // vacuous while still going green.
       expect(rows[0].usesuper).toBe(false);
       expect(rows[0].usebypassrls).toBe(false);
+    });
+
+    it("connects the owner as a role that CAN bypass RLS", async () => {
+      /*
+       * The mirror of the test above, and the one that catches a bad deploy.
+       *
+       * `FORCE ROW LEVEL SECURITY` makes the policies apply to the table's
+       * owner too — that is why it is set. The consequence is that the owner
+       * connection only keeps its cross-tenant reach if the role is a
+       * SUPERUSER or holds BYPASSRLS. It is a superuser locally and in CI
+       * because Docker's POSTGRES_USER is one, so nothing here would notice
+       * otherwise.
+       *
+       * On a managed provider it usually is not. Neon's default role owns the
+       * tables and is not a superuser, so `db` would silently fall under the
+       * policies: migrations still run, but the superadmin plane would list
+       * zero schools and the test harness would truncate nothing. Provision
+       * the owner from a role that has BYPASSRLS (on Neon, `neon_superuser`).
+       */
+      const { rows } = await pool.query<{
+        usesuper: boolean;
+        usebypassrls: boolean;
+      }>(`SELECT usesuper, usebypassrls FROM pg_user WHERE usename = current_user`);
+
+      expect(
+        rows[0].usesuper || rows[0].usebypassrls,
+        "DATABASE_URL's role must be SUPERUSER or have BYPASSRLS: FORCE ROW "
+        + "LEVEL SECURITY subjects even the table owner to the policies, so "
+        + "without it migrations, the test harness and the superadmin plane "
+        + "all lose their cross-tenant reach.",
+      ).toBe(true);
     });
 
     it("is not the same role that owns the tables", async () => {
@@ -348,6 +379,53 @@ describe("row-level security", () => {
       }));
 
       expect(pgErrorCode(err)).toBe("23503");
+    });
+
+    it("refuses a payment naming one child against another child's invoice", async () => {
+      const alpha = await makeSchool({ subdomain: "alpha" });
+      const one = await makeStudent(alpha, "2026/001");
+      const two = await makeStudent(alpha, "2026/002");
+      const invoice = await makeInvoice(alpha, one, { totalCents: 1_800_000 });
+
+      /*
+       * Both students and the invoice belong to the SAME school, so tenancy is
+       * not what is being tested — this is a pair of references that are each
+       * individually true and wrong together.
+       *
+       * With separate (school_id, student_id) and (school_id, invoice_id)
+       * keys this was accepted: the money then reads as credited to child two
+       * on the ledger and as settling child one's bill on the invoice, with
+       * nothing in the database disagreeing. The reference carries the student
+       * now, so the pair cannot come apart.
+       */
+      const err = await errorFrom(() => appDb.transaction(async (tx) => {
+        await tx.execute(sql`SELECT set_config('app.school_id', ${alpha.id}, true)`);
+        await tx.execute(sql`
+          INSERT INTO payments (school_id, student_id, invoice_id, method, amount_cents, received_at)
+          VALUES (${alpha.id}, ${two.id}, ${invoice.id}, 'cash', 500000, now())
+        `);
+      }));
+
+      expect(pgErrorCode(err)).toBe("23503");
+    });
+
+    it("still allows a credit on account, which names no invoice", async () => {
+      const alpha = await makeSchool({ subdomain: "alpha" });
+      const student = await makeStudent(alpha, "2026/001");
+
+      // invoice_id NULL disables the composite key for that row under MATCH
+      // SIMPLE, which is exactly what an unallocated payment needs.
+      const rows = await appDb.transaction(async (tx) => {
+        await tx.execute(sql`SELECT set_config('app.school_id', ${alpha.id}, true)`);
+        const r = await tx.execute(sql`
+          INSERT INTO payments (school_id, student_id, method, amount_cents, received_at)
+          VALUES (${alpha.id}, ${student.id}, 'cash', 500000, now())
+          RETURNING amount_cents
+        `);
+        return r.rows;
+      });
+
+      expect(rows).toHaveLength(1);
     });
 
     it("leaves no tenant table referencing a parent without carrying school_id", async () => {

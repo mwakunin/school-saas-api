@@ -74,19 +74,32 @@ async function sourceFiles(dir: string): Promise<string[]> {
   return found;
 }
 
-/** Import specifiers pulled from `@/db` or a relative path to it. */
+/**
+ * Import specifiers pulled from `@/db` or a relative path to it.
+ *
+ * The module specifier accepts an optional `/index`, and the clause is matched
+ * for a bare default, a `{ default as x }` rename, and the named connections.
+ * All three of the latter used to slip past: `@/db/index` did not match the
+ * specifier at all, and `{ default as ownerDb }` matched neither the
+ * bare-default pattern (it starts with `{`) nor the named list. Any of them
+ * would have handed a route the RLS-exempt connection with the guard green.
+ */
 function dbImportsIn(source: string): string[] {
   const names: string[] = [];
-  // Written to avoid ambiguity between the adjacent quantifiers: the import
-  // clause cannot contain a quote, so there is exactly one way to match.
-  const pattern = /import\s([^;"']*)from\s*["'](?:@\/db|\.\.?\/(?:\.\.\/)*db)["']/g;
+  // The clause cannot contain a quote, so there is exactly one way to match —
+  // which keeps this linear rather than backtracking.
+  const pattern
+    = /import\s([^;"']*)from\s*["'](?:@\/db|\.\.?\/(?:\.\.\/)*db)(?:\/index)?["']/g;
 
   for (const match of source.matchAll(pattern)) {
     const clause = match[1];
 
     // `import db from "@/db"` — the default export is the owner connection.
-    const defaultImport = clause.match(/^\s*(\w+)\s*(?:,|$)/);
-    if (defaultImport)
+    if (/^\s*\w+\s*(?:,|$)/.test(clause))
+      names.push("default");
+
+    // `import { default as ownerDb } from "@/db"` — the same thing, renamed.
+    if (/\bdefault\s+as\s+\w+/.test(clause))
       names.push("default");
 
     for (const named of clause.matchAll(/\b(pool|appDb|appPool)\b/g))
@@ -157,5 +170,26 @@ describe("database access", () => {
     expect(dbImportsIn(`import { appDb } from "@/db";`)).toContain("appDb");
     expect(dbImportsIn(`import { appPool } from "../db";`)).toContain("appPool");
     expect(dbImportsIn(`import { schools } from "@/db/schema";`)).toEqual([]);
+  });
+
+  it.each([
+    // Both of these reach the same module and used to match nothing.
+    ["explicit /index", `import db from "@/db/index";`],
+    ["named default rename", `import { default as ownerDb } from "@/db";`],
+    ["named default rename via /index", `import { default as x } from "@/db/index";`],
+    ["relative /index", `import db from "../db/index";`],
+  ])("sees through %s", (_case, source) => {
+    expect(dbImportsIn(source)).toContain("default");
+  });
+
+  it("sees a named connection reached through /index", () => {
+    expect(dbImportsIn(`import { pool } from "@/db/index";`)).toContain("pool");
+    expect(dbImportsIn(`import { appDb } from "@/db/index";`)).toContain("appDb");
+  });
+
+  it("still ignores sibling modules that merely start with db", () => {
+    // `@/db/schema` and `@/db-errors` are not the connection module.
+    expect(dbImportsIn(`import { schools } from "@/db/schema";`)).toEqual([]);
+    expect(dbImportsIn(`import { pgErrorCode } from "@/lib/db-errors";`)).toEqual([]);
   });
 });

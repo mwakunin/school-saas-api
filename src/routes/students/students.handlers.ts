@@ -226,9 +226,38 @@ export const list: TenantRouteHandler<ListRoute> = async (c) => {
     .from(students)
     .where(where);
 
+  /*
+   * One query for the page, not one per student.
+   *
+   * This used to call `studentDetail` per row, which is three queries each —
+   * and two of them fetched the enrollment history and guardian list that a
+   * list item then threw away. A 50-row page cost 150 round trips to render
+   * 50 names. The class list is the screen a teacher opens every morning.
+   *
+   * The open enrollment is LEFT joined, because a student with none is a real
+   * state (admitted, not yet placed) and must still appear on the register
+   * rather than dropping out of it.
+   */
   const rows = await db
-    .select({ id: students.id })
+    .select({
+      student: students,
+      enrollmentId: enrollments.id,
+      streamId: enrollments.streamId,
+      boardingStatus: enrollments.boardingStatus,
+      startedOn: enrollments.startedOn,
+      streamName: streams.name,
+      gradeLevelId: gradeLevels.id,
+      gradeLevelName: gradeLevels.name,
+      gradeLevelSequence: gradeLevels.sequence,
+      gradeLevelPhase: gradeLevels.phase,
+    })
     .from(students)
+    .leftJoin(enrollments, and(
+      eq(enrollments.studentId, students.id),
+      isNull(enrollments.endedOn),
+    ))
+    .leftJoin(streams, eq(enrollments.streamId, streams.id))
+    .leftJoin(gradeLevels, eq(streams.gradeLevelId, gradeLevels.id))
     .where(where)
     // Family name first: it is how a Kenyan register is read and how the
     // office looks someone up.
@@ -236,13 +265,27 @@ export const list: TenantRouteHandler<ListRoute> = async (c) => {
     .limit(query.limit)
     .offset(query.offset);
 
-  const detailed = await Promise.all(
-    rows.map(r => studentDetail(db, r.id)),
-  );
-
-  const list = detailed
-    .filter(s => s !== null)
-    .map(({ enrollments: _history, guardians: _linked, ...rest }) => rest);
+  const list = rows.map(r => ({
+    ...r.student,
+    currentEnrollment: r.enrollmentId
+      ? {
+          id: r.enrollmentId,
+          streamId: r.streamId!,
+          boardingStatus: r.boardingStatus!,
+          startedOn: r.startedOn!,
+          stream: {
+            id: r.streamId!,
+            name: r.streamName!,
+            gradeLevel: {
+              id: r.gradeLevelId!,
+              name: r.gradeLevelName!,
+              sequence: r.gradeLevelSequence!,
+              phase: r.gradeLevelPhase!,
+            },
+          },
+        }
+      : null,
+  }));
 
   return c.json({ students: list, total }, HttpStatusCodes.OK);
 };

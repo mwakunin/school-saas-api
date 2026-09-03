@@ -195,6 +195,35 @@ describe("balances", () => {
       expect(studentBalance.balanceCents).toBe(1_100_000);
     });
 
+    it("owes nothing on a voided invoice that was already paid", async () => {
+      const school = await makeSchool({ subdomain: "alpha" });
+      const student = await makeStudent(school, "2026/001");
+      const invoice = await makeInvoice(school, student, { totalCents: 2_500_000 });
+      await makePayment(school, student, {
+        amountCents: 1_000_000,
+        invoiceId: invoice.id,
+      });
+
+      await voidInvoice(invoice.id);
+
+      const perInvoice = await inTenant(school.id, db =>
+        invoiceBalancesFor(db, [invoice.id]));
+
+      // Not `0 - paidCents`. A negative amount outstanding reads on a
+      // statement as the school owing the family on this invoice, which is
+      // not a claim one invoice can make. Whether a refund is due is a
+      // question about the student's balance, below.
+      expect(perInvoice.get(invoice.id)).toMatchObject({
+        totalCents: 0,
+        paidCents: 1_000_000,
+        outstandingCents: 0,
+      });
+
+      // The payment still counts towards what the family is owed overall.
+      const balance = await inTenant(school.id, db => balanceFor(db, student.id));
+      expect(balance.balanceCents).toBe(-1_000_000);
+    });
+
     it("owes nothing on a voided invoice, whatever its total says", async () => {
       const school = await makeSchool({ subdomain: "alpha" });
       const student = await makeStudent(school, "2026/001");

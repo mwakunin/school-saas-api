@@ -27,13 +27,40 @@ import * as schema from "./schema";
  * `pg_policies`, and still do nothing at all.
  */
 
+/**
+ * How long to wait for a free connection before giving up.
+ *
+ * `pg` waits forever by default. A database that has gone away therefore turns
+ * every request into one that hangs rather than one that fails — including
+ * `/health`, which is the endpoint whose whole job is to notice. Failing takes
+ * a few seconds; hanging takes until something else times out.
+ */
+const CONNECTION_TIMEOUT_MS = 5_000;
+
+/**
+ * Keeps an idle-client failure from killing the process.
+ *
+ * `pg` Pool emits `error` for a client that dies while idle — a database
+ * restart, a dropped network link, an idle-timeout on the server side. An
+ * `error` event with no listener is an unhandled exception in Node, so without
+ * this a routine Postgres restart takes the whole API down instead of costing
+ * one pooled connection.
+ */
+function surviveIdleFailures(pool: Pool, name: string) {
+  pool.on("error", (err) => {
+    console.error(`[db:${name}] idle client error:`, err);
+  });
+  return pool;
+}
+
 // One driver serves both local Docker Postgres and Neon — Neon speaks the
 // standard wire protocol over TCP, so there's no environment branching here.
-export const pool = new Pool({
+export const pool = surviveIdleFailures(new Pool({
   connectionString: env.DATABASE_URL,
   // Neon (and most managed Postgres) require TLS; local Docker doesn't offer it.
   ssl: sslConfigFor(env.DATABASE_URL),
-});
+  connectionTimeoutMillis: CONNECTION_TIMEOUT_MS,
+}), "owner");
 
 const db = drizzle({
   client: pool,
@@ -41,10 +68,11 @@ const db = drizzle({
   schema,
 });
 
-export const appPool = new Pool({
+export const appPool = surviveIdleFailures(new Pool({
   connectionString: env.APP_DATABASE_URL,
   ssl: sslConfigFor(env.APP_DATABASE_URL),
-});
+  connectionTimeoutMillis: CONNECTION_TIMEOUT_MS,
+}), "app");
 
 export const appDb = drizzle({
   client: appPool,

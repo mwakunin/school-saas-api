@@ -457,30 +457,47 @@ export const listInvoices: TenantRouteHandler<ListInvoicesRoute> = async (c) => 
 
   const where = filters.length > 0 ? and(...filters) : undefined;
 
-  const [{ total }] = await db
-    .select({ total: count() })
-    .from(invoices)
-    .where(where);
-
-  const rows = await db
+  /*
+   * `outstandingOnly` has to be applied BEFORE paging, not after.
+   *
+   * "Outstanding" is derived from payments, so it is not a column the query can
+   * filter on (CLAUDE.md §3 rule 4 — a stored balance would drift). The first
+   * version paged first and filtered the page, which produced two wrong
+   * things at once: a "page" of 50 that came back holding 3 rows, and a `total`
+   * counting invoices the filter had just excluded. A bursar reconciling
+   * against that total would be chasing a figure no screen agrees with.
+   *
+   * So the filtered path resolves the whole matching set, filters it, and pages
+   * in memory. Bounded by one term's invoices — a few hundred rows for a school
+   * of this size — and honest, which the alternative was not.
+   */
+  const matchingIds = await db
     .select({ id: invoices.id })
     .from(invoices)
     .where(where)
-    .orderBy(desc(invoices.issuedOn))
-    .limit(query.limit)
-    .offset(query.offset);
+    .orderBy(desc(invoices.issuedOn));
 
-  const detailed = await Promise.all(rows.map(r => invoiceDetail(db, r.id)));
-  const list = detailed.filter(i => i !== null);
+  if (!query.outstandingOnly) {
+    const page = matchingIds.slice(query.offset, query.offset + query.limit);
+    const detailed = await Promise.all(page.map(r => invoiceDetail(db, r.id)));
 
-  // Filtered after the fact: "outstanding" is derived from payments, so it is
-  // not a column the query could have used. Fine at a term's scale, and the
-  // alternative is a stored balance that drifts (CLAUDE.md §3 rule 4).
-  const filtered = query.outstandingOnly
-    ? list.filter(i => i.outstandingCents > 0)
-    : list;
+    return c.json({
+      invoices: detailed.filter(i => i !== null),
+      total: matchingIds.length,
+    }, HttpStatusCodes.OK);
+  }
 
-  return c.json({ invoices: filtered, total }, HttpStatusCodes.OK);
+  const all = await Promise.all(matchingIds.map(r => invoiceDetail(db, r.id)));
+  const outstanding = all
+    .filter(i => i !== null)
+    .filter(i => i.outstandingCents > 0);
+
+  return c.json({
+    invoices: outstanding.slice(query.offset, query.offset + query.limit),
+    // Counts what the filter actually matched, so paging through it terminates
+    // where the caller expects.
+    total: outstanding.length,
+  }, HttpStatusCodes.OK);
 };
 
 export const getInvoice: TenantRouteHandler<GetInvoiceRoute> = async (c) => {
@@ -697,6 +714,15 @@ export const listBalances: TenantRouteHandler<ListBalancesRoute> = async (c) => 
     filters.push(inArray(students.id, matching));
   }
 
+  /*
+   * The whole matching roll, not one page of it.
+   *
+   * `totalOutstandingCents` is a school-wide figure — it is what a head looks
+   * at to answer "how much are we missing". Computing it from the current page
+   * made it silently mean "how much the first 100 families owe", which is a
+   * smaller number that looks equally plausible and is wrong by an amount
+   * nobody can see. The page is applied to the rows returned; the total is not.
+   */
   const roll = await db
     .select({
       id: students.id,
@@ -706,9 +732,7 @@ export const listBalances: TenantRouteHandler<ListBalancesRoute> = async (c) => 
     })
     .from(students)
     .where(and(...filters))
-    .orderBy(asc(students.familyName), asc(students.givenName))
-    .limit(query.limit)
-    .offset(query.offset);
+    .orderBy(asc(students.familyName), asc(students.givenName));
 
   const balances = await balancesFor(db, roll.map(s => s.id));
 
@@ -724,13 +748,13 @@ export const listBalances: TenantRouteHandler<ListBalancesRoute> = async (c) => 
     };
   });
 
-  const shown = query.owingOnly ? rows.filter(r => r.balanceCents > 0) : rows;
+  const matching = query.owingOnly ? rows.filter(r => r.balanceCents > 0) : rows;
 
   return c.json({
-    balances: shown,
-    // Only debts count towards the school's outstanding figure — families in
-    // credit must not net off against families who owe, or the number a head
-    // reads is smaller than the money actually missing.
+    balances: matching.slice(query.offset, query.offset + query.limit),
+    // Only debts count — families in credit must not net off against families
+    // who owe, or the number a head reads is smaller than the money actually
+    // missing.
     totalOutstandingCents: rows
       .filter(r => r.balanceCents > 0)
       .reduce((sum, r) => sum + r.balanceCents, 0),

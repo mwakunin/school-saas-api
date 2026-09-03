@@ -22,6 +22,27 @@
 --
 -- The password here is a local-development default. Production must set its
 -- own out of band:  ALTER ROLE school_app PASSWORD '...';
+--
+-- ---------------------------------------------------------------------------
+-- DEPLOYMENT REQUIREMENT for the OTHER connection (DATABASE_URL)
+--
+-- `FORCE ROW LEVEL SECURITY` subjects even a table's owner to the policies.
+-- That is deliberate — it closes the owner-exemption half of the problem — but
+-- it means the owner connection keeps its cross-tenant reach only if its role
+-- is a SUPERUSER or holds BYPASSRLS.
+--
+-- Locally and in CI it is a superuser, because Docker's POSTGRES_USER is one.
+-- On a managed provider it usually is not: Neon's default role owns the tables
+-- and is not a superuser, so `db` would quietly fall under the policies —
+-- migrations still apply, but the superadmin plane lists zero schools and the
+-- test harness truncates nothing.
+--
+-- So provision DATABASE_URL from a role that can bypass. On Neon that is
+-- `neon_superuser`; elsewhere:  ALTER ROLE <owner> BYPASSRLS;
+--
+-- `rls.test.ts` asserts this, so a deployment that gets it wrong fails a test
+-- rather than behaving strangely in production.
+-- ---------------------------------------------------------------------------
 
 DO $$
 BEGIN

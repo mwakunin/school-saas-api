@@ -29,7 +29,12 @@ function findPgError(err: unknown): PgErrorLike | undefined {
   let current = err;
 
   for (let depth = 0; current != null && depth < 5; depth += 1) {
-    if (typeof current === "object" && "code" in current)
+    // A STRING `code`, not merely the presence of one. Node attaches numeric
+    // and symbolic `code` values to plenty of errors (`ECONNREFUSED`, an
+    // AggregateError), and stopping at the first object that happens to have
+    // the property would return a wrapper whose SQLSTATE is undefined — while
+    // the real pg error sat one link further down the chain.
+    if (typeof current === "object" && typeof (current as PgErrorLike).code === "string")
       return current as PgErrorLike;
 
     current = (current as PgErrorLike).cause;

@@ -8,6 +8,7 @@ import {
   streams,
   students,
 } from "@/db/schema";
+import { todayInBusinessZone } from "@/lib/dates";
 import { normalizeKenyanPhone } from "@/lib/phone";
 import { toZodV4SchemaTyped } from "@/lib/zod-utils";
 
@@ -51,9 +52,16 @@ const optionalKenyanPhone = z.string().optional().transform((value, ctx) => {
   return normalized;
 });
 
-/** A calendar day that is not in the future — a birthday, an admission date. */
+/**
+ * A calendar day that is not in the future — a birthday, an admission date.
+ *
+ * "Today" is Kenya's, not UTC's. Kenya is UTC+3, so for the first three hours
+ * of each Kenyan day UTC still reports yesterday — and a clerk admitting a
+ * child at 8am on the 6th would be told the 6th is in the future. Same reason
+ * `lib/dates.ts` exists at all.
+ */
 const pastDate = z.iso.date().refine(
-  value => value <= new Date().toISOString().slice(0, 10),
+  value => value <= todayInBusinessZone(),
   "Cannot be in the future",
 );
 

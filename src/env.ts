@@ -203,6 +203,31 @@ const EnvSchema = z.object({
     const owner = parseRole(input.DATABASE_URL);
     const app = parseRole(input.APP_DATABASE_URL);
 
+    /*
+     * A missing username is rejected, not skipped.
+     *
+     * Both DSNs omitting the role is the case that used to slip through: the
+     * comparison below had nothing to compare, so it passed — while libpq
+     * quietly fell back to PGUSER or the OS user for both, making them the
+     * same role and disabling isolation. The check has to be able to see what
+     * it is checking.
+     */
+    for (const [key, role] of [
+      ["DATABASE_URL", owner],
+      ["APP_DATABASE_URL", app],
+    ] as const) {
+      if (!role) {
+        ctx.addIssue({
+          code: "custom",
+          path: [key],
+          message:
+            "Must name its role explicitly (postgresql://ROLE:password@host/db). "
+            + "Without it the connecting role comes from the environment, and "
+            + "the two connections cannot be shown to differ.",
+        });
+      }
+    }
+
     if (owner && app && owner === app) {
       ctx.addIssue({
         code: "custom",

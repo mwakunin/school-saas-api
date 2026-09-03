@@ -34,7 +34,25 @@ const router = createRouter()
       let database: "up" | "down" = "up";
 
       try {
-        await db.execute(sql`select 1`);
+        /*
+         * Bounded on both halves, and bounded by Postgres rather than by a
+         * timer here.
+         *
+         * Waiting for a connection is capped by the pool's
+         * `connectionTimeoutMillis` (see db/index.ts). Running the query is
+         * capped by a transaction-local `statement_timeout`, so a probe that
+         * outlives its welcome is cancelled server-side instead of being
+         * abandoned client-side while the backend keeps working — which is
+         * what a bare `Promise.race` would do, and why this is not one.
+         *
+         * A readiness probe that can hang is worse than one that fails: the
+         * load balancer learns nothing either way, but a hung probe also holds
+         * a connection while it does so.
+         */
+        await db.transaction(async (tx) => {
+          await tx.execute(sql`SET LOCAL statement_timeout = 2000`);
+          await tx.execute(sql`select 1`);
+        });
       }
       catch (err) {
         database = "down";

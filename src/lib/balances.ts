@@ -181,14 +181,24 @@ export async function invoiceBalancesFor(
 
   return new Map(rows.map((row) => {
     const paidCents = paidByInvoice.get(row.id) ?? 0;
+    const voided = row.voidedAt !== null;
     // A voided invoice is owed nothing, whatever its total says.
-    const totalCents = row.voidedAt ? 0 : row.totalCents;
+    const totalCents = voided ? 0 : row.totalCents;
 
     return [row.id, {
       invoiceId: row.id,
       totalCents,
       paidCents,
-      outstandingCents: totalCents - paidCents,
+      /*
+       * Zero when voided, rather than `0 - paidCents`.
+       *
+       * An invoice that was paid and then voided would otherwise report a
+       * NEGATIVE amount outstanding, which reads on a statement as the school
+       * owing the family — on this invoice alone, which is not a claim it can
+       * make. Whether a refund is due is a question about the student's
+       * balance, where the payment still counts; see `balancesFor`.
+       */
+      outstandingCents: voided ? 0 : totalCents - paidCents,
     }];
   }));
 }
@@ -205,6 +215,22 @@ export async function recomputeInvoiceTotal(
   db: AppDb,
   invoiceId: string,
 ): Promise<number> {
+  /*
+   * Lock the invoice before summing its lines.
+   *
+   * Without this, two concurrent line additions can leave the total short. In
+   * READ COMMITTED, when a blocked UPDATE is released it re-checks its WHERE
+   * against the new row version, but a subquery in the SET list was already
+   * evaluated against the statement's original snapshot — so the second writer
+   * can store a sum computed before the first writer's line existed. The
+   * invoice then disagrees with its own lines, permanently and silently.
+   *
+   * Taking the row lock in a separate statement first means the second
+   * transaction blocks here, and its aggregate below runs as a NEW statement
+   * once the first has committed — so it sees every line.
+   */
+  await db.execute(sql`SELECT id FROM invoices WHERE id = ${invoiceId} FOR UPDATE`);
+
   const [row] = await db.execute<{ total: string }>(sql`
     UPDATE invoices
     SET total_cents = coalesce(

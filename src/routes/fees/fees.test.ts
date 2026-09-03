@@ -570,6 +570,74 @@ describe("fees", () => {
       expect(owing.balances.every((b: { balanceCents: number }) => b.balanceCents > 0)).toBe(true);
     });
 
+    it("totals outstanding across the whole school, not just one page", async () => {
+      const { bursar, term1, setFees, school } = await seed("alpha");
+      await setFees([TUITION]);
+      const blue = await makeStream(school, 6, "Extra");
+
+      // Five more children, so the roll exceeds a deliberately small page.
+      for (let i = 10; i < 15; i += 1) {
+        await makeStudent(school, `2026/0${i}`, {
+          givenName: `Extra${i}`,
+          streamId: blue.id,
+          boardingStatus: "day",
+        });
+      }
+      await post("/fee-structures", {
+        termId: term1.id,
+        gradeLevelId: school.gradeLevels.find(g => g.sequence === 6)!.id,
+        boardingStatus: "day",
+        items: [TUITION],
+      }, jsonHeaders("alpha", bursar));
+
+      await post("/invoices/generate", {
+        termId: term1.id,
+        issuedOn: "2026-01-06",
+      }, jsonHeaders("alpha", bursar));
+
+      const page = await (await app.request("/balances?limit=2", {
+        headers: tenantHeaders("alpha", bursar),
+      })).json();
+
+      // The page is two rows; the figure a head reads is the school's. When
+      // this was computed from the page it silently meant "what the first two
+      // families owe" — a smaller number that looks just as plausible.
+      expect(page.balances).toHaveLength(2);
+      expect(page.totalOutstandingCents).toBe(8 * 1_800_000);
+    });
+
+    it("pages the outstanding-only invoice filter, not the page", async () => {
+      const { bursar, kids, term1, setFees } = await seed("alpha");
+      await setFees([TUITION]);
+      await post("/invoices/generate", {
+        termId: term1.id,
+        issuedOn: "2026-01-06",
+      }, jsonHeaders("alpha", bursar));
+
+      // Settle one of the three in full.
+      const [settled] = await db
+        .select()
+        .from(invoices)
+        .where(eq(invoices.studentId, kids[0].id));
+      await post("/payments", {
+        studentId: kids[0].id,
+        invoiceId: settled.id,
+        method: "cash",
+        amountCents: 1_800_000,
+      }, jsonHeaders("alpha", bursar));
+
+      const res = await (await app.request("/invoices?outstandingOnly=true", {
+        headers: tenantHeaders("alpha", bursar),
+      })).json();
+
+      // `total` has to count what the filter matched. Filtering a page after
+      // the fact left it counting invoices the filter had just removed, so
+      // paging through the result never terminated where the caller expected.
+      expect(res.invoices).toHaveLength(2);
+      expect(res.total).toBe(2);
+      expect(res.invoices.every((i: { outstandingCents: number }) => i.outstandingCents > 0)).toBe(true);
+    });
+
     it("422s a payment against another school's student", async () => {
       const { bursar } = await billed("alpha");
       const betaSeed = await seed("beta");
