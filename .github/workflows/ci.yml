@@ -75,6 +75,14 @@ jobs:
 
       - run: pnpm install --frozen-lockfile
 
+      # Service containers cannot mount an init script, so the runtime role is
+      # created here instead — from the same db/roles.sql that docker-compose
+      # mounts locally and that Neon is provisioned with. One definition, three
+      # invocations: a role that differed between CI and dev would make the RLS
+      # tests pass here and mean nothing.
+      - name: Create the unprivileged runtime role
+        run: PGPASSWORD=school psql -h localhost -p 5435 -U school -d school_test -f db/roles.sql
+
       - name: Lint
         run: pnpm lint
 
@@ -120,11 +128,15 @@ jobs:
       # that previous runs already touched, so it would not catch a migration
       # that only fails from nothing. Several fixes in this repo's history
       # were exactly that.
+      - name: Create the unprivileged runtime role
+        run: PGPASSWORD=school psql -h localhost -p 5435 -U school -d fresh -f db/roles.sql
+
       - name: Apply every migration from scratch
         run: pnpm exec tsx src/db/migrate.ts
         env:
           NODE_ENV: test
           TEST_DATABASE_URL: postgresql://school:school@localhost:5435/fresh
+          TEST_APP_DATABASE_URL: postgresql://school_app:school_app@localhost:5435/fresh
 
   docker:
     name: docker image builds

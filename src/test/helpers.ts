@@ -2,11 +2,19 @@ import type { SQL } from "drizzle-orm";
 
 import { eq, sql } from "drizzle-orm";
 
-import type { UserRole } from "@/lib/types";
+import type { MembershipRole, UserRole } from "@/lib/types";
 
 import app from "@/app";
 import db, { pool } from "@/db";
-import { user } from "@/db/schema";
+import {
+  academicYears,
+  gradeLevels,
+  memberships,
+  schools,
+  terms,
+  user,
+} from "@/db/schema";
+import { GRADE_LEVELS, termsForYear } from "@/lib/academic-spine";
 import { sentOtps } from "@/lib/auth";
 import { sentEmails } from "@/lib/email";
 import { normalizeKenyanPhone } from "@/lib/phone";
@@ -215,4 +223,113 @@ let emailCounter = 0;
 export function nextEmail() {
   emailCounter += 1;
   return `person${emailCounter}@example.test`;
+}
+
+// ---------------------------------------------------------------------------
+// Tenancy
+// ---------------------------------------------------------------------------
+
+let subdomainCounter = 0;
+
+/**
+ * Creates a school with its academic spine, on the OWNER connection.
+ *
+ * Test setup legitimately works across tenants — an isolation test needs two
+ * schools to exist before either can be shown to be invisible to the other —
+ * so this is one of the few places outside the superadmin plane that may use
+ * the unscoped connection.
+ */
+export async function makeSchool(overrides: {
+  name?: string;
+  subdomain?: string;
+  status?: "trial" | "active" | "suspended" | "demo";
+  year?: number;
+} = {}) {
+  subdomainCounter += 1;
+  const subdomain = overrides.subdomain ?? `school${subdomainCounter}`;
+  const year = overrides.year ?? 2026;
+
+  const [school] = await db
+    .insert(schools)
+    .values({
+      name: overrides.name ?? `Test School ${subdomainCounter}`,
+      subdomain,
+      status: overrides.status ?? "active",
+    })
+    .returning();
+
+  const [academicYear] = await db
+    .insert(academicYears)
+    .values({ schoolId: school.id, year, isCurrent: true })
+    .returning();
+
+  const insertedTerms = await db
+    .insert(terms)
+    .values(termsForYear(year).map(t => ({
+      schoolId: school.id,
+      academicYearId: academicYear.id,
+      number: t.number,
+      startsOn: t.startsOn,
+      endsOn: t.endsOn,
+    })))
+    .returning();
+
+  const insertedGrades = await db
+    .insert(gradeLevels)
+    .values(GRADE_LEVELS.map(g => ({
+      schoolId: school.id,
+      name: g.name,
+      sequence: g.sequence,
+      phase: g.phase,
+    })))
+    .returning();
+
+  return {
+    ...school,
+    subdomain,
+    academicYear,
+    terms: insertedTerms,
+    gradeLevels: insertedGrades,
+  };
+}
+
+/** Gives `userId` a role at `schoolId`. A person may hold several. */
+export async function addMembership(
+  userId: string,
+  schoolId: string,
+  role: MembershipRole,
+) {
+  const [row] = await db
+    .insert(memberships)
+    .values({ userId, schoolId, role })
+    .returning();
+
+  return row;
+}
+
+/**
+ * Request headers addressing a school, carrying a signed-in session.
+ *
+ * The Host header is how the tenant is chosen, so a test that forgets it is
+ * testing the 404 path rather than what it meant to. `ROOT_DOMAIN` defaults to
+ * `localhost` in test, matching .env.test.
+ */
+export function tenantHeaders(subdomain: string, user?: TestUser) {
+  return {
+    host: `${subdomain}.localhost`,
+    ...(user ? user.headers : {}),
+  };
+}
+
+/**
+ * Signs someone in and gives them a role at a school, which is the setup
+ * almost every tenant test needs.
+ */
+export async function signInAt(
+  schoolId: string,
+  role: MembershipRole,
+): Promise<TestUser> {
+  const person = await signIn(nextPhone());
+  await addMembership(person.id, schoolId, role);
+  return person;
 }

@@ -29,19 +29,57 @@ const PRODUCTION_REQUIRED = [
   "IMAGEKIT_URL_ENDPOINT",
 ] as const;
 
+/** The username from a DSN, or undefined if it isn't parseable. */
+function parseRole(dsn: string | undefined): string | undefined {
+  if (!dsn)
+    return undefined;
+  try {
+    return decodeURIComponent(new URL(dsn).username) || undefined;
+  }
+  catch {
+    return undefined;
+  }
+}
+
 const EnvSchema = z.object({
   NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
   PORT: z.coerce.number().int().positive().default(9999),
   LOG_LEVEL: z.enum(["fatal", "error", "warn", "info", "debug", "trace", "silent"]),
 
   // --- Data stores ---
+  /**
+   * The OWNER connection: migrations, the test harness, the superadmin plane.
+   * Exempt from row-level security, so nothing that serves a tenant request
+   * may use it.
+   */
   DATABASE_URL: z.url(),
+  /**
+   * The unprivileged runtime connection (`school_app`, see db/roles.sql).
+   * Subject to RLS, which is what makes the policies load-bearing rather than
+   * decorative.
+   *
+   * Required, and required to be *different* from DATABASE_URL — the whole
+   * guarantee collapses if they are the same role, and a deployment that
+   * quietly pointed both at the owner would look completely healthy.
+   */
+  APP_DATABASE_URL: z.url(),
   TEST_DATABASE_URL: z.url().optional(),
+  TEST_APP_DATABASE_URL: z.url().optional(),
   REDIS_URL: z.url(),
 
   // --- Auth (Better Auth) ---
   BETTER_AUTH_SECRET: z.string().min(32, "Must be at least 32 characters"),
   BETTER_AUTH_URL: z.url(),
+
+  /**
+   * The domain schools are hosted under: `stmarys.example.co.ke` resolves the
+   * `stmarys` tenant when this is `example.co.ke`. Requires wildcard DNS and a
+   * wildcard TLS certificate (CLAUDE.md §2).
+   *
+   * Locally this is `localhost`, which browsers resolve for any subdomain
+   * without hosts-file edits, so `stmarys.localhost:9999` just works.
+   */
+  ROOT_DOMAIN: z.string().min(1).default("localhost"),
 
   // --- M-Pesa ---
   // Picks the Daraja host: sandbox.safaricom.co.ke vs api.safaricom.co.ke.
@@ -143,14 +181,50 @@ const EnvSchema = z.object({
         message: "Must be set when NODE_ENV is 'test'",
       });
     }
+
+    if (input.NODE_ENV === "test" && !input.TEST_APP_DATABASE_URL) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["TEST_APP_DATABASE_URL"],
+        message: "Must be set when NODE_ENV is 'test'",
+      });
+    }
+
+    /*
+     * The two connections must be different roles.
+     *
+     * If APP_DATABASE_URL points at the owner, every RLS policy silently stops
+     * applying and one school can read another's children's records — with no
+     * error, no failing test that doesn't check for this specifically, and a
+     * `pg_policies` listing that still looks correct. It is the single
+     * highest-consequence misconfiguration in the system, so it fails at boot
+     * rather than at the first cross-tenant read.
+     */
+    const owner = parseRole(input.DATABASE_URL);
+    const app = parseRole(input.APP_DATABASE_URL);
+
+    if (owner && app && owner === app) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["APP_DATABASE_URL"],
+        message:
+          `Must connect as a different role from DATABASE_URL (both are `
+          + `'${owner}'). The owner role bypasses row-level security, so `
+          + `sharing it disables tenant isolation entirely — see db/roles.sql.`,
+      });
+    }
   })
   .transform(input => ({
     ...input,
-    // Everything downstream reads DATABASE_URL; in test it resolves to the
-    // disposable test database so no caller has to remember the distinction.
+    // Everything downstream reads DATABASE_URL / APP_DATABASE_URL; in test they
+    // resolve to the disposable test database so no caller has to remember the
+    // distinction.
     DATABASE_URL: input.NODE_ENV === "test" && input.TEST_DATABASE_URL
       ? input.TEST_DATABASE_URL
       : input.DATABASE_URL,
+    APP_DATABASE_URL: input.NODE_ENV === "test" && input.TEST_APP_DATABASE_URL
+      ? input.TEST_APP_DATABASE_URL
+      : input.APP_DATABASE_URL,
   }));
 
 export type env = z.infer<typeof EnvSchema>;

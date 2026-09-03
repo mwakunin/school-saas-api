@@ -9,12 +9,27 @@ import { withSession } from "@/middlewares/auth";
 import { pinoLogger } from "@/middlewares/pino-logger";
 import { rateLimits } from "@/middlewares/rate-limit";
 
-import type { AppBindings, AppOpenAPI } from "./types";
+import type { AppBindings, AppOpenAPI, TenantBindings } from "./types";
 
 import { auth } from "./auth";
 
 export function createRouter() {
   return new OpenAPIHono<AppBindings>({
+    strict: false,
+    defaultHook,
+  });
+}
+
+/**
+ * A router for routes that act on behalf of one school.
+ *
+ * Differs from `createRouter` only in its bindings, and that is the point:
+ * `c.var.db` exists on this type and not on the other, so a tenant route
+ * reaching for the module-level connection is a type error rather than a
+ * silent cross-tenant read. Mount these behind `tenantChain`.
+ */
+export function createTenantRouter() {
+  return new OpenAPIHono<TenantBindings>({
     strict: false,
     defaultHook,
   });

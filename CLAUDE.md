@@ -52,11 +52,11 @@ Tenant routing is **subdomain-based**: `stmarys.example.co.ke`. Requires wildcar
 
 These are load-bearing. Do not deviate without discussion.
 
-1. **`schoolId` on every domain table.** Even where it is derivable through a foreign key. Uniform tenant guard and future RLS depend on it.
-2. **Never query the raw `db` export from a route handler.** Use the scoped client (§4). One forgotten `where` clause in a product holding children's records is a business-ending bug.
+1. **`schoolId` on every domain table.** Even where it is derivable through a foreign key. The RLS policies and the uniform tenant guard depend on it.
+2. **Never query the raw `db` export from a route handler.** Use `c.get('db')` (§4). One forgotten `where` clause in a product holding children's records is a business-ending bug. Enforced by `db/db-access.test.ts`, which fails the build on a stray import.
 3. **Money is integer cents.** Never floats, never `numeric` for money. Field names end in `Cents`.
 4. **Balances are derived**, never stored. `sum(invoices) - sum(payments)`. Materialize later only if measured to be slow.
-5. **Nothing hard-deletes.** Students, invoices, payments, and scores are only ever status-transitioned. Withdrawn students must remain fully queryable.
+5. **Nothing hard-deletes.** Students, invoices, payments, and scores are only ever status-transitioned. Withdrawn students must remain fully queryable. The runtime role holds no `DELETE` privilege on domain tables, so this is a database guarantee rather than a habit.
 6. **Scores hang off `enrollmentId`, never `studentId`.** A mark is "this child, in this stream, in this year".
 7. **Snapshot anything printed.** Report cards and invoices freeze their content at finalisation. Regenerating a 2026 report card in 2028 must not produce different output.
 8. **Say CBE, not CBC**, in table names, code, and all UI copy. The rename came out of the Presidential Working Party on Education Reform.
@@ -69,29 +69,21 @@ These are load-bearing. Do not deviate without discussion.
 
 Shared schema, shared database, `school_id` discriminator. Not schema-per-tenant — migrations across dozens of tenants are not worth it at this scale.
 
-Isolation is enforced structurally:
+**Isolation lives in Postgres, not in application discipline.** An earlier draft of this document put a hand-written `forSchool()` namespace-per-aggregate here and deferred RLS to "later, as defence in depth". That is inverted: a scoped client is a convention, and the failure mode of a convention is one forgotten `where` clause — silent, invisible in review, and indistinguishable from correct code until a parent at one school sees another school's pupils.
 
-```ts
-// db/tenant.ts
-export function forSchool(schoolId: string) {
-  return {
-    students: {
-      list: () =>
-        db.select().from(students).where(eq(students.schoolId, schoolId)),
-      byId: (id: string) =>
-        db.select().from(students)
-          .where(and(eq(students.id, id), eq(students.schoolId, schoolId))),
-    },
-    // ... one namespace per aggregate
-  };
-}
-```
+Four layers, strongest first.
 
-Middleware resolves the school from subdomain + session, verifies the user has a `membership` for it, and puts the scoped client on Hono's context. Handlers use `c.get('db')` only.
+**1. Two database connections.** `db` connects as the table owner; `appDb` connects as `school_app`, an unprivileged role (`db/roles.sql`). Postgres exempts a table's owner from RLS and a superuser from it outright, so the app must not connect as either — otherwise the policies exist, appear in `pg_policies`, and do nothing. The owner connection is confined to migrations, the test harness, the subdomain→school bootstrap, and the superadmin plane; `db/db-access.test.ts` enforces that allowlist.
 
-Postgres RLS can be layered underneath later as defence in depth. It is not a substitute for the above.
+**2. A transaction per tenant request.** `withTenant` resolves the subdomain, opens a transaction on `appDb`, and sets `app.school_id` with `set_config(..., true)` — transaction-scoped, so it cannot outlive the request and leak onto the next borrower of a pooled connection. Handlers use `c.get('db')`, which is that transaction. Requests are therefore atomic: an error status rolls the whole thing back.
 
-**Superadmin plane** is a separate app/route namespace, not a role inside a tenant. It onboards schools, seeds their academic year and class structure, and suspends non-payers. Build it early and ugly — the alternative is onboarding schools with SQL scripts.
+**3. Policies on every tenant table**, `USING` and `WITH CHECK` both, so a write attributed to another school is refused as firmly as a read. `ENABLE` plus `FORCE ROW LEVEL SECURITY`. With no tenant set, every query returns zero rows — never everything.
+
+**4. Composite foreign keys.** RLS does **not** constrain foreign keys: Postgres validates a reference internally, bypassing policies. So child rows reference `(school_id, id)`, not `(id)`, which makes a cross-tenant pointer fail the constraint. Without this a stream at one school could legally reference another school's grade level, and every policy would allow it. Any new tenant table referencing another must do the same; `rls.test.ts` fails the build otherwise.
+
+Roles come from `memberships` via `withMembership`, and `requireMembershipRole(...)` guards routes. The global `user.role` is **only** `'user' | 'superadmin'` — it cannot express "bursar at St Mary's".
+
+**Superadmin plane** is a separate app/route namespace, not a role inside a tenant. It onboards schools (seeding Grade 1–9, the academic year and its three terms), and suspends non-payers. It is the one plane that legitimately works across tenants, so it keeps the owner connection. Build it early and ugly — the alternative is onboarding schools with SQL scripts.
 
 ---
 
@@ -131,12 +123,14 @@ export const schools = pgTable('schools', {
 });
 ```
 
-`users` is Better Auth's table — **global**, not tenant-scoped. A person may work at two schools, or be both a teacher and a parent at one.
+`user` is Better Auth's table — **global**, not tenant-scoped, and singular. A person may work at two schools, or be both a teacher and a parent at one.
+
+**Its `id` is `text`, not `uuid`.** Better Auth generates its own string ids, so every foreign key into it is `text(...)`. Domain-to-domain keys stay `uuid`. An earlier draft of this document had `uuid` throughout; the constraint simply fails to create.
 
 ```ts
 export const memberships = pgTable('memberships', {
   id: uuid('id').primaryKey().defaultRandom(),
-  userId: uuid('user_id').notNull().references(() => users.id),
+  userId: text('user_id').notNull().references(() => user.id),
   schoolId: uuid('school_id').notNull().references(() => schools.id),
   role: text('role')
     .$type<'admin' | 'bursar' | 'teacher' | 'guardian'>()
@@ -185,7 +179,7 @@ export const streams = pgTable('streams', {
   gradeLevelId: uuid('grade_level_id').notNull().references(() => gradeLevels.id),
   academicYearId: uuid('academic_year_id').notNull().references(() => academicYears.id),
   name: text('name').notNull(),                     // 'Blue', 'East', 'A'
-  classTeacherId: uuid('class_teacher_id').references(() => users.id),
+  classTeacherId: text('class_teacher_id').references(() => user.id),
 }, (t) => [unique().on(t.gradeLevelId, t.academicYearId, t.name)]);
 ```
 
@@ -217,7 +211,7 @@ export const students = pgTable('students', {
   photoUrl: text('photo_url'),
 
   // optional portal login; most Grade 1-9 pupils will never have one
-  userId: uuid('user_id').references(() => users.id),
+  userId: text('user_id').references(() => user.id),
 
   status: text('status')
     .$type<'active' | 'transferred_out' | 'graduated' | 'withdrawn' | 'deceased'>()
@@ -258,7 +252,7 @@ export const enrollments = pgTable('enrollments', {
 export const guardians = pgTable('guardians', {
   id: uuid('id').primaryKey().defaultRandom(),
   schoolId: uuid('school_id').notNull(),
-  userId: uuid('user_id').references(() => users.id),  // null until they sign up
+  userId: text('user_id').references(() => user.id),  // null until they sign up
   name: text('name').notNull(),
   phone: text('phone').notNull(),                      // E.164; the SMS target
   altPhone: text('alt_phone'),
@@ -334,7 +328,7 @@ export const assessments = pgTable('assessments', {
   weight: numeric('weight', { precision: 5, scale: 2 }),
 
   administeredOn: date('administered_on'),
-  createdBy: uuid('created_by').references(() => users.id),
+  createdBy: text('created_by').references(() => user.id),
   publishedAt: timestamp('published_at'),  // null = teachers still entering
 });
 
@@ -350,7 +344,7 @@ export const assessmentScores = pgTable('assessment_scores', {
   isAbsent: boolean('is_absent').default(false).notNull(),
   comment: text('comment'),
 
-  enteredBy: uuid('entered_by').references(() => users.id),
+  enteredBy: text('entered_by').references(() => user.id),
   enteredAt: timestamp('entered_at').defaultNow().notNull(),
 }, (t) => [unique().on(t.assessmentId, t.enrollmentId, t.competencyId)]);
 ```
@@ -369,7 +363,7 @@ export const scoreAttachments = pgTable('score_attachments', {
   url: text('url').notNull(),              // ImageKit
   kind: text('kind').$type<'image' | 'audio' | 'video' | 'document'>().notNull(),
   caption: text('caption'),
-  uploadedBy: uuid('uploaded_by').references(() => users.id),
+  uploadedBy: text('uploaded_by').references(() => user.id),
   uploadedAt: timestamp('uploaded_at').defaultNow().notNull(),
 });
 ```
@@ -413,7 +407,7 @@ export const reportCards = pgTable('report_cards', {
   attendancePresent: integer('attendance_present'),
   attendanceTotal: integer('attendance_total'),
 
-  finalisedBy: uuid('finalised_by').references(() => users.id),
+  finalisedBy: text('finalised_by').references(() => user.id),
   finalisedAt: timestamp('finalised_at'),
   releasedAt: timestamp('released_at'),    // null = not visible to guardians
 }, (t) => [unique().on(t.enrollmentId, t.termId)]);
@@ -503,7 +497,7 @@ export const payments = pgTable('payments', {
     .$type<'mpesa' | 'bank' | 'cash' | 'cheque'>().notNull(),
   amountCents: integer('amount_cents').notNull(),
   reference: text('reference'),
-  recordedBy: uuid('recorded_by').references(() => users.id),
+  recordedBy: text('recorded_by').references(() => user.id),
   receivedAt: timestamp('received_at').notNull(),
   reversedAt: timestamp('reversed_at'),
   reversalReason: text('reversal_reason'),
@@ -523,7 +517,7 @@ Rules:
 ## 6. Table inventory
 
 ```
-schools, users, memberships
+schools, user, memberships
 academic_years, terms
 grade_levels, streams, enrollments
 students, guardians, student_guardians
@@ -536,18 +530,25 @@ mpesa_transactions, payments
 
 ~22 tables. Everything deferred (attendance, timetables, transport, library, SMS templates) hangs off `enrollments` and `terms` without disturbing this.
 
+Two more are needed before v1 ships and are not yet built:
+
+- **`sms_messages`** — Africa's Talking charges per unit and reports delivery asynchronously, so schools will ask what they are spending. Needs recipient, body, provider id, status, cost, and the guardian or student it concerns.
+- **`audit_log`** — who changed a mark, who reversed a payment, who released a report card. For a product holding children's records and school money this is both a safeguard and a sales point.
+
 ---
 
 ## 7. Build order
 
-1. Fork the existing scaffold. Strip domain, keep auth, rate limiting, Docker dev/test databases, CI.
-2. Tenancy + academic spine + scoped client (§4, §5.1, §5.2).
+1. ~~Fork the existing scaffold. Strip domain, keep auth, rate limiting, Docker dev/test databases, CI.~~ **Done.**
+2. ~~Tenancy + academic spine + RLS + superadmin plane (§4, §5.1, §5.2).~~ **Done.**
 3. Students, guardians, enrollment (§5.3).
 4. Fees: structures → invoice generation for one term (§5.7).
 5. Daraja C2B against sandbox + reconciliation queue (§5.8).
 6. Bursar dashboard: outstanding balances per class.
 7. **Put it in front of one real school before writing anything else.**
 8. Curriculum seed + assessment + report cards (§5.4–5.6).
+
+The demo seed (§8) is **not** a phase-8 activity. Grow `seed/01…06` alongside steps 3–6: it is what makes each step testable, and running it in CI is what catches a migration that broke something real.
 
 Fees ships first because it is what a bursar will pay for — someone is currently matching M-Pesa messages to a ledger by hand. It also forces the spine into existence, since you cannot invoice a student without terms, classes, and enrollment.
 

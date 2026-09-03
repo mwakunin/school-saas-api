@@ -8,6 +8,20 @@
       "when": 1788457858995,
       "tag": "0000_auth_tables",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1788461531990,
+      "tag": "0001_tenancy_and_academic_spine",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1788461532990,
+      "tag": "0002_tenant_rls",
+      "breakpoints": true
     }
   ]
 }

@@ -2,7 +2,7 @@ import { betterAuth } from "better-auth";
 import { drizzleAdapter } from "better-auth/adapters/drizzle";
 import { phoneNumber } from "better-auth/plugins";
 
-import db from "@/db";
+import { appDb } from "@/db";
 import * as authSchema from "@/db/auth-schema";
 import env from "@/env";
 
@@ -70,7 +70,7 @@ export const auth = betterAuth({
   secret: env.BETTER_AUTH_SECRET,
   baseURL: env.BETTER_AUTH_URL,
 
-  database: drizzleAdapter(db, {
+  database: drizzleAdapter(appDb, {
     provider: "pg",
     schema: authSchema,
   }),

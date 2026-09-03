@@ -23,7 +23,7 @@ services:
       # Creates the unprivileged runtime role. Runs only when the data
       # directory is empty — so on an existing volume, `docker compose down -v`
       # first, or run the file by hand with psql.
-      - ./docker/init-app-role.sql:/docker-entrypoint-initdb.d/10-app-role.sql:ro
+      - ./db/roles.sql:/docker-entrypoint-initdb.d/10-roles.sql:ro
     healthcheck:
       test: [CMD-SHELL, pg_isready -U school -d school_dev]
       interval: 5s
@@ -47,7 +47,7 @@ services:
     tmpfs:
       - /var/lib/postgresql/data
     volumes:
-      - ./docker/init-app-role.sql:/docker-entrypoint-initdb.d/10-app-role.sql:ro
+      - ./db/roles.sql:/docker-entrypoint-initdb.d/10-roles.sql:ro
     healthcheck:
       test: [CMD-SHELL, pg_isready -U school -d school_test]
       interval: 5s
