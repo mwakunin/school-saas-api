@@ -5,6 +5,7 @@ import createApp from "@/lib/create-app";
 import academic from "@/routes/academic/academic.index";
 import health from "@/routes/health.route";
 import index from "@/routes/index.route";
+import students from "@/routes/students/students.index";
 import superadmin from "@/routes/superadmin/superadmin.index";
 
 const app = createApp();
@@ -41,6 +42,7 @@ const unscopedRoutes = [
  */
 const tenantRoutes = [
   academic,
+  students,
 ] as unknown as readonly AppOpenAPI[];
 
 [...unscopedRoutes, ...tenantRoutes].forEach((route) => {

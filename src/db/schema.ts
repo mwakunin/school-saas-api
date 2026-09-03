@@ -8,6 +8,7 @@ import {
   integer,
   jsonb,
   pgTable,
+  primaryKey,
   text,
   timestamp,
   unique,
@@ -231,6 +232,179 @@ export const streams = pgTable("streams", {
   }),
 ]);
 
+// ---------------------------------------------------------------------------
+// 5.3 Students, guardians, enrollment
+// ---------------------------------------------------------------------------
+
+/**
+ * A child on the register.
+ *
+ * **A student is not a user.** `userId` is nullable and usually null — most
+ * Grade 1-9 pupils will never have a login. The parent portal belongs to
+ * guardians.
+ *
+ * **Name parts, not firstName/lastName.** Kenyan names do not split reliably
+ * into a fixed given/surname order, and forcing them to loses information that
+ * cannot be recovered.
+ */
+export const students = pgTable("students", {
+  id: uuid().primaryKey().defaultRandom(),
+  schoolId: uuid().notNull().references(() => schools.id),
+
+  // School-scoped, human-facing, and doubles as the M-Pesa account reference a
+  // parent types when paying. Format is the school's own ("2026/118").
+  admissionNumber: text().notNull(),
+
+  /*
+   * Ministry-issued, and follows the child between schools.
+   *
+   * Unique per school, NOT globally. A globally unique UPI would need one row
+   * readable by two tenants, which puts a hole straight through the isolation
+   * model. A transfer creates a fresh row at the receiving school instead.
+   */
+  upiNumber: text(),
+  birthCertNumber: text(),
+
+  givenName: text().notNull(),
+  middleNames: text(),
+  familyName: text().notNull(),
+  preferredName: text(),
+
+  // A birthday is a calendar day, not an instant (CLAUDE.md §3 rule 9).
+  dateOfBirth: date(),
+  sex: text().$type<"male" | "female">(),
+  photoUrl: text(),
+
+  userId: userRef("user_id").references(() => user.id),
+
+  status: text()
+    .$type<"active" | "transferred_out" | "graduated" | "withdrawn" | "deceased">()
+    .notNull()
+    .default("active"),
+
+  admittedOn: date().notNull(),
+  exitedOn: date(),
+  previousSchool: text(),
+}, t => [
+  unique().on(t.schoolId, t.admissionNumber),
+  // Nullable, and Postgres treats NULLs as distinct — so the many students
+  // without a UPI yet do not collide.
+  unique().on(t.schoolId, t.upiNumber),
+  unique("students_school_id_id_key").on(t.schoolId, t.id),
+  // "Find all the Wanjikus" is a query bursars run constantly.
+  index().on(t.schoolId, t.familyName),
+  // A child cannot leave before they arrived.
+  check("students_exit_after_admission", sql`${t.exitedOn} IS NULL OR ${t.exitedOn} >= ${t.admittedOn}`),
+  /*
+   * An exit date and a non-active status travel together. Without this, a
+   * student can be marked `withdrawn` with no date (so no report can say when)
+   * or carry an exit date while still counted as active — and the second one
+   * inflates every roll, every invoice run and every class list.
+   */
+  check(
+    "students_exit_matches_status",
+    sql`(${t.status} = 'active') = (${t.exitedOn} IS NULL)`,
+  ),
+]);
+
+/**
+ * A parent or other adult responsible for a child.
+ *
+ * A table, not columns on the student, because siblings share a parent.
+ * Without this you send the same fee reminder three times and store the phone
+ * number three different ways.
+ */
+export const guardians = pgTable("guardians", {
+  id: uuid().primaryKey().defaultRandom(),
+  schoolId: uuid().notNull().references(() => schools.id),
+  // Null until they sign up for the portal.
+  userId: userRef("user_id").references(() => user.id),
+  name: text().notNull(),
+  // E.164, normalised on write (CLAUDE.md §3 rule 10). This is the SMS target,
+  // and SMS is what actually reaches a Kenyan parent.
+  phone: text().notNull(),
+  altPhone: text(),
+  email: text(),
+  nationalId: text(),
+  occupation: text(),
+}, t => [
+  unique("guardians_school_id_id_key").on(t.schoolId, t.id),
+  /*
+   * Indexed, not unique. A household may genuinely share one handset, and a
+   * unique constraint would block the second parent from being recorded at
+   * all. Deduplication is offered at the API instead, where a human can decide
+   * whether two people are really one.
+   */
+  index().on(t.schoolId, t.phone),
+]);
+
+export const studentGuardians = pgTable("student_guardians", {
+  schoolId: uuid().notNull().references(() => schools.id),
+  studentId: uuid().notNull(),
+  guardianId: uuid().notNull(),
+  relationship: text(),
+  isPrimary: boolean().default(false).notNull(),
+  receivesInvoices: boolean().default(true).notNull(),
+  // Safeguarding: who may collect this child from school.
+  canCollect: boolean().default(true).notNull(),
+}, t => [
+  primaryKey({ columns: [t.studentId, t.guardianId] }),
+  foreignKey({
+    columns: [t.schoolId, t.studentId],
+    foreignColumns: [students.schoolId, students.id],
+    name: "student_guardians_school_student_fk",
+  }),
+  foreignKey({
+    columns: [t.schoolId, t.guardianId],
+    foreignColumns: [guardians.schoolId, guardians.id],
+    name: "student_guardians_school_guardian_fk",
+  }),
+  index().on(t.schoolId, t.guardianId),
+]);
+
+/**
+ * Which class a child is in, for a stretch of time.
+ *
+ * **There is deliberately no `streamId` on `students`.** "Which class is this
+ * child in" is the open enrollment row — the one with `endedOn` null. That is
+ * what keeps last year's marks and invoices pointing at the correct class
+ * after progression or a stream switch, instead of being silently rewritten
+ * when the child moves.
+ *
+ * Scores hang off `enrollmentId`, never `studentId` (CLAUDE.md §3 rule 6): a
+ * mark is "this child, in this stream, in this year".
+ */
+export const enrollments = pgTable("enrollments", {
+  id: uuid().primaryKey().defaultRandom(),
+  schoolId: uuid().notNull().references(() => schools.id),
+  studentId: uuid().notNull(),
+  streamId: uuid().notNull(),
+  boardingStatus: text().$type<"day" | "boarder">().notNull(),
+  startedOn: date().notNull(),
+  // Null = current.
+  endedOn: date(),
+}, t => [
+  unique("enrollments_school_id_id_key").on(t.schoolId, t.id),
+  foreignKey({
+    columns: [t.schoolId, t.studentId],
+    foreignColumns: [students.schoolId, students.id],
+    name: "enrollments_school_student_fk",
+  }),
+  foreignKey({
+    columns: [t.schoolId, t.streamId],
+    foreignColumns: [streams.schoolId, streams.id],
+    name: "enrollments_school_stream_fk",
+  }),
+  index().on(t.schoolId, t.streamId),
+  index().on(t.schoolId, t.studentId),
+  check(
+    "enrollments_dates_ordered",
+    sql`${t.endedOn} IS NULL OR ${t.endedOn} >= ${t.startedOn}`,
+  ),
+  // The overlap constraint itself is an EXCLUDE, which drizzle cannot express;
+  // it is added by hand in the migration. See 0003.
+]);
+
 /**
  * Every tenant-scoped table, for the migration that puts RLS on them.
  *
@@ -244,6 +418,10 @@ export const TENANT_TABLES = [
   "terms",
   "grade_levels",
   "streams",
+  "students",
+  "guardians",
+  "student_guardians",
+  "enrollments",
 ] as const;
 
 // ---------------------------------------------------------------------------
@@ -299,7 +477,43 @@ export const gradeLevelsRelations = relations(gradeLevels, ({ one, many }) => ({
   streams: many(streams),
 }));
 
-export const streamsRelations = relations(streams, ({ one }) => ({
+export const studentsRelations = relations(students, ({ one, many }) => ({
+  school: one(schools, { fields: [students.schoolId], references: [schools.id] }),
+  enrollments: many(enrollments),
+  guardians: many(studentGuardians),
+}));
+
+export const guardiansRelations = relations(guardians, ({ one, many }) => ({
+  school: one(schools, { fields: [guardians.schoolId], references: [schools.id] }),
+  user: one(user, { fields: [guardians.userId], references: [user.id] }),
+  students: many(studentGuardians),
+}));
+
+export const studentGuardiansRelations = relations(studentGuardians, ({ one }) => ({
+  student: one(students, {
+    fields: [studentGuardians.studentId],
+    references: [students.id],
+  }),
+  guardian: one(guardians, {
+    fields: [studentGuardians.guardianId],
+    references: [guardians.id],
+  }),
+}));
+
+export const enrollmentsRelations = relations(enrollments, ({ one }) => ({
+  school: one(schools, { fields: [enrollments.schoolId], references: [schools.id] }),
+  student: one(students, {
+    fields: [enrollments.studentId],
+    references: [students.id],
+  }),
+  stream: one(streams, {
+    fields: [enrollments.streamId],
+    references: [streams.id],
+  }),
+}));
+
+export const streamsRelations = relations(streams, ({ one, many }) => ({
+  enrollments: many(enrollments),
   school: one(schools, { fields: [streams.schoolId], references: [schools.id] }),
   gradeLevel: one(gradeLevels, {
     fields: [streams.gradeLevelId],

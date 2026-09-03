@@ -11,6 +11,7 @@ import {
   gradeLevels,
   memberships,
   schools,
+  streams,
   terms,
   user,
 } from "@/db/schema";
@@ -332,4 +333,33 @@ export async function signInAt(
   const person = await signIn(nextPhone());
   await addMembership(person.id, schoolId, role);
   return person;
+}
+
+/**
+ * A class at a school — "Grade 4 Blue" — in its current academic year.
+ *
+ * Takes the grade by sequence rather than by id, because a test that says
+ * `makeStream(alpha, 4, "Blue")` reads as what it means, and looking the id up
+ * here keeps the seeded-spine detail out of every test body.
+ */
+export async function makeStream(
+  school: { id: string; academicYear: { id: string }; gradeLevels: Array<{ id: string; sequence: number }> },
+  gradeSequence: number,
+  name: string,
+) {
+  const grade = school.gradeLevels.find(g => g.sequence === gradeSequence);
+  if (!grade)
+    throw new Error(`No Grade ${gradeSequence} at this school`);
+
+  const [row] = await db
+    .insert(streams)
+    .values({
+      schoolId: school.id,
+      gradeLevelId: grade.id,
+      academicYearId: school.academicYear.id,
+      name,
+    })
+    .returning();
+
+  return row;
 }

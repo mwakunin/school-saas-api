@@ -248,6 +248,8 @@ export const enrollments = pgTable('enrollments', {
 
 **There is deliberately no `streamId` on `students`.** "Which class is this child in" is the open enrollment row. This is what keeps last year's marks and invoices pointing at the correct class after progression or a stream switch.
 
+An `EXCLUDE` constraint forbids overlapping enrollments per student, so a child can never be in two classes on one day. Scores hang off `enrollmentId`, so an overlap would make a mark's class genuinely ambiguous — and unrecoverable by inspection.
+
 ```ts
 export const guardians = pgTable('guardians', {
   id: uuid('id').primaryKey().defaultRandom(),
@@ -273,6 +275,8 @@ export const studentGuardians = pgTable('student_guardians', {
 ```
 
 Guardians are a table, not columns on the student, because siblings share a parent. Without this you send the same fee reminder three times and store the phone number three ways.
+
+`student_guardians` is the **one** table the runtime role may `DELETE` from. Rule 5 exists so history stays queryable; a guardian link is not history, it is a live claim about who may collect a child. A wrong one has to disappear from every query, including one that forgot a soft-delete filter.
 
 ### 5.4 Curriculum
 
@@ -541,7 +545,7 @@ Two more are needed before v1 ships and are not yet built:
 
 1. ~~Fork the existing scaffold. Strip domain, keep auth, rate limiting, Docker dev/test databases, CI.~~ **Done.**
 2. ~~Tenancy + academic spine + RLS + superadmin plane (§4, §5.1, §5.2).~~ **Done.**
-3. Students, guardians, enrollment (§5.3).
+3. ~~Students, guardians, enrollment (§5.3).~~ **Done.**
 4. Fees: structures → invoice generation for one term (§5.7).
 5. Daraja C2B against sandbox + reconciliation queue (§5.8).
 6. Bursar dashboard: outstanding balances per class.
