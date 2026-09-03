@@ -1,0 +1,76 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: school-postgres-dev
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: school
+      POSTGRES_PASSWORD: school
+      POSTGRES_DB: school_dev
+    # Bound to 127.0.0.1, never 0.0.0.0. A bare "5436:5432" publishes on every
+    # interface, so anyone on the same network (café wifi, shared office LAN)
+    # could reach this database with the credentials sitting right above. Note
+    # a host firewall does NOT save you here: Docker writes its own iptables
+    # rules that bypass ufw.
+    #
+    # 5436/5435/6381 rather than the defaults because two other projects on
+    # this machine already bind 5432 and 5434/5433; remapping lets all of them
+    # run at once.
+    ports:
+      - "127.0.0.1:5436:5432"
+    volumes:
+      - postgres_dev_data:/var/lib/postgresql/data
+      # Creates the unprivileged runtime role. Runs only when the data
+      # directory is empty — so on an existing volume, `docker compose down -v`
+      # first, or run the file by hand with psql.
+      - ./docker/init-app-role.sql:/docker-entrypoint-initdb.d/10-app-role.sql:ro
+    healthcheck:
+      test: [CMD-SHELL, pg_isready -U school -d school_dev]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  postgres-test:
+    image: postgres:16-alpine
+    container_name: school-postgres-test
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: school
+      POSTGRES_PASSWORD: school
+      POSTGRES_DB: school_test
+    # Loopback only — see the note on the dev database above.
+    ports:
+      - "127.0.0.1:5435:5432"
+    # No named volume — test DB is disposable and gets wiped/reset between
+    # runs. That also means the init script below runs on every container
+    # start, which is what keeps the app role present without manual steps.
+    tmpfs:
+      - /var/lib/postgresql/data
+    volumes:
+      - ./docker/init-app-role.sql:/docker-entrypoint-initdb.d/10-app-role.sql:ro
+    healthcheck:
+      test: [CMD-SHELL, pg_isready -U school -d school_test]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: school-redis-dev
+    restart: unless-stopped
+    # Loopback only. Redis matters even more than Postgres here: it has no
+    # authentication configured at all, so publishing it on 0.0.0.0 hands
+    # full read/write access to anyone who can route to this host.
+    ports:
+      - "127.0.0.1:6381:6379"
+    volumes:
+      - redis_dev_data:/data
+    healthcheck:
+      test: [CMD, redis-cli, ping]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres_dev_data:
+  redis_dev_data:
