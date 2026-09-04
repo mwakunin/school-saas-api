@@ -46,15 +46,18 @@ export const listTransactionsQuerySchema = z.object({
 export const allocateSchema = toZodV4SchemaTyped(
   z.object({
     studentId: z.uuid(),
-    /**
-     * Optional, and usually omitted.
+    /*
+     * Deliberately no `invoiceId`.
      *
-     * Left unset the money lands as a credit on the student's account, which
-     * is what a parent paying "school fees" has actually done. Naming a term
-     * is a separate decision, and guessing the oldest unpaid invoice is wrong
-     * every time someone pays next term in advance.
+     * An earlier version accepted one and `allocateTransaction` ignored it —
+     * the API would have taken a caller's decision about which term to settle
+     * and silently dropped it, which is worse than not offering the choice.
+     *
+     * The money lands as a credit on the student's account, which is what a
+     * parent paying "school fees" has actually done. Naming a term is a
+     * separate act, and guessing the oldest unpaid invoice is wrong every
+     * time someone pays next term in advance.
      */
-    invoiceId: z.uuid().optional(),
   }),
 );
 
@@ -69,6 +72,8 @@ export const runMatcherResultSchema = toZodV4SchemaTyped(
     examined: z.number().int(),
     allocated: z.number().int(),
     stillUnmatched: z.number().int(),
+    /** Unmatched confirmations left after this pass; run again if non-zero. */
+    remaining: z.number().int(),
   }),
 );
 

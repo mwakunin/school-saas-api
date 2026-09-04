@@ -733,13 +733,25 @@ export const reversePayment: TenantRouteHandler<ReversePaymentRoute> = async (c)
   }
 
   const updated = await db.transaction(async (tx) => {
-    // Reversed, not deleted: "where did this KES 15,000 go" has to stay
-    // answerable, and the row is the only thing that can answer it.
+    /*
+     * Reversed, not deleted: "where did this KES 15,000 go" has to stay
+     * answerable, and the row is the only thing that can answer it.
+     *
+     * `reversedAt IS NULL` is part of the predicate rather than a check before
+     * it. The read above narrows the common case to a clean 409, but two
+     * bursars reversing the same receipt at once would both pass it — and the
+     * second would overwrite the first's reason and timestamp, losing why the
+     * money was actually reversed. Letting the UPDATE match nothing is what
+     * makes that a conflict instead of a silent rewrite.
+     */
     const [row] = await tx
       .update(payments)
       .set({ reversedAt: new Date(), reversalReason: reason })
-      .where(eq(payments.id, id))
+      .where(and(eq(payments.id, id), isNull(payments.reversedAt)))
       .returning();
+
+    if (!row)
+      return null;
 
     /*
      * An M-Pesa payment reversed is a confirmation back in the queue.
@@ -757,6 +769,13 @@ export const reversePayment: TenantRouteHandler<ReversePaymentRoute> = async (c)
 
     return row;
   });
+
+  if (!updated) {
+    return c.json(
+      { message: "This payment was reversed by someone else a moment ago" },
+      HttpStatusCodes.CONFLICT,
+    );
+  }
 
   return c.json(updated, HttpStatusCodes.OK);
 };

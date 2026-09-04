@@ -20,6 +20,7 @@ import {
 import {
   allocateTransaction,
   matchUnallocated,
+  normalisedAdmissionNumber,
   normaliseReference,
 } from "@/lib/mpesa-matching";
 
@@ -57,7 +58,7 @@ function fieldError(path: string[], message: string) {
  * `2026/118` gets typed as `118`, `ADM 118`, or last year's `2025/118`; all
  * three share the tail.
  */
-async function suggestionsFor(db: AppDb, reference: string | null) {
+async function candidatesFor(db: AppDb, reference: string | null) {
   if (!reference)
     return [];
 
@@ -80,25 +81,13 @@ async function suggestionsFor(db: AppDb, reference: string | null) {
       eq(students.status, "active"),
       or(
         ilike(students.admissionNumber, `%${tail}`),
-        sql`upper(regexp_replace(${students.admissionNumber}, '[\\s/\\-_.]', '', 'g')) = ${normaliseReference(reference)}`,
+        sql`${normalisedAdmissionNumber(students.admissionNumber)} = ${normaliseReference(reference)}`,
       ),
     ))
     .orderBy(asc(students.admissionNumber))
     .limit(5);
 
-  if (candidates.length === 0)
-    return [];
-
-  // The balance is what makes the right row obvious: the child who owes
-  // exactly this much is almost always the one the parent was paying for.
-  const balances = await balancesFor(db, candidates.map(s => s.id));
-
-  return candidates.map(s => ({
-    studentId: s.id,
-    admissionNumber: s.admissionNumber,
-    name: `${s.givenName} ${s.familyName}`,
-    balanceCents: balances.get(s.id)?.balanceCents ?? 0,
-  }));
+  return candidates;
 }
 
 export const listTransactions: TenantRouteHandler<ListTransactionsRoute> = async (c) => {
@@ -150,17 +139,43 @@ export const listTransactions: TenantRouteHandler<ListTransactionsRoute> = async
     .limit(query.limit)
     .offset(query.offset);
 
-  const transactions = await Promise.all(rows.map(async (row) => {
+  /*
+   * Candidates first, then ONE balance lookup for the whole page.
+   *
+   * Fetching a balance per row meant a page of fifty unmatched payments cost
+   * fifty pairs of aggregate queries to render — on the screen a bursar leaves
+   * open all morning. `balancesFor` already takes a set, so the shape was
+   * there; it was just being called one student at a time.
+   */
+  const candidatesByRow = new Map<string, Awaited<ReturnType<typeof candidatesFor>>>();
+
+  for (const row of rows) {
+    // Only worth computing for rows a bursar might act on.
+    if (row.status === "unmatched")
+      candidatesByRow.set(row.id, await candidatesFor(db, row.accountReference));
+  }
+
+  const everyCandidate = [...new Set(
+    [...candidatesByRow.values()].flatMap(list => list.map(s => s.id)),
+  )];
+
+  // The balance is what makes the right row obvious: the child who owes
+  // exactly this much is almost always the one the parent was paying for.
+  const balances = await balancesFor(db, everyCandidate);
+
+  const transactions = rows.map((row) => {
     const { rawPayload: _envelope, ...rest } = row;
 
     return {
       ...rest,
-      // Only worth computing for rows a bursar might act on.
-      suggestions: row.status === "unmatched"
-        ? await suggestionsFor(db, row.accountReference)
-        : [],
+      suggestions: (candidatesByRow.get(row.id) ?? []).map(s => ({
+        studentId: s.id,
+        admissionNumber: s.admissionNumber,
+        name: `${s.givenName} ${s.familyName}`,
+        balanceCents: balances.get(s.id)?.balanceCents ?? 0,
+      })),
     };
-  }));
+  });
 
   return c.json({
     transactions,
@@ -319,13 +334,16 @@ export const requeue: TenantRouteHandler<RequeueRoute> = async (c) => {
 export const runMatcher: TenantRouteHandler<RunMatcherRoute> = async (c) => {
   const db = c.var.db;
 
-  const results = await matchUnallocated(db, c.var.school.id);
+  const { results, remaining } = await matchUnallocated(db, c.var.school.id);
   const allocated = results.filter(r => r.outcome.kind === "matched").length;
 
   return c.json({
     examined: results.length,
     allocated,
     stillUnmatched: results.length - allocated,
+    // Whether pressing again would do anything. A deep backlog is walked a
+    // batch at a time rather than in one request that might not finish.
+    remaining,
   }, HttpStatusCodes.OK);
 };
 

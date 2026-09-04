@@ -22,22 +22,24 @@ const darajaAckSchema = z.object({
 });
 
 /**
- * The payload is entirely attacker-controllable, so this is documentation
- * rather than a gate — every field optional, and unknown ones passed through,
- * because the raw envelope is stored whole precisely so a field we did not
- * model is still recoverable later.
+ * Any JSON at all, deliberately.
+ *
+ * An earlier version declared the known fields as optional strings. That
+ * validated the body BEFORE the handler ran, so a confirmation carrying
+ * `BusinessShortCode` as a JSON number — which Daraja does, and which
+ * `parseC2bConfirmation` explicitly copes with — was answered 422 and never
+ * stored. Safaricom would then retry a payment we could never accept.
+ *
+ * Validating a payload we do not control, on an endpoint whose contract is
+ * "always acknowledge", is a contradiction: the schema can only ever turn a
+ * storable payment into a rejected one. `parseC2bConfirmation` is the single
+ * authority on whether there is enough here to store, and it answers by
+ * returning null rather than by failing a request.
+ *
+ * The fields Daraja sends are described in the route below instead, where they
+ * inform a reader without gating a request.
  */
-const c2bConfirmationSchema = z.looseObject({
-  TransID: z.string().optional(),
-  TransTime: z.string().optional(),
-  TransAmount: z.union([z.string(), z.number()]).optional(),
-  BusinessShortCode: z.string().optional(),
-  BillRefNumber: z.string().optional(),
-  MSISDN: z.string().optional(),
-  FirstName: z.string().optional(),
-  MiddleName: z.string().optional(),
-  LastName: z.string().optional(),
-});
+const c2bConfirmationSchema = z.unknown();
 
 export const c2bConfirmation = createRoute({
   tags,
@@ -50,7 +52,12 @@ export const c2bConfirmation = createRoute({
     + "on a reference it does not recognise — Safaricom retries anything it "
     + "does not see acknowledged, and a webhook that can reject is a webhook "
     + "that loses money. Matching happens afterwards, against a row that is "
-    + "already safe.",
+    + "already safe.\n\n"
+    + "Daraja sends TransID, TransTime (YYYYMMDDHHmmss in EAT), TransAmount, "
+    + "BusinessShortCode, BillRefNumber, MSISDN and the payer's name parts — "
+    + "any of which may arrive as a JSON string or number. The body is not "
+    + "validated against that shape on purpose: rejecting a payload we do not "
+    + "control could only ever turn a real payment into a retry loop.",
   request: {
     params: z.object({ token: z.string() }),
     body: jsonContentRequired(c2bConfirmationSchema, "Daraja's confirmation"),

@@ -31,6 +31,49 @@ import type { C2bConfirmationRoute, C2bValidationRoute } from "./webhooks.routes
 /** Daraja treats anything but this as a failure, and retries. */
 const ACK = { ResultCode: 0, ResultDesc: "Accepted" } as const;
 
+/** Last four digits only — enough to recognise a number, not to dial it. */
+function maskMsisdn(value: unknown): string | undefined {
+  if (typeof value !== "string" && typeof value !== "number")
+    return undefined;
+  const digits = String(value).replace(/\D/g, "");
+  return digits.length >= 4 ? `***${digits.slice(-4)}` : "***";
+}
+
+/**
+ * What may go in a log line about a confirmation.
+ *
+ * The payload carries a parent's phone number and full name. Logs are shipped,
+ * retained, and read by people who have no business with either — so the whole
+ * envelope never goes in one, even on a failure path.
+ *
+ * What is left is enough to reconcile against Safaricom's own statement, which
+ * the school can always pull: the receipt number identifies the transaction
+ * exactly, and the amount confirms it. That is what an operator chasing a lost
+ * payment actually needs.
+ *
+ * For a payload too malformed to have a receipt number, the shape is reported
+ * instead — the field names present, never their values.
+ */
+function redactedConfirmation(payload: unknown): Record<string, unknown> {
+  if (typeof payload !== "object" || payload === null)
+    return { shape: typeof payload };
+
+  const body = payload as Record<string, unknown>;
+
+  return {
+    transactionId: typeof body.TransID === "string" ? body.TransID : undefined,
+    amount: typeof body.TransAmount === "string" || typeof body.TransAmount === "number"
+      ? String(body.TransAmount)
+      : undefined,
+    shortcode: typeof body.BusinessShortCode === "string" || typeof body.BusinessShortCode === "number"
+      ? String(body.BusinessShortCode)
+      : undefined,
+    msisdn: maskMsisdn(body.MSISDN),
+    // Field names only. A reference can itself be a name a parent typed.
+    fields: Object.keys(body).sort(),
+  };
+}
+
 /** Parsed once: the allowlist cannot change without a restart. */
 const trustedProxies = new Set(
   env.TRUSTED_PROXY_IPS?.split(",").map(ip => ip.trim()).filter(Boolean) ?? [],
@@ -106,7 +149,10 @@ export const c2bConfirmation: AppRouteHandler<C2bConfirmationRoute> = async (c) 
      * nothing but repeated deliveries. Logged with the raw body so it can be
      * reconstructed by hand if it turns out to be real money.
      */
-    logger.error({ payload, school: school.name }, "Unparseable M-Pesa C2B confirmation");
+    logger.error(
+      { confirmation: redactedConfirmation(payload), school: school.name },
+      "Unparseable M-Pesa C2B confirmation",
+    );
     return c.json(ACK, HttpStatusCodes.OK);
   }
 
@@ -200,9 +246,17 @@ export const c2bConfirmation: AppRouteHandler<C2bConfirmationRoute> = async (c) 
       return c.json(ACK, HttpStatusCodes.OK);
     }
 
-    // Anything else is ours, not Safaricom's. Log it with the payload so the
-    // money is recoverable, then let the retry come — this one might succeed.
-    logger.error({ err, payload, school: school.name }, "Failed to store M-Pesa C2B confirmation");
+    /*
+     * Anything else is ours, not Safaricom's. The receipt number is logged so
+     * the payment can be found in Safaricom's statement and reconciled by
+     * hand; the payload itself is not, because a log is the wrong place for a
+     * parent's name and phone number. Safaricom will retry, and that attempt
+     * may succeed.
+     */
+    logger.error(
+      { err, transactionId: parsed.transactionId, school: school.name },
+      "Failed to store M-Pesa C2B confirmation",
+    );
     throw err;
   }
 
@@ -211,7 +265,9 @@ export const c2bConfirmation: AppRouteHandler<C2bConfirmationRoute> = async (c) 
       school: school.name,
       transactionId: parsed.transactionId,
       amountCents: parsed.amountCents,
-      reference: parsed.accountReference,
+      // The reference is what the parent typed and is frequently a name, so it
+      // stays out of the log; the row itself has it for the bursar's queue.
+      hasReference: parsed.accountReference !== null,
     },
     "Recorded M-Pesa C2B confirmation",
   );

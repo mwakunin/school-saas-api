@@ -12,11 +12,6 @@ expand(config({
 }));
 
 /**
- * Credentials that are only needed once the payment / email / media features
- * land. They're optional in dev and test so the API boots without them, but
- * required in production — enforced in the superRefine below.
- */
-/**
  * Credentials production cannot run without.
  *
  * The platform-level `MPESA_CONSUMER_KEY` / `SECRET` / `SHORTCODE` / `PASSKEY`
@@ -183,6 +178,24 @@ const EnvSchema = z.object({
           code: "custom",
           path: ["MPESA_CALLBACK_URL"],
           message: "Must be a publicly reachable HTTPS URL",
+        });
+      }
+
+      /*
+       * Safaricom will not post a confirmation to a plaintext URL, and this is
+       * the origin every school's callback path is built on — so an `http://`
+       * value here does not fail loudly, it just means no payment ever
+       * arrives. Checked in production only, because local development runs
+       * over http://localhost.
+       */
+      if (input.MPESA_C2B_BASE_URL && !input.MPESA_C2B_BASE_URL.startsWith("https://")) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["MPESA_C2B_BASE_URL"],
+          message:
+            "Must be HTTPS: Safaricom will not deliver C2B confirmations to a "
+            + "plaintext URL, and the failure is silent — payments simply never "
+            + "arrive.",
         });
       }
     }

@@ -1,4 +1,6 @@
-import { and, eq, isNull, sql } from "drizzle-orm";
+import type { AnyColumn } from "drizzle-orm";
+
+import { and, count, eq, isNull, sql } from "drizzle-orm";
 
 import type { AppDb } from "@/db";
 
@@ -27,6 +29,19 @@ import { mpesaTransactions, payments, students } from "@/db/schema";
  */
 export function normaliseReference(value: string): string {
   return value.toUpperCase().replace(/[\s/\-_.]/g, "");
+}
+
+/**
+ * The same normalisation, expressed for Postgres.
+ *
+ * Written once and shared, because the SQL half and the JavaScript half above
+ * have to agree on what "the same number, written differently" means. Two
+ * copies that drifted would put a payment in the queue that the suggestion
+ * list then failed to suggest a candidate for — the one situation where a
+ * bursar has nothing at all to go on.
+ */
+export function normalisedAdmissionNumber(column: AnyColumn) {
+  return sql`upper(regexp_replace(${column}, '[\\s/\\-_.]', '', 'g'))`;
 }
 
 export type MatchOutcome
@@ -85,7 +100,7 @@ export async function matchReference(
   const loose = await db
     .select({ id: students.id })
     .from(students)
-    .where(sql`upper(regexp_replace(${students.admissionNumber}, '[\\s/\\-_.]', '', 'g')) = ${normalised}`);
+    .where(sql`${normalisedAdmissionNumber(students.admissionNumber)} = ${normalised}`);
 
   if (loose.length === 1)
     return { kind: "matched", studentId: loose[0].id, confidence: "normalised" };
@@ -156,15 +171,29 @@ export async function allocateTransaction(
  * admission number corrected, turns yesterday's unmatched payments into
  * today's matches without anyone re-keying them.
  */
+/**
+ * How many confirmations one pass will look at.
+ *
+ * Each one costs a query or two, so an unbounded sweep over a school that let
+ * a term's payments pile up would hold a request open for as long as the
+ * backlog is deep. Bounded and resumable instead: the caller is told whether
+ * more remain and can press again.
+ */
+export const MATCH_BATCH_SIZE = 200;
+
 export async function matchUnallocated(
   db: AppDb,
   schoolId: string,
-): Promise<AllocationResult[]> {
+  batchSize: number = MATCH_BATCH_SIZE,
+): Promise<{ results: AllocationResult[]; remaining: number }> {
   const pending = await db
     .select()
     .from(mpesaTransactions)
     .where(eq(mpesaTransactions.status, "unmatched"))
-    .orderBy(mpesaTransactions.transactedAt);
+    // Oldest first: a parent waiting on a receipt has been waiting longest,
+    // and the ordering has to be stable for "press again" to make progress.
+    .orderBy(mpesaTransactions.transactedAt)
+    .limit(batchSize);
 
   const results: AllocationResult[] = [];
 
@@ -182,7 +211,19 @@ export async function matchUnallocated(
     results.push({ transactionId: transaction.id, outcome });
   }
 
-  return results;
+  /*
+   * What is left AFTER this pass.
+   *
+   * Counted rather than inferred from the batch being full: rows this pass
+   * could not match are still unmatched, so a full batch does not mean there
+   * is more to do, and an empty one does not mean there is not.
+   */
+  const [{ left }] = await db
+    .select({ left: count() })
+    .from(mpesaTransactions)
+    .where(eq(mpesaTransactions.status, "unmatched"));
+
+  return { results, remaining: left };
 }
 
 /**

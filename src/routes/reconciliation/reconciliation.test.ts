@@ -462,6 +462,114 @@ describe("reconciliation", () => {
     });
   });
 
+  describe("m-Pesa settings", () => {
+    it("403s a bursar — handling Daraja credentials is an admin act", async () => {
+      const { school, bursar } = await seed("alpha");
+      void school;
+
+      const res = await app.request("/mpesa/settings", {
+        headers: tenantHeaders("alpha", bursar),
+      });
+
+      expect(res.status).toBe(403);
+    });
+
+    it("stores credentials encrypted and never returns them", async () => {
+      const { school } = await seed("alpha");
+      const admin = await signInAt(school.id, "admin");
+
+      const res = await app.request("/mpesa/settings", {
+        method: "PUT",
+        headers: jsonHeaders("alpha", admin),
+        body: JSON.stringify({
+          shortcode: "600638",
+          consumerKey: "the-consumer-key",
+          consumerSecret: "the-consumer-secret",
+        }),
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.text();
+
+      // A support session with a screen share must not be able to leak a
+      // school's ability to transact.
+      expect(body).not.toContain("the-consumer-secret");
+      expect(body).not.toContain("the-consumer-key");
+      expect(JSON.parse(body)).toMatchObject({
+        shortcode: "600638",
+        credentialsConfigured: true,
+      });
+
+      // And what landed in the column is ciphertext, not the secret.
+      const [row] = await db
+        .select({ credentials: schools.mpesaCredentials })
+        .from(schools)
+        .where(eq(schools.id, school.id));
+
+      expect(row.credentials).not.toContain("the-consumer-secret");
+      expect(row.credentials!.startsWith("v1.")).toBe(true);
+    });
+
+    it("keeps the callback token across a credential change", async () => {
+      const { school } = await seed("alpha");
+      const admin = await signInAt(school.id, "admin");
+
+      const put = (secret: string) => app.request("/mpesa/settings", {
+        method: "PUT",
+        headers: jsonHeaders("alpha", admin),
+        body: JSON.stringify({
+          shortcode: "600638",
+          consumerKey: "k",
+          consumerSecret: secret,
+        }),
+      });
+
+      const first = await (await put("first-secret")).json();
+      const second = await (await put("rotated-secret")).json();
+
+      /*
+       * Rotating the token on every credential change would silently break the
+       * URLs already registered with Safaricom — confirmations would arrive at
+       * a path nobody answers to, and the school would find out when a parent
+       * asked why a payment never showed.
+       */
+      expect(second.confirmationUrl).toBe(first.confirmationUrl);
+      expect(second.confirmationUrl).toMatch(/\/webhooks\/mpesa\/c2b\/.+\/confirmation$/);
+    });
+
+    it("reports an unconfigured school honestly", async () => {
+      const school = await makeSchool({ subdomain: "gamma" });
+      const admin = await signInAt(school.id, "admin");
+
+      const body = await (await app.request("/mpesa/settings", {
+        headers: tenantHeaders("gamma", admin),
+      })).json();
+
+      expect(body).toMatchObject({
+        shortcode: null,
+        credentialsConfigured: false,
+        confirmationUrl: null,
+      });
+    });
+
+    it("422s a shortcode that is not digits", async () => {
+      const { school } = await seed("alpha");
+      const admin = await signInAt(school.id, "admin");
+
+      const res = await app.request("/mpesa/settings", {
+        method: "PUT",
+        headers: jsonHeaders("alpha", admin),
+        body: JSON.stringify({
+          shortcode: "not-a-paybill",
+          consumerKey: "k",
+          consumerSecret: "s",
+        }),
+      });
+
+      expect(res.status).toBe(422);
+    });
+  });
+
   describe("balances", () => {
     it("moves the child's balance once the payment is allocated", async () => {
       const { bursar, wanjiku, confirm } = await seed("alpha");

@@ -156,6 +156,61 @@ describe("m-Pesa C2B webhook", () => {
     });
   });
 
+  describe("accepting whatever Daraja actually sends", () => {
+    it("stores a confirmation whose numeric fields arrive as numbers", async () => {
+      const { token } = await withPaybill("alpha");
+
+      /*
+       * Daraja is not consistent about JSON types, and the parser has always
+       * coped with numbers. The ROUTE did not: an earlier body schema declared
+       * these as optional strings, so this was answered 422 before the handler
+       * ran — nothing stored, and Safaricom retrying a payment we could never
+       * accept. Validating a payload we do not control on an endpoint whose
+       * contract is "always acknowledge" can only ever cause that.
+       */
+      const res = await post(`/webhooks/mpesa/c2b/${token}/confirmation`, {
+        ...CONFIRMATION,
+        BusinessShortCode: 600638,
+        MSISDN: 254712345678,
+        TransAmount: 18000,
+      });
+
+      expect(res.status).toBe(200);
+
+      const [row] = await db.select().from(mpesaTransactions);
+      expect(row).toMatchObject({
+        shortcode: "600638",
+        msisdn: "254712345678",
+        amountCents: 1_800_000,
+        status: "unmatched",
+      });
+    });
+
+    it("acknowledges known fields carrying the wrong type entirely", async () => {
+      const { token } = await withPaybill("alpha");
+
+      const res = await post(`/webhooks/mpesa/c2b/${token}/confirmation`, {
+        TransID: { nested: "object" },
+        TransTime: [],
+        TransAmount: null,
+      });
+
+      // Nothing storable, so nothing is stored — but it is still a 200,
+      // because a retry will not make this parse.
+      expect(res.status).toBe(200);
+      expect(await db.select().from(mpesaTransactions)).toHaveLength(0);
+    });
+
+    it("acknowledges a body that is not an object at all", async () => {
+      const { token } = await withPaybill("alpha");
+
+      for (const body of [[], "a string", 42]) {
+        const res = await post(`/webhooks/mpesa/c2b/${token}/confirmation`, body);
+        expect(res.status).toBe(200);
+      }
+    });
+  });
+
   describe("the tenant comes from the path, not the payload", () => {
     it("404s a token no school answers to", async () => {
       await withPaybill("alpha");
