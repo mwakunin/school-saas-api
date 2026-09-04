@@ -10,13 +10,13 @@ importers:
     dependencies:
       '@hono/node-server':
         specifier: ^1.18.1
-        version: 1.18.1(hono@4.9.6)
+        version: 1.18.1(hono@4.13.5)
       '@hono/zod-openapi':
         specifier: ^1.0.2
-        version: 1.0.2(hono@4.9.6)(zod@4.4.3)
+        version: 1.0.2(hono@4.13.5)(zod@4.4.3)
       '@scalar/hono-api-reference':
         specifier: ^0.9.13
-        version: 0.9.13(hono@4.9.6)
+        version: 0.9.13(hono@4.13.5)
       better-auth:
         specifier: ^1.7.1
         version: 1.7.1(drizzle-kit@0.31.10)(drizzle-orm@0.44.4(@libsql/client@0.15.10)(@types/pg@8.23.1)(kysely@0.29.5)(pg@8.23.0))(pg@8.23.0)(vitest@3.2.4(@types/debug@4.1.12)(@types/node@24.2.0)(supports-color@7.2.0)(tsx@4.20.3)(yaml@2.8.0))
@@ -36,11 +36,11 @@ importers:
         specifier: ^0.8.3
         version: 0.8.3(drizzle-orm@0.44.4(@libsql/client@0.15.10)(@types/pg@8.23.1)(kysely@0.29.5)(pg@8.23.0))(zod@4.4.3)
       hono:
-        specifier: ^4.9.6
-        version: 4.9.6
+        specifier: ^4.13.5
+        version: 4.13.5
       hono-pino:
         specifier: ^0.10.3
-        version: 0.10.3(hono@4.9.6)(pino@9.7.0)
+        version: 0.10.3(hono@4.13.5)(pino@9.7.0)
       ioredis:
         specifier: ^6.0.0
         version: 6.0.0(supports-color@7.2.0)
@@ -61,7 +61,7 @@ importers:
         version: 6.24.0
       stoker:
         specifier: 2.0.1
-        version: 2.0.1(@asteasolutions/zod-to-openapi@8.1.0(zod@4.4.3))(@hono/zod-openapi@1.0.2(hono@4.9.6)(zod@4.4.3))(hono@4.9.6)(openapi3-ts@4.5.0)
+        version: 2.0.1(@asteasolutions/zod-to-openapi@8.1.0(zod@4.4.3))(@hono/zod-openapi@1.0.2(hono@4.13.5)(zod@4.4.3))(hono@4.13.5)(openapi3-ts@4.5.0)
       zod:
         specifier: ^4.4.3
         version: 4.4.3
@@ -2285,8 +2285,8 @@ packages:
       hono: '>=4.0.0'
       pino: '>=7.1.0'
 
-  hono@4.9.6:
-    resolution: {integrity: sha512-doVjXhSFvYZ7y0dNokjwwSahcrAfdz+/BCLvAMa/vHLzjj8+CFyV5xteThGUsKdkaasgN+gF2mUxao+SGLpUeA==}
+  hono@4.13.5:
+    resolution: {integrity: sha512-O6+/eCYRkzzzy0rPWwKLiGBR1nFuUPZynnwjxN1MBA62NNqbT0wQEzQyK2gSO5yDIDB336sXQleAhOHrzlYyKw==}
     engines: {node: '>=16.9.0'}
 
   html-escaper@2.0.2:
@@ -3890,21 +3890,21 @@ snapshots:
       '@eslint/core': 0.15.1
       levn: 0.4.1
 
-  '@hono/node-server@1.18.1(hono@4.9.6)':
+  '@hono/node-server@1.18.1(hono@4.13.5)':
     dependencies:
-      hono: 4.9.6
+      hono: 4.13.5
 
-  '@hono/zod-openapi@1.0.2(hono@4.9.6)(zod@4.4.3)':
+  '@hono/zod-openapi@1.0.2(hono@4.13.5)(zod@4.4.3)':
     dependencies:
       '@asteasolutions/zod-to-openapi': 8.1.0(zod@4.4.3)
-      '@hono/zod-validator': 0.7.2(hono@4.9.6)(zod@4.4.3)
-      hono: 4.9.6
+      '@hono/zod-validator': 0.7.2(hono@4.13.5)(zod@4.4.3)
+      hono: 4.13.5
       openapi3-ts: 4.5.0
       zod: 4.4.3
 
-  '@hono/zod-validator@0.7.2(hono@4.9.6)(zod@4.4.3)':
+  '@hono/zod-validator@0.7.2(hono@4.13.5)(zod@4.4.3)':
     dependencies:
-      hono: 4.9.6
+      hono: 4.13.5
       zod: 4.4.3
 
   '@humanfs/core@0.19.1': {}
@@ -4108,10 +4108,10 @@ snapshots:
     dependencies:
       '@scalar/types': 0.2.11
 
-  '@scalar/hono-api-reference@0.9.13(hono@4.9.6)':
+  '@scalar/hono-api-reference@0.9.13(hono@4.13.5)':
     dependencies:
       '@scalar/core': 0.3.11
-      hono: 4.9.6
+      hono: 4.13.5
 
   '@scalar/openapi-types@0.3.7':
     dependencies:
@@ -5206,13 +5206,13 @@ snapshots:
 
   help-me@5.0.0: {}
 
-  hono-pino@0.10.3(hono@4.9.6)(pino@9.7.0):
+  hono-pino@0.10.3(hono@4.13.5)(pino@9.7.0):
     dependencies:
       defu: 6.1.4
-      hono: 4.9.6
+      hono: 4.13.5
       pino: 9.7.0
 
-  hono@4.9.6: {}
+  hono@4.13.5: {}
 
   html-escaper@2.0.2: {}
 
@@ -6104,12 +6104,12 @@ snapshots:
 
   std-env@3.9.0: {}
 
-  stoker@2.0.1(@asteasolutions/zod-to-openapi@8.1.0(zod@4.4.3))(@hono/zod-openapi@1.0.2(hono@4.9.6)(zod@4.4.3))(hono@4.9.6)(openapi3-ts@4.5.0):
+  stoker@2.0.1(@asteasolutions/zod-to-openapi@8.1.0(zod@4.4.3))(@hono/zod-openapi@1.0.2(hono@4.13.5)(zod@4.4.3))(hono@4.13.5)(openapi3-ts@4.5.0):
     dependencies:
-      hono: 4.9.6
+      hono: 4.13.5
     optionalDependencies:
       '@asteasolutions/zod-to-openapi': 8.1.0(zod@4.4.3)
-      '@hono/zod-openapi': 1.0.2(hono@4.9.6)(zod@4.4.3)
+      '@hono/zod-openapi': 1.0.2(hono@4.13.5)(zod@4.4.3)
       openapi3-ts: 4.5.0
 
   string-width@4.2.3:
