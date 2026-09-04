@@ -222,6 +222,21 @@ export const createArea: TenantRouteHandler<CreateAreaRoute> = async (c) => {
         HttpStatusCodes.UNPROCESSABLE_ENTITY,
       );
     }
+    /*
+     * The case-insensitive name index, which `updateArea` already answered for
+     * and this did not — so the commonest way to hit it, adding "Mathematics"
+     * to a school that seeded, came back a 500.
+     *
+     * It matters beyond the status code: the seed decides what to skip by
+     * name, so a second area sharing one leaves that check ambiguous, and a
+     * report card prints the subject twice.
+     */
+    if (isUniqueViolation(err)) {
+      return c.json(
+        fieldError(["name"], "This school already has a learning area by that name"),
+        HttpStatusCodes.UNPROCESSABLE_ENTITY,
+      );
+    }
     throw err;
   }
 };

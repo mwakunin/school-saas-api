@@ -1019,6 +1019,22 @@ export const termResults = pgTable("term_results", {
     name: "term_results_school_learning_area_fk",
   }),
   index().on(t.schoolId, t.termId),
+  /*
+   * The rule has to be one this code can actually apply.
+   *
+   * `.$type<>()` is a TypeScript fiction — it constrains nothing in the
+   * database, and `reduceLevels` treats any rule it does not recognise as
+   * `mode_ties_low` SILENTLY. So an unrecognised value here would produce
+   * levels computed one way and labelled another, then get copied verbatim
+   * into a report card snapshot and frozen there. That is the same defect
+   * fixed by storing the rule in the first place, arriving by a different
+   * door: a backfill, a manual correction, or a fourth rule added to the
+   * enum without a migration.
+   */
+  check(
+    "term_results_level_reduction_known",
+    sql`${t.levelReduction} IN ('mode_ties_low', 'mode_ties_high', 'lowest')`,
+  ),
 ]);
 
 /**

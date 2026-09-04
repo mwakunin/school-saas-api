@@ -1,11 +1,12 @@
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { beforeEach, describe, expect, it } from "vitest";
 
 import type { TestUser } from "@/test/helpers";
 
 import app from "@/app";
 import db from "@/db";
-import { assessmentScores, enrollments, learningAreas, reportCards, schools } from "@/db/schema";
+import { assessmentScores, enrollments, learningAreas, reportCards, schools, termResults } from "@/db/schema";
+import { isCheckViolation, pgConstraintName } from "@/lib/db-errors";
 import {
   makeSchool,
   makeStream,
@@ -173,6 +174,22 @@ describe("assessment", () => {
       expect(again.skippedExisting).toBeGreaterThan(0);
     });
 
+    it("names the field when an area is added twice, rather than falling over", async () => {
+      const { admin, subdomain } = await seed("alpha");
+
+      // The commonest way to hit the name index: a school that seeded, then
+      // added a subject it thought was missing. `updateArea` already answered
+      // for this; creating did not, so it came back a 500.
+      const res = await post("/learning-areas", {
+        name: "mathematics",
+        code: "MAT2",
+        sequence: 31,
+      }, jsonHeaders(subdomain, admin));
+
+      expect(res.status).toBe(422);
+      expect((await res.json()).error.issues[0].path).toEqual(["name"]);
+    });
+
     it("refuses to remove a learning area that has been assessed", async () => {
       const ctx = await seed("alpha");
       const assessment = await makeAssessment(ctx);
@@ -326,6 +343,63 @@ describe("assessment", () => {
       }, jsonHeaders("alpha", ctx.teacher));
       expect(retry.status).toBe(200);
     });
+
+    it("makes a concurrent publish wait rather than landing mid-save", async () => {
+      const ctx = await seed("alpha");
+      const assessment = await makeAssessment(ctx);
+
+      /*
+       * The published check is only worth something if the answer cannot
+       * change between reading it and writing the marks.
+       *
+       * READ COMMITTED gives every statement its own snapshot, so a publish
+       * committing in that gap left the save going ahead into an assessment
+       * parents had already been shown — and nothing afterwards recorded that
+       * it happened, because both requests returned success.
+       *
+       * Racing two requests and hoping to land in the window would be a test
+       * that mostly passes either way. Instead an uncommitted publish is held
+       * open, which is the real thing: the same row, the same lock, taken by
+       * the same statement `publishAssessment` runs.
+       */
+      const publishing = Promise.withResolvers<void>();
+      const commit = Promise.withResolvers<void>();
+
+      const holder = db.transaction(async (tx) => {
+        await tx.execute(sql`
+          UPDATE assessments SET published_at = now() WHERE id = ${assessment.id}
+        `);
+        publishing.resolve();
+        await commit.promise;
+      });
+
+      await publishing.promise;
+
+      const save = Promise.resolve(put(`/assessments/${assessment.id}/scores`, {
+        scores: [{ enrollmentId: ctx.pupils[0].enrolmentId, rawScore: 90 }],
+      }, jsonHeaders("alpha", ctx.teacher)));
+
+      /*
+       * Note what does NOT hold this up on its own. The scores insert takes
+       * `FOR KEY SHARE` on the parent assessment through the foreign key, and
+       * that does not conflict with the `FOR NO KEY UPDATE` an ordinary column
+       * update takes — so without the lock on the read, this request sails
+       * straight past an in-flight publish.
+       */
+      const settledEarly = await Promise.race([
+        save.then(() => true),
+        new Promise<false>(r => setTimeout(() => r(false), 300)),
+      ]);
+
+      expect(settledEarly).toBe(false);
+
+      commit.resolve();
+      await holder;
+
+      // And having waited, it sees the publish that won and refuses — rather
+      // than writing marks into an assessment parents can already read.
+      expect((await save).status).toBe(409);
+    });
   });
 
   describe("term results", () => {
@@ -363,6 +437,33 @@ describe("assessment", () => {
       expect(byEnrolment[ctx.pupils[0].enrolmentId].streamPosition).toBe(1);
       expect(byEnrolment[ctx.pupils[2].enrolmentId].streamPosition).toBe(3);
       expect(byEnrolment[ctx.pupils[0].enrolmentId].outOf).toBe(3);
+    });
+
+    it("refuses a reduction rule this code cannot apply", async () => {
+      const ctx = await withMarks("alpha");
+      await post("/term-results/compute", { termId: ctx.term.id }, jsonHeaders("alpha", ctx.admin));
+
+      /*
+       * Deliberately reaching past the API, on the owner connection, because
+       * no route can do this — `computeResults` validates against a Zod enum.
+       * The constraint is there for the paths that are not the API: a backfill,
+       * a hand-run correction, a fourth rule added to the enum without a
+       * migration.
+       *
+       * It matters because `reduceLevels` treats an unrecognised rule as
+       * `mode_ties_low` SILENTLY, so the row would be labelled with a policy
+       * that did not produce it — and `finaliseReportCard` copies that label
+       * verbatim into a snapshot and freezes it.
+       */
+      const err = await db.update(termResults)
+        .set({ levelReduction: "mean" as never })
+        .where(eq(termResults.schoolId, ctx.school.id))
+        .then(() => null, (e: unknown) => e);
+
+      // Named rather than merely "something failed", so this keeps testing the
+      // constraint it is about and not whichever one happens to fire next.
+      expect(isCheckViolation(err)).toBe(true);
+      expect(pgConstraintName(err)).toBe("term_results_level_reduction_known");
     });
 
     it("skips an absence rather than counting it as zero", async () => {

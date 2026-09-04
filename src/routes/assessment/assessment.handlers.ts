@@ -144,10 +144,23 @@ export const saveScores: TenantRouteHandler<SaveScoresRoute> = async (c) => {
   const { scores } = c.req.valid("json");
   const db = c.var.db;
 
+  /*
+   * Locked, because the published check below is only worth anything if the
+   * answer cannot change under us.
+   *
+   * `c.var.db` is the request's transaction, but READ COMMITTED gives each
+   * statement its own snapshot: a publish committing between this read and the
+   * upsert would leave us writing marks into an assessment parents had already
+   * been shown — the exact thing the check exists to prevent, and invisible
+   * afterwards because both requests succeeded. `FOR UPDATE` makes the publish
+   * wait for this request to finish instead, and the lock is held to the end of
+   * the request rather than the end of the block below.
+   */
   const [assessment] = await db
     .select({ publishedAt: assessments.publishedAt, maxScore: assessments.maxScore })
     .from(assessments)
-    .where(eq(assessments.id, id));
+    .where(eq(assessments.id, id))
+    .for("update");
 
   if (!assessment) {
     return c.json(

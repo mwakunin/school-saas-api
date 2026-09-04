@@ -64,6 +64,13 @@
       "when": 1788531376148,
       "tag": "0008_level_reduction_and_area_names",
       "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1788535628530,
+      "tag": "0009_level_reduction_check",
+      "breakpoints": true
     }
   ]
 }
