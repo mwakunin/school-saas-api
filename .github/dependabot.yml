@@ -1,0 +1,26 @@
+version: 2
+
+updates:
+  # Pinned action SHAs are immutable, which is the point — but it also means
+  # they never pick up upstream security fixes on their own. Dependabot
+  # understands the `# v4` comment convention and bumps both the SHA and the
+  # comment together.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: chore(ci)
+
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: chore(deps)
+    groups:
+      # One PR for the routine noise; anything that isn't a patch still comes
+      # through on its own so it gets looked at.
+      patch-updates:
+        update-types:
+          - patch

@@ -1,0 +1,228 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Read-only by default, so test and migrations get a token that can do nothing
+# but read the repository. The docker job re-declares its own permissions to
+# add packages: write, which is the only job that needs to publish anything.
+permissions:
+  contents: read
+
+# A newer push to the same branch makes the older run irrelevant.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# Actions are pinned to commit SHAs, not tags. A tag like v4 is mutable: the
+# upstream owner can repoint it, and this workflow holds a token with
+# packages: write, so whatever it runs can publish images. The trailing comment
+# records which release each SHA was, since a bare SHA says nothing.
+jobs:
+  test:
+    name: lint, typecheck, test
+    runs-on: ubuntu-latest
+
+    services:
+      # The suite talks to real Postgres — the exclusion constraints and
+      # SQLSTATE mapping it relies on cannot be exercised against a mock.
+      # Mapped to 5435 so .env.test works unchanged.
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: school
+          POSTGRES_PASSWORD: school
+          POSTGRES_DB: school_test
+        ports:
+          - 5435:5432
+        options: >-
+          --health-cmd "pg_isready -U school -d school_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+      # Rate limiting is tested against real Redis: the limiter reaches it
+      # through a Lua script registered with defineCommand, which a fake
+      # would not exercise.
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6381:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # Checkout otherwise leaves the job's token in .git/config for
+          # everything that runs afterwards, and `pnpm install` runs
+          # lifecycle scripts. Nothing here talks to git over the network
+          # and no dependency comes from a repository, so it has no use.
+          persist-credentials: false
+
+      # Must come before setup-node: its pnpm cache needs pnpm on PATH.
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      # Service containers cannot mount an init script, so the runtime role is
+      # created here instead — from the same db/roles.sql that docker-compose
+      # mounts locally and that Neon is provisioned with. One definition, three
+      # invocations: a role that differed between CI and dev would make the RLS
+      # tests pass here and mean nothing.
+      - name: Create the unprivileged runtime role
+        run: PGPASSWORD=school psql -h localhost -p 5435 -U school -d school_test -f db/roles.sql
+
+      - name: Lint
+        run: pnpm lint
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      # globalSetup migrates the database, so no separate migrate step. The
+      # suite provides its own credentials via .env.test.
+      - name: Test
+        run: pnpm test -- --run
+
+  migrations:
+    name: migrations apply to an empty database
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: school
+          POSTGRES_PASSWORD: school
+          POSTGRES_DB: fresh
+        ports:
+          - 5435:5432
+        options: >-
+          --health-cmd "pg_isready -U school -d fresh"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+
+      # Separate from the suite on purpose: globalSetup migrates a database
+      # that previous runs already touched, so it would not catch a migration
+      # that only fails from nothing. Several fixes in this repo's history
+      # were exactly that.
+      - name: Create the unprivileged runtime role
+        run: PGPASSWORD=school psql -h localhost -p 5435 -U school -d fresh -f db/roles.sql
+
+      - name: Apply every migration from scratch
+        run: pnpm exec tsx src/db/migrate.ts
+        env:
+          NODE_ENV: test
+          TEST_DATABASE_URL: postgresql://school:school@localhost:5435/fresh
+          TEST_APP_DATABASE_URL: postgresql://school_app:school_app@localhost:5435/fresh
+
+  docker:
+    name: docker image builds
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      # Lets GITHUB_TOKEN push to GHCR — no personal access token needed.
+      packages: write
+
+    steps:
+      # This job's token can publish to GHCR, so leaving it in .git/config
+      # for every later step is the one worth removing most. The publish
+      # step authenticates through docker/login-action instead, and its
+      # `git rev-parse` reads the local repository, which needs no
+      # credential.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: school-api:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # A built image that cannot start is not a passing build.
+      - name: Container starts and reports unhealthy without a database
+        run: |
+          docker run -d --name api-smoke -p 9999:9999 \
+            -e DATABASE_URL=postgresql://nobody:nobody@127.0.0.1:1/none \
+            -e APP_DATABASE_URL=postgresql://nobody_app:nobody@127.0.0.1:1/none \
+            -e REDIS_URL=redis://127.0.0.1:6379 \
+            -e BETTER_AUTH_SECRET=ci-only-secret-that-is-long-enough-32 \
+            -e BETTER_AUTH_URL=https://example.test \
+            -e MPESA_CONSUMER_KEY=x -e MPESA_CONSUMER_SECRET=x \
+            -e MPESA_SHORTCODE=x -e MPESA_PASSKEY=x \
+            -e MPESA_CALLBACK_URL=https://example.test/cb \
+            -e RESEND_API_KEY=x -e RESEND_FROM_EMAIL=noreply@example.test \
+            -e IMAGEKIT_PUBLIC_KEY=x -e IMAGEKIT_PRIVATE_KEY=x \
+            -e IMAGEKIT_URL_ENDPOINT=https://ik.example.test \
+            school-api:ci
+          for i in $(seq 1 20); do
+            if curl -fsS http://localhost:9999/ >/dev/null 2>&1; then
+              echo "container serving requests"
+              # /health must report the database as down, not pretend it is up.
+              curl -s http://localhost:9999/health | tee /dev/stderr | grep -q '"database":"down"'
+              docker rm -f api-smoke >/dev/null
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "container never served a request:" >&2
+          docker logs api-smoke >&2
+          docker rm -f api-smoke >/dev/null
+          exit 1
+
+      # Publishing only after the smoke test means a broken image never
+      # reaches the registry. Skipped on pull requests: a PR should prove the
+      # image builds, not publish one — and a fork's token cannot write
+      # packages anyway.
+      - name: Log in to GHCR
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push to GHCR
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          # GHCR rejects uppercase in a repository path.
+          IMAGE="ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
+          SHA="$(git rev-parse --short HEAD)"
+
+          # Both tags point at the image the smoke test just passed. `latest`
+          # is convenient; the sha tag is what a rollback actually needs,
+          # since `latest` moves.
+          docker tag school-api:ci "${IMAGE}:latest"
+          docker tag school-api:ci "${IMAGE}:sha-${SHA}"
+          docker push "${IMAGE}:latest"
+          docker push "${IMAGE}:sha-${SHA}"
+
+          echo "Pushed \`${IMAGE}:sha-${SHA}\`" >> "$GITHUB_STEP_SUMMARY"
