@@ -22,6 +22,7 @@ import {
   recomputeInvoiceTotal,
 } from "@/lib/balances";
 import { isForeignKeyViolation, isUniqueViolation } from "@/lib/db-errors";
+import { releaseReversedTransaction } from "@/lib/mpesa-matching";
 
 import type {
   AddItemRoute,
@@ -731,13 +732,50 @@ export const reversePayment: TenantRouteHandler<ReversePaymentRoute> = async (c)
     );
   }
 
-  // Reversed, not deleted: "where did this KES 15,000 go" has to stay
-  // answerable, and the row is the only thing that can answer it.
-  const [updated] = await db
-    .update(payments)
-    .set({ reversedAt: new Date(), reversalReason: reason })
-    .where(eq(payments.id, id))
-    .returning();
+  const updated = await db.transaction(async (tx) => {
+    /*
+     * Reversed, not deleted: "where did this KES 15,000 go" has to stay
+     * answerable, and the row is the only thing that can answer it.
+     *
+     * `reversedAt IS NULL` is part of the predicate rather than a check before
+     * it. The read above narrows the common case to a clean 409, but two
+     * bursars reversing the same receipt at once would both pass it — and the
+     * second would overwrite the first's reason and timestamp, losing why the
+     * money was actually reversed. Letting the UPDATE match nothing is what
+     * makes that a conflict instead of a silent rewrite.
+     */
+    const [row] = await tx
+      .update(payments)
+      .set({ reversedAt: new Date(), reversalReason: reason })
+      .where(and(eq(payments.id, id), isNull(payments.reversedAt)))
+      .returning();
+
+    if (!row)
+      return null;
+
+    /*
+     * An M-Pesa payment reversed is a confirmation back in the queue.
+     *
+     * This is the pair that makes a mis-allocation recoverable: the payment
+     * stays on the record as reversed, and the money Safaricom really sent
+     * becomes allocatable again. Without it the confirmation would read
+     * `allocated` for ever while no live payment existed — money that arrived,
+     * was acknowledged, and now belongs to nobody.
+     *
+     * Same transaction as the reversal, so the two can never disagree.
+     */
+    if (row.mpesaTransactionId)
+      await releaseReversedTransaction(tx, row.mpesaTransactionId);
+
+    return row;
+  });
+
+  if (!updated) {
+    return c.json(
+      { message: "This payment was reversed by someone else a moment ago" },
+      HttpStatusCodes.CONFLICT,
+    );
+  }
 
   return c.json(updated, HttpStatusCodes.OK);
 };

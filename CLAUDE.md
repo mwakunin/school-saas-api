@@ -492,6 +492,8 @@ export const mpesaTransactions = pgTable('mpesa_transactions', {
   status: text('status')
     .$type<'unmatched' | 'allocated' | 'rejected'>()
     .notNull(),
+  // why a bursar set it aside, or why the system refused it
+  statusReason: text('status_reason'),
   receivedAt: timestamp('received_at').defaultNow().notNull(),
 });
 
@@ -516,10 +518,14 @@ export const payments = pgTable('payments', {
 
 Rules:
 
-- **The webhook's only job is to write an `mpesa_transactions` row and return 200.** It never guesses, never allocates, never fails on an unrecognised reference.
-- A separate matcher resolves tenant from `shortcode`, then matches `accountReference` against `admissionNumber`. Hits become a `payment`. Misses stay `unmatched`.
+- **The webhook's only job is to write an `mpesa_transactions` row and return 200.** It never guesses, never allocates, never fails on an unrecognised reference. A duplicate receipt is a Safaricom retry and is acknowledged, not stored twice; an unparseable body is acknowledged too, because a retry will not make it parse. The body is deliberately not schema-validated — rejecting a payload we do not control could only turn a real payment into a retry loop.
+- **The one exception is an unknown callback token, which returns 404.** That is our own misconfiguration — a URL registered with Safaricom that no longer resolves — not a transient fault, and answering 200 would swallow it silently while real payments went nowhere. Safaricom's retries are what make it visible.
+- **The tenant comes from an unguessable token in the callback path, NOT from `shortcode`.** An earlier draft of this section resolved it from the payload — but the endpoint is unauthenticated and the shortcode is a public field the caller supplies, so anyone could file fabricated payments against any school. Each school gets its own 256-bit callback URL (`schools.mpesa_callback_token`); a payload whose shortcode disagrees with the school's is stored `rejected` as evidence rather than believed.
+- The matcher then matches `accountReference` against `admissionNumber`. Hits become a `payment`. Misses stay `unmatched`.
+- **Matching is deliberately strict**: exact, or exact once separators and case are ignored. No fuzzy fallback — `ADM 118` for `2026/118` is meant to stay unmatched. A wrong automatic allocation is worse than none, because the money lands on another family's account and nobody is looking for it. The queue offers near misses as *suggestions* instead, with each candidate's balance.
 - **Build the manual reconciliation queue from day one.** A meaningful share of payments arrive unmatched — parents type the reference wrong constantly. This is not an edge case, it is the core bursar workflow.
-- Because the raw row is never mutated, mis-allocation is always reversible and "where did this KES 15,000 go" is always answerable.
+- Because the raw row is never mutated, mis-allocation is always reversible and "where did this KES 15,000 go" is always answerable. **A trigger enforces this** — only `status` and `status_reason` may change — because a claim this load-bearing cannot rest on a comment. Reversing an M-Pesa payment returns its confirmation to the queue, which is the other half of that promise; a partial unique index allows exactly one *live* payment per confirmation, so a reversed one releases it without leaving the record.
+- **Credentials are encrypted at rest** with AES-256-GCM (`lib/crypto.ts`), versioned so the algorithm can change without guessing at the old format, and never returned by any endpoint — only whether they are set.
 - Each school uses **its own paybill/till**. Money must never route through our account — licensing problem and an instant trust objection.
 
 ---
@@ -553,7 +559,7 @@ Two more are needed before v1 ships and are not yet built:
 2. ~~Tenancy + academic spine + RLS + superadmin plane (§4, §5.1, §5.2).~~ **Done.**
 3. ~~Students, guardians, enrollment (§5.3).~~ **Done.**
 4. ~~Fees: structures → invoice generation for one term (§5.7).~~ **Done.**
-5. Daraja C2B against sandbox + reconciliation queue (§5.8).
+5. ~~C2B webhook, matcher and reconciliation queue (§5.8).~~ **Done.** — but **`registerC2bUrls` has never been run against Daraja's sandbox.** It is written and wired; exercising it needs real credentials and a publicly reachable tunnel, and until that happens no school's callbacks are actually registered with Safaricom. Everything downstream of a delivered confirmation is tested.
 6. Bursar dashboard: outstanding balances per class.
 7. **Put it in front of one real school before writing anything else.**
 8. Curriculum seed + assessment + report cards (§5.4–5.6).

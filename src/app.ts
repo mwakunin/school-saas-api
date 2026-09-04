@@ -6,8 +6,10 @@ import academic from "@/routes/academic/academic.index";
 import fees from "@/routes/fees/fees.index";
 import health from "@/routes/health.route";
 import index from "@/routes/index.route";
+import reconciliation from "@/routes/reconciliation/reconciliation.index";
 import students from "@/routes/students/students.index";
 import superadmin from "@/routes/superadmin/superadmin.index";
+import webhooks from "@/routes/webhooks/webhooks.index";
 
 const app = createApp();
 
@@ -25,6 +27,9 @@ const unscopedRoutes = [
   index,
   health,
   superadmin,
+  // Safaricom callbacks: no session, no subdomain — the tenant comes from an
+  // unguessable token in the path. See routes/webhooks.
+  webhooks,
 ] as const;
 
 /**
@@ -45,6 +50,7 @@ const tenantRoutes = [
   academic,
   students,
   fees,
+  reconciliation,
 ] as unknown as readonly AppOpenAPI[];
 
 [...unscopedRoutes, ...tenantRoutes].forEach((route) => {

@@ -33,6 +33,11 @@ const OWNER_ALLOWLIST = new Map([
   ["middlewares/tenant.ts", "resolves subdomain -> school, the one bootstrap read"],
   ["routes/health.route.ts", "liveness probe; reaches no tenant data"],
   ["routes/superadmin/superadmin.handlers.ts", "the cross-tenant plane by design"],
+  [
+    "routes/webhooks/webhooks.handlers.ts",
+    "Safaricom callbacks carry no session and no subdomain; the token in the "
+    + "path is what establishes the tenant, and reading it is the bootstrap",
+  ],
 ]);
 
 /**
