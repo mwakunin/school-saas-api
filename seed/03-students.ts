@@ -223,11 +223,22 @@ export async function seedStudents(ctx: SchoolContext): Promise<Register> {
   }
 
   /*
-   * The parent login, attached to a real child.
+   * The child the parent login WOULD see, once there is anything to see.
    *
-   * Given a sibling pair on purpose: the parent view is what convinces a head
-   * that fee follow-up gets easier, and a parent looking at two children at
-   * once is the version of that screen worth showing.
+   * Being straight about this, because the comment here used to say "attached
+   * to a real child" and it was not attached to anything. `guardians.user_id`
+   * exists in the schema and NO route ever writes it; no route reads it
+   * either, because there are no guardian-scoped endpoints at all. A parent
+   * signing in today reaches `/school`, `/terms`, `/grade-levels` and
+   * `/streams` — the four routes that admit `anyMember` — and nothing about
+   * their own children.
+   *
+   * So this is not linked here. Writing `user_id` directly would be a second
+   * write outside the API, for a column nothing reads, to support a portal
+   * that does not exist — data pretending to be a feature. The membership is
+   * real and correct (this person IS a guardian at this school); what is
+   * missing is the parent portal, and it is recorded as missing in CLAUDE.md
+   * rather than papered over here.
    */
   const parentsChild = siblingGroups[0].pupils[0];
 

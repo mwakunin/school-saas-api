@@ -562,6 +562,8 @@ Two more are needed before v1 ships and are not yet built:
 - **`sms_messages`** — Africa's Talking charges per unit and reports delivery asynchronously, so schools will ask what they are spending. Needs recipient, body, provider id, status, cost, and the guardian or student it concerns.
 - **`audit_log`** — who changed a mark, who reversed a payment, who released a report card. For a product holding children's records and school money this is both a safeguard and a sales point.
 
+**No parent portal exists.** `guardians.user_id` is in the schema and no route writes it; no route reads it either, because there are no guardian-scoped endpoints. A guardian who signs in reaches `/school`, `/terms`, `/grade-levels` and `/streams` — the four that admit `anyMember` — and nothing about their own children. CLAUDE.md §9 calls the parent portal a v1 surface and §8 calls the parent view the thing that convinces a head; neither is demonstrable today, and the demo seed says so in its own running order rather than promising it.
+
 A third gap, found by building the demo seed and **now closed**: onboarding a school left nobody able to sign into it. `POST /superadmin/schools/{id}/memberships` grants the first role from outside the tenant, because the tenant-side equivalent would be guarded by `admin` — a role that does not exist yet at a school that has just been created. Still missing, and wanted before a real school runs itself: the tenant-side version, so a head can add their own bursar without the platform operator.
 
 ---

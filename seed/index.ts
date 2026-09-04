@@ -12,6 +12,7 @@ import { seedHistory } from "./04-history";
 import { seedFees } from "./05-fees";
 import { seedCurrentTerm } from "./06-current";
 import { TERM_DATES } from "./lib/calendar";
+import { DEMO_PASSWORD } from "./lib/client";
 
 /**
  * The demo tenant, built through the API from an empty database.
@@ -87,7 +88,7 @@ export async function seedDemo(): Promise<SeedSummary> {
     logins: Object.entries(LOGINS).map(([role, login]) => ({
       role,
       email: login.email,
-      password: "demo-password-2026",
+      password: DEMO_PASSWORD,
     })),
     terms: TERM_DATES,
     pupils: register.pupils.length,
@@ -117,14 +118,21 @@ export async function seedDemo(): Promise<SeedSummary> {
       `  owes ${shillings(fees.alarming.balanceCents)} across three terms — the one to chase first.`,
       ``,
       `As the class teacher, open "${current.unpublished.title}" in ${current.unpublished.streamName}.`,
-      `  Marks are two thirds entered and it is NOT published.`,
-      `  Sign in as the parent: the marks are not there. Publish it; now they are.`,
+      `  Marks are two thirds entered and it is NOT published, so it is absent`,
+      `  from the term mean and from every released report card. Publish it and`,
+      `  recompute: the means move.`,
+      `  (The parent's side of this is not demonstrable yet — see below.)`,
       ``,
       `As the head, open a report card from last term. Positions and levels are frozen`,
       `  into it — change a mark behind it and reprint: the document does not move.`,
       ``,
       `Search the register for one of the sibling families. Two children, one guardian,`,
       `  one phone number, one fee reminder.`,
+      ``,
+      `NOT YET DEMONSTRABLE: the parent portal. The parent login is a real`,
+      `  guardian membership, but no route serves a guardian their own child's`,
+      `  marks, balance or report card — and nothing links a guardian record to`,
+      `  a login. Do not promise this screen in a meeting.`,
     ],
   };
 }

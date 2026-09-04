@@ -1,7 +1,7 @@
 import type { Api, Session } from "./lib/client";
 
 import { ACADEMIC_YEAR, TERM_DATES } from "./lib/calendar";
-import { makeSuperadmin, platformApi, schoolApi, signUp } from "./lib/client";
+import { makeSuperadmin, platformApi, schoolApi, signUp, signUpOperator } from "./lib/client";
 
 /**
  * The school, its year, its classes and the four people who will log in.
@@ -62,8 +62,14 @@ export interface SchoolContext {
 }
 
 export async function seedSchool(): Promise<SchoolContext> {
-  // The operator account. Its role is the one thing no endpoint can grant.
-  const operator = await signUp("operator@demo.school", "Demo Operator");
+  /*
+   * The operator account. Its role is the one thing no endpoint can grant.
+   *
+   * A password generated per run and thrown away — unlike the four demo staff
+   * logins, this account is superadmin across EVERY school, so a value anyone
+   * could read from the repository would be a way into every tenant.
+   */
+  const operator = await signUpOperator("operator@demo.school", "Demo Operator");
   await makeSuperadmin(operator);
   const platform = platformApi(operator.cookie);
 

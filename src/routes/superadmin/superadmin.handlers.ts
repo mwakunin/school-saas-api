@@ -199,14 +199,28 @@ export const grantMembership: AppRouteHandler<GrantMembershipRoute> = async (c) 
   if (granted)
     return c.json({ ...granted, created: true }, HttpStatusCodes.CREATED);
 
-  const [existing] = await db
-    .select()
-    .from(memberships)
+  /*
+   * A row already existed — reactivate it rather than hand it back as it is.
+   *
+   * `withMembership` only accepts memberships with `isActive` true, so
+   * returning a deactivated row would answer 201 with a membership that grants
+   * nothing: the endpoint would report success and the person would still be
+   * unable to act, with nothing in the response to say why. Granting access is
+   * this route's whole purpose, so it has to mean it.
+   *
+   * Nothing sets `isActive` false today — there is no deactivation route yet —
+   * so this is the correct behaviour waiting for the obvious next feature
+   * rather than a bug anyone can currently reach.
+   */
+  const [reactivated] = await db
+    .update(memberships)
+    .set({ isActive: true })
     .where(and(
       eq(memberships.userId, person.id),
       eq(memberships.schoolId, id),
       eq(memberships.role, role),
-    ));
+    ))
+    .returning();
 
-  return c.json({ ...existing, created: false }, HttpStatusCodes.CREATED);
+  return c.json({ ...reactivated, created: false }, HttpStatusCodes.CREATED);
 };

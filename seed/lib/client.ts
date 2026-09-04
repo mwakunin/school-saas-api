@@ -1,4 +1,5 @@
 import { eq } from "drizzle-orm";
+import { randomBytes } from "node:crypto";
 
 import app from "@/app";
 import db from "@/db";
@@ -21,6 +22,35 @@ import env from "@/env";
  * the same middleware chain — nothing is stubbed — and it means the seed needs
  * no running server, which is what lets CI run it as an integration test.
  */
+
+/**
+ * The shared password for the four demo staff logins — see `src/env.ts`.
+ *
+ * Shared and printed on purpose: these accounts are handed to a prospect, at a
+ * tenant holding invented children and reset nightly. A secret nobody may know
+ * would defeat the point of them.
+ */
+export const DEMO_PASSWORD = env.DEMO_PASSWORD;
+
+/**
+ * The operator account's password, generated fresh every run and never
+ * printed.
+ *
+ * This one is NOT like the four above, and the difference is the whole reason
+ * it exists separately. `operator@demo.school` is promoted to platform
+ * superadmin — a role that reads and modifies EVERY school, not just the demo
+ * one. A repository-visible password on that account means anyone who can read
+ * this file can sign into a production deployment and reach every tenant's
+ * children and fees.
+ *
+ * So it is random, it is discarded when the seed finishes, and the account is
+ * left behind unusable rather than usable-by-anyone. Nothing needs to sign in
+ * as it afterwards: the seed holds its session for the few superadmin calls it
+ * makes and never needs it again.
+ */
+function operatorPassword(): string {
+  return `op-${randomBytes(24).toString("base64url")}`;
+}
 
 export interface Session {
   id: string;
@@ -141,7 +171,7 @@ export function schoolApi(subdomain: string, cookie?: string): Api {
 export async function signUp(
   email: string,
   name: string,
-  password = "demo-password-2026",
+  password: string = DEMO_PASSWORD,
 ): Promise<Session> {
   const response = await app.request("/api/auth/sign-up/email", {
     method: "POST",
@@ -181,6 +211,10 @@ export async function signUp(
  * Everything downstream of this — the school, its staff, its children, their
  * marks and their fees — goes through the API.
  */
+export async function signUpOperator(email: string, name: string): Promise<Session> {
+  return signUp(email, name, operatorPassword());
+}
+
 export async function makeSuperadmin(session: Session): Promise<void> {
   await db.update(user).set({ role: "superadmin" }).where(eq(user.id, session.id));
 }

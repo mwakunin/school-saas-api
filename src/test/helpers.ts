@@ -76,6 +76,8 @@ async function postJson(path: string, body: unknown, cookie?: string) {
 export interface TestUser {
   id: string;
   phoneNumber: string;
+  /** Set when the account was created with email+password. */
+  email?: string;
   /** Ready-to-spread request headers carrying the session cookie. */
   headers: { cookie: string };
 }
@@ -220,7 +222,7 @@ export async function signUpWithEmail(
   if (!row)
     throw new Error(`User row missing after sign-up for ${email}`);
 
-  return { id: row.id, phoneNumber: "", headers: { cookie } };
+  return { id: row.id, phoneNumber: "", email, headers: { cookie } };
 }
 
 let emailCounter = 0;

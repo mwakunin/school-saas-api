@@ -7,7 +7,7 @@ import type { SeedSummary } from "./index";
 
 import { LOGINS, SUBDOMAIN } from "./01-school";
 import { seedDemo } from "./index";
-import { schoolApi } from "./lib/client";
+import { DEMO_PASSWORD, schoolApi } from "./lib/client";
 
 /**
  * The demo tenant, run end to end against a real database.
@@ -44,7 +44,7 @@ async function accessAs(as: keyof typeof LOGINS) {
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
       email: LOGINS[as].email,
-      password: "demo-password-2026",
+      password: DEMO_PASSWORD,
     }),
   });
 
@@ -260,6 +260,30 @@ describe("the demo tenant", () => {
       expect(detail.snapshot.learningAreas.length).toBeGreaterThan(0);
       expect(detail.snapshot.levelReduction).toBeDefined();
     });
+  });
+
+  it("does not leave a superadmin anyone could sign in as", async () => {
+    /*
+     * The demo staff share a password on purpose — those accounts are handed
+     * to a prospect and reset nightly. The operator account is NOT like them:
+     * it is superadmin across every school on the platform, so a value that
+     * could be read out of this repository would be a way into every tenant's
+     * children and fees, not just the demo's.
+     *
+     * Its password is generated per run and discarded, which leaves the
+     * account unusable rather than usable-by-anyone. Nothing needs it after
+     * the seed finishes.
+     */
+    const asOperator = await app.request("/api/auth/sign-in/email", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        email: "operator@demo.school",
+        password: DEMO_PASSWORD,
+      }),
+    });
+
+    expect(asOperator.ok).toBe(false);
   });
 
   it("is reproducible: the same seed builds the same school", async () => {
