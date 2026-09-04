@@ -182,6 +182,126 @@ describe("reconciliation", () => {
     });
   });
 
+  describe("working through a backlog", () => {
+    /** Confirmations at chosen times, so the sweep order is deterministic. */
+    async function backlog(school: { id: string }, rows: Array<[string, string, string]>) {
+      for (const [id, reference, at] of rows) {
+        await db.insert(mpesaTransactions).values({
+          schoolId: school.id,
+          transactionId: id,
+          shortcode: "600638",
+          accountReference: reference,
+          msisdn: "254712345678",
+          amountCents: 100_000,
+          transactedAt: new Date(at),
+          rawPayload: {},
+          status: "unmatched",
+        });
+      }
+    }
+
+    it("reaches a matchable payment sitting behind unmatchable ones", async () => {
+      const { school, bursar } = await seed("alpha");
+      await makeStudent(school, "2026/500", { givenName: "Reachable" });
+
+      /*
+       * The failure this exists to prevent.
+       *
+       * The rows at the front of a queue are there BECAUSE nothing could match
+       * them. A bounded sweep that always restarted from the oldest re-examined
+       * the same stuck batch every time, matched nothing, and still reported
+       * that more remained — so "run again" did nothing, for ever, and a
+       * payment behind them was never looked at.
+       */
+      await backlog(school, [
+        ["T1", "GIBBERISH-A", "2026-01-01T08:00:00Z"],
+        ["T2", "GIBBERISH-B", "2026-01-02T08:00:00Z"],
+        ["T3", "GIBBERISH-C", "2026-01-03T08:00:00Z"],
+        ["T4", "2026/500", "2026-01-04T08:00:00Z"],
+      ]);
+
+      // Walk the queue the way a client would, carrying the cursor.
+      let after: string | undefined;
+      let passes = 0;
+
+      do {
+        const body = await (await post(
+          "/mpesa/transactions/match",
+          after ? { after } : {},
+          jsonHeaders("alpha", bursar),
+        )).json();
+
+        after = body.nextCursor ?? undefined;
+        passes += 1;
+      } while (after && passes < 10);
+
+      // The matchable row was reached, and the sweep terminated.
+      const paid = await db.select().from(payments);
+      expect(paid).toHaveLength(1);
+      expect(paid[0].reference).toBe("T4");
+      expect(passes).toBeLessThan(10);
+    });
+
+    it("returns a cursor that moves, rather than repeating a batch", async () => {
+      const { school, bursar } = await seed("alpha");
+      await backlog(school, [
+        ["U1", "NOPE-1", "2026-01-01T08:00:00Z"],
+        ["U2", "NOPE-2", "2026-01-02T08:00:00Z"],
+        ["U3", "NOPE-3", "2026-01-03T08:00:00Z"],
+      ]);
+
+      const first = await (await post(
+        "/mpesa/transactions/match",
+        {},
+        jsonHeaders("alpha", bursar),
+      )).json();
+
+      // A batch of 200 swallows all three, so the sweep is done in one pass.
+      expect(first.examined).toBe(3);
+      expect(first.allocated).toBe(0);
+      // `remaining` counts what a FURTHER pass would examine, not the size of
+      // the queue — otherwise it never falls and always invites a useless
+      // re-run.
+      expect(first.remaining).toBe(0);
+      expect(first.nextCursor).toBeNull();
+    });
+
+    it("starts from the oldest again once the sweep is finished", async () => {
+      const { school, bursar } = await seed("alpha");
+      await backlog(school, [["V1", "NOPE", "2026-01-01T08:00:00Z"]]);
+
+      await post("/mpesa/transactions/match", {}, jsonHeaders("alpha", bursar));
+
+      // A confirmation that arrives later must be picked up by the next run,
+      // which is why a finished sweep clears the cursor rather than parking at
+      // the end of the queue.
+      await makeStudent(school, "2026/777", { givenName: "New" });
+      await backlog(school, [["V2", "2026/777", "2026-01-05T08:00:00Z"]]);
+
+      const body = await (await post(
+        "/mpesa/transactions/match",
+        {},
+        jsonHeaders("alpha", bursar),
+      )).json();
+
+      expect(body.allocated).toBe(1);
+    });
+
+    it("422s a cursor it cannot read", async () => {
+      const { bursar } = await seed("alpha");
+
+      const res = await post(
+        "/mpesa/transactions/match",
+        { after: "not-a-cursor" },
+        jsonHeaders("alpha", bursar),
+      );
+
+      // A client looping on a cursor it cannot read would sweep the first
+      // batch for ever and believe it was progressing.
+      expect(res.status).toBe(422);
+    });
+  });
+
   describe("the queue", () => {
     it("shows unmatched payments with the money still sitting there", async () => {
       const { bursar, confirm } = await seed("alpha");

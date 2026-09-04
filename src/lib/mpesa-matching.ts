@@ -1,6 +1,7 @@
 import type { AnyColumn } from "drizzle-orm";
 
-import { and, count, eq, isNull, sql } from "drizzle-orm";
+import { and, asc, count, eq, isNull, sql } from "drizzle-orm";
+import { Buffer } from "node:buffer";
 
 import type { AppDb } from "@/db";
 
@@ -176,23 +177,92 @@ export async function allocateTransaction(
  *
  * Each one costs a query or two, so an unbounded sweep over a school that let
  * a term's payments pile up would hold a request open for as long as the
- * backlog is deep. Bounded and resumable instead: the caller is told whether
- * more remain and can press again.
+ * backlog is deep.
  */
 export const MATCH_BATCH_SIZE = 200;
 
+/**
+ * Where a sweep got to: the last confirmation it examined.
+ *
+ * `transactedAt` alone is not unique — two payments can share a second — so
+ * the id breaks the tie and makes the ordering total. Without that a cursor
+ * could skip a row or repeat one, which on a matcher means a payment that is
+ * never looked at again.
+ */
+export interface MatchCursor {
+  transactedAt: Date;
+  id: string;
+}
+
+/** Opaque to callers, so the pair can change without breaking a client. */
+export function encodeCursor(cursor: MatchCursor): string {
+  return Buffer
+    .from(`${cursor.transactedAt.toISOString()}|${cursor.id}`, "utf8")
+    .toString("base64url");
+}
+
+export function decodeCursor(value: string): MatchCursor | null {
+  try {
+    const [timestamp, id] = Buffer.from(value, "base64url").toString("utf8").split("|");
+    const transactedAt = new Date(timestamp);
+
+    if (!id || Number.isNaN(transactedAt.getTime()))
+      return null;
+
+    return { transactedAt, id };
+  }
+  catch {
+    return null;
+  }
+}
+
+/**
+ * Sweeps unmatched confirmations, resuming where the last pass stopped.
+ *
+ * The cursor is the whole point. A bounded sweep that always started from the
+ * oldest row could not make progress: the rows at the front of the queue are
+ * there precisely BECAUSE nothing could match them, so every pass re-examined
+ * the same stuck batch, matched nothing, and reported that more remained. A
+ * backlog deeper than one batch was unreachable, and the "run again" the
+ * response invited did nothing at all. That is how the first bounded version
+ * of this function behaved.
+ *
+ * Ordered by `(transactedAt, id)` — oldest first, since a parent waiting on a
+ * receipt has been waiting longest — and paged by that same pair, so each call
+ * examines rows the last one did not.
+ *
+ * Safe to run repeatedly and concurrently with itself: it only ever moves a
+ * row from `unmatched` to `allocated`, and the partial unique index on
+ * `payments.mpesa_transaction_id` means a second runner that raced the first
+ * fails its insert rather than paying twice.
+ */
 export async function matchUnallocated(
   db: AppDb,
   schoolId: string,
-  batchSize: number = MATCH_BATCH_SIZE,
-): Promise<{ results: AllocationResult[]; remaining: number }> {
+  options: { batchSize?: number; after?: MatchCursor | null } = {},
+): Promise<{
+  results: AllocationResult[];
+  remaining: number;
+  nextCursor: MatchCursor | null;
+}> {
+  const batchSize = options.batchSize ?? MATCH_BATCH_SIZE;
+  const after = options.after ?? null;
+
+  /*
+   * Row-value comparison, not `transactedAt > x OR (= x AND id > y)`.
+   *
+   * Postgres compares the tuple left to right in one expression, which is both
+   * easier to read and index-friendly against `(transacted_at, id)`.
+   */
+  const beyondCursor = after
+    ? sql`(${mpesaTransactions.transactedAt}, ${mpesaTransactions.id}) > (${after.transactedAt.toISOString()}::timestamptz, ${after.id}::uuid)`
+    : undefined;
+
   const pending = await db
     .select()
     .from(mpesaTransactions)
-    .where(eq(mpesaTransactions.status, "unmatched"))
-    // Oldest first: a parent waiting on a receipt has been waiting longest,
-    // and the ordering has to be stable for "press again" to make progress.
-    .orderBy(mpesaTransactions.transactedAt)
+    .where(and(eq(mpesaTransactions.status, "unmatched"), beyondCursor))
+    .orderBy(asc(mpesaTransactions.transactedAt), asc(mpesaTransactions.id))
     .limit(batchSize);
 
   const results: AllocationResult[] = [];
@@ -211,19 +281,50 @@ export async function matchUnallocated(
     results.push({ transactionId: transaction.id, outcome });
   }
 
-  /*
-   * What is left AFTER this pass.
-   *
-   * Counted rather than inferred from the batch being full: rows this pass
-   * could not match are still unmatched, so a full batch does not mean there
-   * is more to do, and an empty one does not mean there is not.
-   */
-  const [{ left }] = await db
-    .select({ left: count() })
-    .from(mpesaTransactions)
-    .where(eq(mpesaTransactions.status, "unmatched"));
+  const last = pending.at(-1);
 
-  return { results, remaining: left };
+  // A short batch means the queue is already exhausted; only a full one leaves
+  // any question about what follows.
+  const reached = last && pending.length === batchSize
+    ? { transactedAt: last.transactedAt, id: last.id }
+    : null;
+
+  /*
+   * What a FURTHER pass would examine — not the size of the queue.
+   *
+   * Counting every unmatched row was the misleading part of the first bounded
+   * version: rows this pass just tried and could not match are still
+   * unmatched, so the figure never fell and "run again" never helped. Counted
+   * beyond where this pass reached instead, so zero genuinely means there is
+   * nothing left to look at.
+   */
+  const remaining = reached
+    ? await db
+        .select({ left: count() })
+        .from(mpesaTransactions)
+        .where(and(
+          eq(mpesaTransactions.status, "unmatched"),
+          sql`(${mpesaTransactions.transactedAt}, ${mpesaTransactions.id}) > (${reached.transactedAt.toISOString()}::timestamptz, ${reached.id}::uuid)`,
+        ))
+        .then(([row]) => row.left)
+    : 0;
+
+  /*
+   * The cursor is offered only when it would lead somewhere.
+   *
+   * Deriving it from `remaining` rather than from the batch being full ties
+   * the two together: a null cursor and a zero count now mean the same thing,
+   * and a caller looping `while (nextCursor)` cannot be handed one final pass
+   * that examines nothing. It also saves that empty round trip whenever the
+   * queue happens to be an exact multiple of the batch.
+   *
+   * Cleared at the end of a sweep rather than parked there, so the next run
+   * starts from the oldest row again — which is what picks up confirmations
+   * that arrived in the meantime.
+   */
+  const nextCursor = remaining > 0 ? reached : null;
+
+  return { results, remaining, nextCursor };
 }
 
 /**

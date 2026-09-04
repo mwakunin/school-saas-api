@@ -67,13 +67,29 @@ export const rejectSchema = toZodV4SchemaTyped(
   }),
 );
 
+export const runMatcherSchema = toZodV4SchemaTyped(
+  z.object({
+    /**
+     * Where the previous pass stopped, from its `nextCursor`.
+     *
+     * Omit to sweep from the oldest confirmation. Supplying it is what lets a
+     * backlog deeper than one batch be worked through: the rows at the front
+     * of the queue are there because nothing could match them, so a sweep that
+     * always restarted would re-examine the same stuck rows for ever.
+     */
+    after: z.string().max(200).optional(),
+  }),
+);
+
 export const runMatcherResultSchema = toZodV4SchemaTyped(
   z.object({
     examined: z.number().int(),
     allocated: z.number().int(),
     stillUnmatched: z.number().int(),
-    /** Unmatched confirmations left after this pass; run again if non-zero. */
+    /** Confirmations a further pass would examine. Zero means the sweep is done. */
     remaining: z.number().int(),
+    /** Pass back as `after` to continue. Null when there is nothing left. */
+    nextCursor: z.string().nullable(),
   }),
 );
 

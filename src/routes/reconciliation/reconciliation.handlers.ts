@@ -19,6 +19,8 @@ import {
 } from "@/lib/mpesa-c2b";
 import {
   allocateTransaction,
+  decodeCursor,
+  encodeCursor,
   matchUnallocated,
   normalisedAdmissionNumber,
   normaliseReference,
@@ -333,17 +335,34 @@ export const requeue: TenantRouteHandler<RequeueRoute> = async (c) => {
 
 export const runMatcher: TenantRouteHandler<RunMatcherRoute> = async (c) => {
   const db = c.var.db;
+  const { after } = c.req.valid("json");
 
-  const { results, remaining } = await matchUnallocated(db, c.var.school.id);
+  const cursor = after ? decodeCursor(after) : null;
+
+  if (after && !cursor) {
+    // Rejected rather than silently restarted: a caller looping on a cursor it
+    // cannot read would sweep the first batch for ever and believe it was
+    // making progress.
+    return c.json(
+      fieldError(["after"], "Unreadable cursor"),
+      HttpStatusCodes.UNPROCESSABLE_ENTITY,
+    );
+  }
+
+  const { results, remaining, nextCursor } = await matchUnallocated(
+    db,
+    c.var.school.id,
+    { after: cursor },
+  );
+
   const allocated = results.filter(r => r.outcome.kind === "matched").length;
 
   return c.json({
     examined: results.length,
     allocated,
     stillUnmatched: results.length - allocated,
-    // Whether pressing again would do anything. A deep backlog is walked a
-    // batch at a time rather than in one request that might not finish.
     remaining,
+    nextCursor: nextCursor ? encodeCursor(nextCursor) : null,
   }, HttpStatusCodes.OK);
 };
 

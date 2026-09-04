@@ -17,6 +17,7 @@ import {
   mpesaSettingsSchema,
   rejectSchema,
   runMatcherResultSchema,
+  runMatcherSchema,
   transactionDetailSchema,
   transactionSchema,
 } from "./reconciliation.schemas";
@@ -157,10 +158,21 @@ export const runMatcher = createRoute({
     "Worth running after the register changes: a child admitted late, or an "
     + "admission number corrected, turns yesterday's unmatched payments into "
     + "today's matches without anyone re-keying them. Only allocates what is "
-    + "unambiguous.",
+    + "unambiguous.\n\n"
+    + "Sweeps a bounded batch and returns a cursor. Pass it back as `after` to "
+    + "continue — a queue deeper than one batch needs more than one call, and "
+    + "the cursor is what stops each call re-examining the same unmatchable "
+    + "rows at the front of it.",
   middleware: [money],
+  request: {
+    body: jsonContentRequired(runMatcherSchema, "Where to resume from"),
+  },
   responses: {
     [HttpStatusCodes.OK]: jsonContent(runMatcherResultSchema, "What it matched"),
+    [HttpStatusCodes.UNPROCESSABLE_ENTITY]: jsonContent(
+      createErrorSchema(runMatcherSchema),
+      "Validation error, or an unreadable cursor",
+    ),
     ...errorResponses,
   },
 });
