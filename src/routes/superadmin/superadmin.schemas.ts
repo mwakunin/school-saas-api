@@ -77,3 +77,34 @@ export const onboardedSchoolSchema = toZodV4SchemaTyped(
     }),
   }),
 );
+
+/**
+ * Granting someone a role at a school.
+ *
+ * By email rather than by user id, because the person doing the onboarding has
+ * the head teacher's email in front of them and no reason to know an opaque
+ * id. The account must already exist — this plane grants access, it does not
+ * create people, and an invitation flow is real work that has not been built.
+ *
+ * It lives on the superadmin plane because of a bootstrap problem: the tenant
+ * equivalent would have to be guarded by `admin`, and a freshly onboarded
+ * school has no admin to run it. Somebody outside the tenant has to grant the
+ * first one.
+ */
+export const grantMembershipSchema = toZodV4SchemaTyped(
+  z.object({
+    email: z.email(),
+    role: z.enum(["admin", "bursar", "teacher", "guardian"]),
+  }),
+);
+
+export const grantedMembershipSchema = toZodV4SchemaTyped(
+  z.object({
+    userId: z.string(),
+    schoolId: z.uuid(),
+    role: z.enum(["admin", "bursar", "teacher", "guardian"]),
+    isActive: z.boolean(),
+    /** False when the person already held this role — the call is idempotent. */
+    created: z.boolean(),
+  }),
+);
