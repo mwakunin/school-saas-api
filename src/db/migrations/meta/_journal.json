@@ -57,6 +57,13 @@
       "when": 1788528625839,
       "tag": "0007_curriculum_assessment_reports",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1788531376148,
+      "tag": "0008_level_reduction_and_area_names",
+      "breakpoints": true
     }
   ]
 }

@@ -1,4 +1,4 @@
-import { and, asc, eq, inArray, isNotNull, isNull } from "drizzle-orm";
+import { and, asc, eq, inArray, isNotNull, isNull, sql } from "drizzle-orm";
 import * as HttpStatusCodes from "stoker/http-status-codes";
 import * as HttpStatusPhrases from "stoker/http-status-phrases";
 
@@ -189,54 +189,77 @@ export const saveScores: TenantRouteHandler<SaveScoresRoute> = async (c) => {
     }
   }
 
+  /*
+   * One row per pupil-and-competency, last entry winning.
+   *
+   * A multi-row upsert cannot touch the same conflict target twice — Postgres
+   * refuses with "cannot affect row a second time" — so a grid that repeated a
+   * pupil would fail the whole submission. Collapsing first keeps the previous
+   * behaviour (the last value entered is the one saved) and makes the
+   * duplicate a non-event rather than a 500.
+   */
+  const deduped = new Map<string, typeof scores[number]>();
+  for (const entry of scores)
+    deduped.set(`${entry.enrollmentId}:${entry.competencyId ?? ""}`, entry);
+
+  const rows = [...deduped.values()].map(entry => ({
+    schoolId: c.var.school.id,
+    assessmentId: id,
+    enrollmentId: entry.enrollmentId,
+    competencyId: entry.competencyId,
+    rawScore: entry.rawScore === undefined ? null : String(entry.rawScore),
+    level: entry.level,
+    isAbsent: entry.isAbsent,
+    comment: entry.comment,
+    enteredBy: c.var.user!.id,
+  }));
+
   let updated = 0;
 
   try {
     /*
-     * The whole grid in one transaction.
+     * The whole grid in one statement, inside one transaction.
      *
      * A partly saved grid is worse than a failed one: a teacher cannot tell
      * which rows landed, and re-entering the lot risks doubling the ones that
      * did. All or nothing, and re-submitting is safe.
      */
     await db.transaction(async (tx) => {
-      for (const entry of scores) {
-        const result = await tx
-          .insert(assessmentScores)
-          .values({
-            schoolId: c.var.school.id,
-            assessmentId: id,
-            enrollmentId: entry.enrollmentId,
-            competencyId: entry.competencyId,
-            rawScore: entry.rawScore === undefined ? null : String(entry.rawScore),
-            level: entry.level,
-            isAbsent: entry.isAbsent,
-            comment: entry.comment,
-            enteredBy: c.var.user!.id,
-          })
-          .onConflictDoUpdate({
-            // Matches the NULLS NOT DISTINCT unique, so re-submitting the grid
-            // corrects rather than duplicates — including on the percentage
-            // path, where the competency is null.
-            target: [
-              assessmentScores.assessmentId,
-              assessmentScores.enrollmentId,
-              assessmentScores.competencyId,
-            ],
-            set: {
-              rawScore: entry.rawScore === undefined ? null : String(entry.rawScore),
-              level: entry.level ?? null,
-              isAbsent: entry.isAbsent,
-              comment: entry.comment ?? null,
-              enteredBy: c.var.user!.id,
-              enteredAt: new Date(),
-            },
-          })
-          .returning({ enteredAt: assessmentScores.enteredAt });
+      const written = await tx
+        .insert(assessmentScores)
+        .values(rows)
+        .onConflictDoUpdate({
+          // Matches the NULLS NOT DISTINCT unique, so re-submitting the grid
+          // corrects rather than duplicates — including on the percentage
+          // path, where the competency is null.
+          target: [
+            assessmentScores.assessmentId,
+            assessmentScores.enrollmentId,
+            assessmentScores.competencyId,
+          ],
+          set: {
+            rawScore: sql`excluded.raw_score`,
+            level: sql`excluded.level`,
+            isAbsent: sql`excluded.is_absent`,
+            comment: sql`excluded.comment`,
+            enteredBy: sql`excluded.entered_by`,
+            enteredAt: new Date(),
+          },
+        })
+        .returning({
+          /*
+           * The genuine insert-versus-update signal.
+           *
+           * An upsert returns a row either way, so counting returned rows made
+           * `updated` always equal `saved` — the field claimed to say how many
+           * marks were CORRECTED and in fact said how many were submitted. A
+           * non-zero `xmax` means this tuple replaced an existing version,
+           * which is the only thing that actually distinguishes them.
+           */
+          wasUpdate: sql<boolean>`(xmax <> 0)`,
+        });
 
-        if (result.length > 0)
-          updated += 1;
-      }
+      updated = written.filter(r => r.wasUpdate).length;
     });
   }
   catch (err) {
@@ -331,7 +354,7 @@ export const computeResults: TenantRouteHandler<ComputeResultsRoute> = async (c)
     );
   }
 
-  const { enrolments, results } = await computeTermResults(
+  const { enrolments, results, cleared } = await computeTermResults(
     db,
     c.var.school.id,
     termId,
@@ -340,7 +363,7 @@ export const computeResults: TenantRouteHandler<ComputeResultsRoute> = async (c)
 
   const positionsRanked = await computePositions(db, termId);
 
-  return c.json({ enrolments, results, positionsRanked }, HttpStatusCodes.OK);
+  return c.json({ enrolments, results, positionsRanked, cleared }, HttpStatusCodes.OK);
 };
 
 export const listTermResults: TenantRouteHandler<ListTermResultsRoute> = async (c) => {
@@ -420,6 +443,7 @@ export const finaliseReportCard: TenantRouteHandler<FinaliseReportCardRoute> = a
       sequence: learningAreas.sequence,
       meanScore: termResults.meanScore,
       overallLevel: termResults.overallLevel,
+      levelReduction: termResults.levelReduction,
       streamPosition: termResults.streamPosition,
       gradePosition: termResults.gradePosition,
       outOf: termResults.outOf,
@@ -493,7 +517,16 @@ export const finaliseReportCard: TenantRouteHandler<FinaliseReportCardRoute> = a
       endsOn: term.endsOn,
     },
     showsPositions: school?.showsPositions ?? true,
-    levelReduction: "mode_ties_low",
+    /*
+     * The rule that actually produced these levels, read from the results
+     * rather than assumed.
+     *
+     * Hardcoding the default meant a school computing with `lowest` got a
+     * frozen document claiming `mode_ties_low` — the snapshot would have
+     * misdescribed its own contents, which is worse than not recording the
+     * rule at all.
+     */
+    levelReduction: results[0].levelReduction,
     learningAreas: results.map(r => ({
       name: r.learningAreaName,
       sequence: r.sequence,

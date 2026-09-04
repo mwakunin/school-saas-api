@@ -109,6 +109,8 @@ export const computeResultsResultSchema = toZodV4SchemaTyped(
     enrolments: z.number().int(),
     results: z.number().int(),
     positionsRanked: z.number().int(),
+    /** Results removed because nothing published stands behind them any more. */
+    cleared: z.number().int(),
   }),
 );
 
@@ -122,5 +124,28 @@ export const finaliseReportCardSchema = toZodV4SchemaTyped(
     headComment: z.string().max(2000).optional(),
     attendancePresent: z.number().int().min(0).max(400).optional(),
     attendanceTotal: z.number().int().min(0).max(400).optional(),
-  }),
+  })
+    /*
+     * Attendance is a pair or it is nothing.
+     *
+     * "Present: 42" with no total says nothing a parent can read, and the
+     * database CHECK refuses it — which without this would surface as a 500
+     * from a constraint violation rather than a message naming the field.
+     */
+    .refine(
+      v => (v.attendancePresent === undefined) === (v.attendanceTotal === undefined),
+      {
+        message: "Give both attendance figures or neither — a count with no total says nothing",
+        path: ["attendanceTotal"],
+      },
+    )
+    .refine(
+      v => v.attendancePresent === undefined
+        || v.attendanceTotal === undefined
+        || v.attendancePresent <= v.attendanceTotal,
+      {
+        message: "A child cannot attend more days than the term had",
+        path: ["attendancePresent"],
+      },
+    ),
 );

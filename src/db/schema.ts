@@ -744,6 +744,17 @@ export const learningAreas = pgTable("learning_areas", {
   sequence: integer().notNull(),
 }, t => [
   unique("learning_areas_school_id_id_key").on(t.schoolId, t.id),
+  /*
+   * One area per name per school, case-insensitively.
+   *
+   * The seed skips an area the school already has by name, but nothing stopped
+   * a second "Mathematics" arriving through the ordinary create route — after
+   * which the seed's own skip check becomes ambiguous and a report card prints
+   * the subject twice. Case-insensitive because "mathematics" and
+   * "Mathematics" are the same subject to everyone except a byte comparison.
+   */
+  uniqueIndex("learning_areas_school_name_unique")
+    .on(t.schoolId, sql`lower(${t.name})`),
   foreignKey({
     columns: [t.schoolId, t.gradeLevelId],
     foreignColumns: [gradeLevels.schoolId, gradeLevels.id],
@@ -972,6 +983,20 @@ export const termResults = pgTable("term_results", {
    * exists to surface. See lib/assessment.ts.
    */
   overallLevel: performanceLevel(),
+
+  /**
+   * The reduction rule that produced `overallLevel`.
+   *
+   * Stored with the result rather than assumed at print time. "Explicit and
+   * configurable" (CLAUDE.md §5.6) means a report card can say which policy
+   * turned four sub-strand judgements into one — and a school that changed the
+   * rule between terms must not have last term's levels relabelled under the
+   * new one.
+   */
+  levelReduction: text()
+    .$type<"mode_ties_low" | "mode_ties_high" | "lowest">()
+    .notNull()
+    .default("mode_ties_low"),
 
   teacherComment: text(),
   computedAt: timestamp({ withTimezone: true }).defaultNow().notNull(),

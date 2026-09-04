@@ -419,7 +419,11 @@ export const reportCards = pgTable('report_cards', {
 
 **Do not average performance levels.** A student who is `exceeding` in one sub-strand and `below_expectation` in another is not `meeting` — that is a mean of ordinals masquerading as a competency judgement, and it hides exactly what the level system exists to surface. Take the mode. Show the per-sub-strand breakdown underneath. Any reduction rule must be explicit and configurable, never silently arithmetic.
 
-`lib/assessment.ts` implements this. Three rules are offered — `mode_ties_low` (the default), `mode_ties_high`, `lowest` — and there is deliberately no `mean`. Ties resolve **down**: overstating is the direction that costs a family a conversation they should have had earlier. The chosen rule is recorded in the report card snapshot, so a printed document can say which policy produced it.
+`lib/assessment.ts` implements this. Three rules are offered — `mode_ties_low` (the default), `mode_ties_high`, `lowest` — and there is deliberately no `mean`. Ties resolve **down**: overstating is the direction that costs a family a conversation they should have had earlier. The rule is stored on each `term_results` row and copied into the snapshot from there, so a printed document says which policy actually produced its levels — and a school that changes the rule between terms does not have last term's levels relabelled under the new one.
+
+`term_results` is the one table in this group the runtime role may `DELETE` from. It is a computation over `assessment_scores`, reconstructible at any time — and recomputing has to be able to remove a result nothing published stands behind any more, because stale reads as fact while absent reads as "not marked yet". Scores, report cards and everything rule 5 names keep no `DELETE`.
+
+**Term results cover everyone enrolled *during* the term**, not everyone enrolled now — a child who transferred out mid-term was taught, sat what they sat, and needs a report for it.
 
 **An absence is not a zero.** A CHECK forbids a mark or a level on an absent row, and the term mean skips them — counting a missed paper as zero drags a child's mean down for something they never sat, and afterwards the two are indistinguishable.
 

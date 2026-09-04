@@ -1,4 +1,4 @@
-import { and, asc, eq, isNotNull, isNull, sql } from "drizzle-orm";
+import { and, asc, eq, gte, inArray, isNotNull, isNull, lte, or, sql } from "drizzle-orm";
 
 import type { AppDb } from "@/db";
 
@@ -9,6 +9,7 @@ import {
   learningAreas,
   streams,
   termResults,
+  terms,
 } from "@/db/schema";
 
 /**
@@ -116,6 +117,18 @@ export function reduceLevels(
   return LEVEL_ORDER[rule === "mode_ties_high" ? Math.max(...tied) : Math.min(...tied)];
 }
 
+/** The school's learning areas in report-card order. */
+export async function listLearningAreas(db: AppDb) {
+  return db
+    .select({
+      id: learningAreas.id,
+      name: learningAreas.name,
+      sequence: learningAreas.sequence,
+    })
+    .from(learningAreas)
+    .orderBy(asc(learningAreas.sequence), asc(learningAreas.name));
+}
+
 export interface LearningAreaResult {
   learningAreaId: string;
   learningAreaName: string;
@@ -145,6 +158,14 @@ export async function computeLearningAreaResults(
   db: AppDb,
   enrollmentId: string,
   termId: string,
+  /**
+   * The school's learning areas, passed in when computing a whole cohort.
+   *
+   * Fetched here when absent, which is right for a single enrolment and wrong
+   * for three hundred — it is the same list every time, and querying it per
+   * child turned one lookup into one per pupil.
+   */
+  areas?: Array<{ id: string; name: string; sequence: number }>,
 ): Promise<LearningAreaResult[]> {
   /*
    * The exam side: a weighted mean of percentages.
@@ -218,16 +239,9 @@ export async function computeLearningAreaResults(
   // Every learning area the school teaches, in the order it prints them —
   // including ones with no results yet, so a gap on a report card is visible
   // as a gap rather than as a missing row nobody notices.
-  const areas = await db
-    .select({
-      id: learningAreas.id,
-      name: learningAreas.name,
-      sequence: learningAreas.sequence,
-    })
-    .from(learningAreas)
-    .orderBy(asc(learningAreas.sequence), asc(learningAreas.name));
+  const allAreas = areas ?? await listLearningAreas(db);
 
-  return areas.map(area => ({
+  return allAreas.map(area => ({
     learningAreaId: area.id,
     learningAreaName: area.name,
     sequence: area.sequence,
@@ -253,38 +267,80 @@ export async function computeTermResults(
   schoolId: string,
   termId: string,
   reduction: LevelReduction = "mode_ties_low",
-): Promise<{ enrolments: number; results: number }> {
+): Promise<{ enrolments: number; results: number; cleared: number }> {
+  const [term] = await db
+    .select({ startsOn: terms.startsOn, endsOn: terms.endsOn })
+    .from(terms)
+    .where(eq(terms.id, termId));
+
+  if (!term)
+    return { enrolments: 0, results: 0, cleared: 0 };
+
+  /*
+   * Everyone who was enrolled DURING the term, not everyone enrolled now.
+   *
+   * Filtering on `ended_on IS NULL` silently excluded a child who transferred
+   * out mid-term — their marks sat in the database with no result computed
+   * from them, so no report card could be produced for the term they were
+   * actually present for. CLAUDE.md §8 asks for exactly that case in the demo
+   * data, which is how it was found.
+   *
+   * Overlap, not containment: a child who joined in week three or left in
+   * week eight was still taught, and still sat whatever they sat.
+   */
   const cohort = await db
     .select({ id: enrollments.id })
     .from(enrollments)
-    .where(isNull(enrollments.endedOn));
+    .where(and(
+      lte(enrollments.startedOn, term.endsOn),
+      or(
+        isNull(enrollments.endedOn),
+        gte(enrollments.endedOn, term.startsOn),
+      ),
+    ));
+
+  const areas = await listLearningAreas(db);
 
   let written = 0;
+  let cleared = 0;
 
   for (const enrolment of cohort) {
-    const areas = await computeLearningAreaResults(db, enrolment.id, termId);
+    const computed = await computeLearningAreaResults(db, enrolment.id, termId, areas);
 
-    for (const area of areas) {
+    const rows = [];
+    const emptyAreaIds = [];
+
+    for (const area of computed) {
       const overallLevel = reduceLevels(
         area.competencyLevels.map(c => c.level),
         reduction,
       );
 
-      // Nothing recorded for this area yet — skip rather than write an empty
-      // row, so "no result" and "a result of nothing" stay distinguishable.
-      if (area.meanScore === null && overallLevel === null)
+      // Nothing recorded for this area — no row, so "no result" and "a result
+      // of nothing" stay distinguishable.
+      if (area.meanScore === null && overallLevel === null) {
+        emptyAreaIds.push(area.learningAreaId);
         continue;
+      }
 
+      rows.push({
+        schoolId,
+        enrollmentId: enrolment.id,
+        termId,
+        learningAreaId: area.learningAreaId,
+        meanScore: area.meanScore === null ? null : area.meanScore.toFixed(2),
+        overallLevel,
+        levelReduction: reduction,
+      });
+    }
+
+    if (rows.length > 0) {
+      // One statement per enrolment rather than one per learning area — a
+      // school teaching eleven subjects was making eleven round trips per
+      // child, three hundred times over.
       await db
         .insert(termResults)
-        .values({
-          schoolId,
-          enrollmentId: enrolment.id,
-          termId,
-          learningAreaId: area.learningAreaId,
-          meanScore: area.meanScore === null ? null : area.meanScore.toFixed(2),
-          overallLevel,
-        })
+        .values(rows)
         .onConflictDoUpdate({
           target: [
             termResults.enrollmentId,
@@ -292,17 +348,40 @@ export async function computeTermResults(
             termResults.learningAreaId,
           ],
           set: {
-            meanScore: area.meanScore === null ? null : area.meanScore.toFixed(2),
-            overallLevel,
+            meanScore: sql`excluded.mean_score`,
+            overallLevel: sql`excluded.overall_level`,
+            levelReduction: sql`excluded.level_reduction`,
             computedAt: new Date(),
           },
         });
 
-      written += 1;
+      written += rows.length;
+    }
+
+    /*
+     * A result that no longer has anything behind it is removed.
+     *
+     * Recomputing after an assessment was withdrawn, or a mark deleted, used
+     * to leave the previous result standing — so `listTermResults` and every
+     * report card finalised afterwards would show a figure derived from marks
+     * that are no longer published. Stale is worse than absent here: absent
+     * reads as "not marked yet", stale reads as fact.
+     */
+    if (emptyAreaIds.length > 0) {
+      const removed = await db
+        .delete(termResults)
+        .where(and(
+          eq(termResults.enrollmentId, enrolment.id),
+          eq(termResults.termId, termId),
+          inArray(termResults.learningAreaId, emptyAreaIds),
+        ))
+        .returning({ id: termResults.id });
+
+      cleared += removed.length;
     }
   }
 
-  return { enrolments: cohort.length, results: written };
+  return { enrolments: cohort.length, results: written, cleared };
 }
 
 /**

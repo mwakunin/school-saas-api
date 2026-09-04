@@ -354,7 +354,18 @@ export async function outstandingByClass(
         ? sql`s.grade_level_id = ${filters.gradeLevelId}::uuid`
         : sql`true`}
     GROUP BY s.id, s.name, gl.id, gl.name, gl.sequence
-    ORDER BY gl.sequence, s.name
+    /*
+     * Grade order first, then worst debt within it.
+     *
+     * The dashboard reads like a school — Grade 1 through Grade 9 — but inside
+     * a grade the class a bursar needs to act on should be at the top. The
+     * stream name is the tie-break so the order is stable between refreshes;
+     * without it two classes owing the same amount could swap places and make
+     * the screen look like it had changed when nothing had.
+     */
+    ORDER BY gl.sequence,
+             coalesce(sum(ps.balance) FILTER (WHERE ps.balance > 0), 0) DESC,
+             s.name
   `).then(r => r.rows);
 
   return rows.map(row => ({

@@ -478,6 +478,153 @@ describe("assessment", () => {
     });
   });
 
+  describe("children who left mid-term", () => {
+    it("still gets a result for the term they were present for", async () => {
+      const ctx = await seed("alpha");
+      const assessment = await makeAssessment(ctx);
+
+      await put(`/assessments/${assessment.id}/scores`, {
+        scores: [{ enrollmentId: ctx.pupils[0].enrolmentId, rawScore: 80 }],
+      }, jsonHeaders("alpha", ctx.teacher));
+      await post(`/assessments/${assessment.id}/publish`, {}, jsonHeaders("alpha", ctx.teacher));
+
+      // Transfers out after sitting the exam — CLAUDE.md §8 asks for exactly
+      // this case in the demo data.
+      await post(`/students/${ctx.pupils[0].student.id}/exit`, {
+        status: "transferred_out",
+        exitedOn: "2026-02-20",
+      }, jsonHeaders("alpha", ctx.admin));
+
+      await post("/term-results/compute", { termId: ctx.term.id }, jsonHeaders("alpha", ctx.admin));
+
+      const results = await (await app.request(
+        `/term-results?termId=${ctx.term.id}&enrollmentId=${ctx.pupils[0].enrolmentId}`,
+        { headers: tenantHeaders("alpha", ctx.admin) },
+      )).json();
+
+      /*
+       * Selecting only currently-open enrolments skipped them entirely: their
+       * marks sat in the database with nothing computed from them, so no
+       * report card could be produced for a term they were taught in.
+       */
+      expect(results).toHaveLength(1);
+      expect(Number(results[0].meanScore)).toBe(80);
+    });
+
+    it("leaves out a child who was never there during the term", async () => {
+      const ctx = await seed("alpha");
+
+      // Enrolled only in term 3; term 1 should not see them.
+      const late = await makeStudent(ctx.school, "2026/900", { givenName: "Later" });
+      const { enrollments } = await import("@/db/schema");
+      await db.insert(enrollments).values({
+        schoolId: ctx.school.id,
+        studentId: late.id,
+        streamId: ctx.blue.id,
+        boardingStatus: "day",
+        startedOn: ctx.school.terms[2].startsOn,
+      });
+
+      const body = await (await post(
+        "/term-results/compute",
+        { termId: ctx.term.id },
+        jsonHeaders("alpha", ctx.admin),
+      )).json();
+
+      // Overlap, not "everyone ever enrolled".
+      expect(body.enrolments).toBe(3);
+    });
+  });
+
+  describe("recomputing after a withdrawal", () => {
+    it("removes a result that nothing published stands behind any more", async () => {
+      const ctx = await seed("alpha");
+      const assessment = await makeAssessment(ctx);
+
+      await put(`/assessments/${assessment.id}/scores`, {
+        scores: [{ enrollmentId: ctx.pupils[0].enrolmentId, rawScore: 80 }],
+      }, jsonHeaders("alpha", ctx.teacher));
+      await post(`/assessments/${assessment.id}/publish`, {}, jsonHeaders("alpha", ctx.teacher));
+      await post("/term-results/compute", { termId: ctx.term.id }, jsonHeaders("alpha", ctx.admin));
+
+      const before = await (await app.request(
+        `/term-results?termId=${ctx.term.id}&enrollmentId=${ctx.pupils[0].enrolmentId}`,
+        { headers: tenantHeaders("alpha", ctx.admin) },
+      )).json();
+      expect(before).toHaveLength(1);
+
+      // The assessment is withdrawn — a mark was wrong and is being redone.
+      await post(`/assessments/${assessment.id}/unpublish`, {}, jsonHeaders("alpha", ctx.teacher));
+      const recompute = await (await post(
+        "/term-results/compute",
+        { termId: ctx.term.id },
+        jsonHeaders("alpha", ctx.admin),
+      )).json();
+
+      /*
+       * The previous figure used to stand, so `/term-results` and any report
+       * card finalised afterwards reported a mark derived from data no longer
+       * published. Stale reads as fact; absent reads as "not marked yet".
+       */
+      expect(recompute.cleared).toBeGreaterThan(0);
+
+      const after = await (await app.request(
+        `/term-results?termId=${ctx.term.id}&enrollmentId=${ctx.pupils[0].enrolmentId}`,
+        { headers: tenantHeaders("alpha", ctx.admin) },
+      )).json();
+      expect(after).toEqual([]);
+    });
+  });
+
+  describe("the marks grid", () => {
+    it("reports how many marks it corrected, not how many were sent", async () => {
+      const ctx = await seed("alpha");
+      const assessment = await makeAssessment(ctx);
+      const grid = (scores: Array<[string, number]>) => ({
+        scores: scores.map(([enrollmentId, rawScore]) => ({ enrollmentId, rawScore })),
+      });
+
+      const first = await (await put(
+        `/assessments/${assessment.id}/scores`,
+        grid([[ctx.pupils[0].enrolmentId, 70], [ctx.pupils[1].enrolmentId, 60]]),
+        jsonHeaders("alpha", ctx.teacher),
+      )).json();
+
+      // Nothing existed, so nothing was corrected.
+      expect(first).toMatchObject({ saved: 2, updated: 0 });
+
+      const second = await (await put(
+        `/assessments/${assessment.id}/scores`,
+        grid([[ctx.pupils[0].enrolmentId, 75], [ctx.pupils[2].enrolmentId, 50]]),
+        jsonHeaders("alpha", ctx.teacher),
+      )).json();
+
+      // One replaced, one new. Counting returned rows made this always equal
+      // `saved`, so the field said "how many were submitted" while claiming to
+      // say "how many replaced an existing mark".
+      expect(second).toMatchObject({ saved: 2, updated: 1 });
+    });
+
+    it("takes the last value when a pupil appears twice in one grid", async () => {
+      const ctx = await seed("alpha");
+      const assessment = await makeAssessment(ctx);
+
+      const res = await put(`/assessments/${assessment.id}/scores`, {
+        scores: [
+          { enrollmentId: ctx.pupils[0].enrolmentId, rawScore: 40 },
+          { enrollmentId: ctx.pupils[0].enrolmentId, rawScore: 65 },
+        ],
+      }, jsonHeaders("alpha", ctx.teacher));
+
+      // A single statement cannot touch one conflict target twice, so the grid
+      // is collapsed first — a repeated row is a correction, not a failure.
+      expect(res.status).toBe(200);
+      const rows = await db.select().from(assessmentScores);
+      expect(rows).toHaveLength(1);
+      expect(Number(rows[0].rawScore)).toBe(65);
+    });
+  });
+
   describe("report cards", () => {
     async function computed(subdomain: string) {
       const ctx = await seed(subdomain);
@@ -616,6 +763,81 @@ describe("assessment", () => {
       // hidden one query away from a screen that decides to show it.
       expect(card.snapshot.showsPositions).toBe(false);
       expect(maths.streamPosition).toBeNull();
+    });
+
+    it("records the reduction rule that actually produced the levels", async () => {
+      const ctx = await seed("alpha");
+      const observation = await makeAssessment(ctx, {
+        title: "Project",
+        kind: "observation",
+        maxScore: undefined,
+      });
+
+      await put(`/assessments/${observation.id}/scores`, {
+        scores: [
+          {
+            enrollmentId: ctx.pupils[0].enrolmentId,
+            competencyId: ctx.subStrands[0].id,
+            level: "exceeding",
+          },
+          {
+            enrollmentId: ctx.pupils[0].enrolmentId,
+            competencyId: ctx.subStrands[1].id,
+            level: "approaching",
+          },
+        ],
+      }, jsonHeaders("alpha", ctx.teacher));
+      await post(`/assessments/${observation.id}/publish`, {}, jsonHeaders("alpha", ctx.teacher));
+
+      // Computed with `lowest`, not the default.
+      await post("/term-results/compute", {
+        termId: ctx.term.id,
+        levelReduction: "lowest",
+      }, jsonHeaders("alpha", ctx.admin));
+
+      const card = await (await post("/report-cards/finalise", {
+        enrollmentId: ctx.pupils[0].enrolmentId,
+        termId: ctx.term.id,
+      }, jsonHeaders("alpha", ctx.admin))).json();
+
+      /*
+       * Hardcoding the default meant a school computing with `lowest` got a
+       * frozen document claiming `mode_ties_low` — the snapshot misdescribing
+       * its own contents, which is worse than not recording the rule at all.
+       */
+      expect(card.snapshot.levelReduction).toBe("lowest");
+
+      const maths = card.snapshot.learningAreas.find(
+        (a: { name: string }) => a.name === "Mathematics",
+      );
+      expect(maths.overallLevel).toBe("approaching");
+    });
+
+    it("422s attendance given as half a pair", async () => {
+      const ctx = await computed("alpha");
+
+      const res = await post("/report-cards/finalise", {
+        enrollmentId: ctx.pupils[0].enrolmentId,
+        termId: ctx.term.id,
+        attendancePresent: 42,
+      }, jsonHeaders("alpha", ctx.admin));
+
+      // The database CHECK refuses it either way; without the schema rule that
+      // arrived as a 500 rather than a message naming the field.
+      expect(res.status).toBe(422);
+    });
+
+    it("422s a child attending more days than the term had", async () => {
+      const ctx = await computed("alpha");
+
+      const res = await post("/report-cards/finalise", {
+        enrollmentId: ctx.pupils[0].enrolmentId,
+        termId: ctx.term.id,
+        attendancePresent: 90,
+        attendanceTotal: 60,
+      }, jsonHeaders("alpha", ctx.admin));
+
+      expect(res.status).toBe(422);
     });
 
     it("will not release something that was never frozen", async () => {

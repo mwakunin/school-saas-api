@@ -583,6 +583,42 @@ describe("fees", () => {
       expect(emptyClass).toMatchObject({ studentCount: 0, outstandingCents: 0 });
     });
 
+    it("puts the worst class first within a grade, as its docs promise", async () => {
+      const { school, bursar, blue, term1 } = await billedAcrossTwoClasses("alpha");
+      const east4 = await makeStream(school, 4, "Aardvark");
+
+      // Same grade as Blue, alphabetically first, but owing more.
+      for (const n of ["2026/020", "2026/021", "2026/022", "2026/023"]) {
+        await makeStudent(school, n, {
+          givenName: `Extra${n.slice(-3)}`,
+          streamId: east4.id,
+          boardingStatus: "day",
+        });
+      }
+      await post("/invoices/generate", {
+        termId: term1.id,
+        issuedOn: "2026-01-06",
+      }, jsonHeaders("alpha", bursar));
+
+      const body = await (await app.request("/balances/by-class", {
+        headers: tenantHeaders("alpha", bursar),
+      })).json();
+
+      const grade4 = body.classes.filter(
+        (c: { gradeLevelName: string }) => c.gradeLevelName === "Grade 4",
+      );
+
+      /*
+       * The response description said "worst first within each grade" while
+       * the query sorted by name — so a dashboard built against the documented
+       * contract would have shown the wrong class at the top, which is the one
+       * a bursar acts on.
+       */
+      expect(grade4[0].streamId).toBe(east4.id);
+      expect(grade4[0].outstandingCents).toBeGreaterThan(grade4[1].outstandingCents);
+      expect(grade4[1].streamId).toBe(blue.id);
+    });
+
     it("orders by grade, so the dashboard reads like a school", async () => {
       const { bursar } = await billedAcrossTwoClasses("alpha");
 

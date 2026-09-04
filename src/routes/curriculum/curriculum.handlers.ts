@@ -7,7 +7,7 @@ import type { TenantRouteHandler } from "@/lib/types";
 
 import { competencies, learningAreas } from "@/db/schema";
 import { areasForPhase, CURRICULUM_SEED, isPlaceholder } from "@/lib/curriculum-seed";
-import { isForeignKeyViolation } from "@/lib/db-errors";
+import { isForeignKeyViolation, isUniqueViolation } from "@/lib/db-errors";
 
 import type {
   AddCompetencyRoute,
@@ -230,20 +230,41 @@ export const updateArea: TenantRouteHandler<UpdateAreaRoute> = async (c) => {
   const { id } = c.req.valid("param");
   const body = c.req.valid("json");
 
-  const [updated] = await c.var.db
-    .update(learningAreas)
-    .set(body)
-    .where(eq(learningAreas.id, id))
-    .returning();
+  try {
+    const [updated] = await c.var.db
+      .update(learningAreas)
+      .set(body)
+      .where(eq(learningAreas.id, id))
+      .returning();
 
-  if (!updated) {
-    return c.json(
-      { message: HttpStatusPhrases.NOT_FOUND },
-      HttpStatusCodes.NOT_FOUND,
-    );
+    if (!updated) {
+      return c.json(
+        { message: HttpStatusPhrases.NOT_FOUND },
+        HttpStatusCodes.NOT_FOUND,
+      );
+    }
+
+    return c.json(updated, HttpStatusCodes.OK);
   }
-
-  return c.json(updated, HttpStatusCodes.OK);
+  catch (err) {
+    // Same shape as `createArea`: a grade level from another school is
+    // invisible here, so the reference finds nothing.
+    if (isForeignKeyViolation(err)) {
+      return c.json(
+        fieldError(["gradeLevelId"], "No such grade level at this school"),
+        HttpStatusCodes.UNPROCESSABLE_ENTITY,
+      );
+    }
+    // The case-insensitive name index — renaming onto an area the school
+    // already has would print the subject twice.
+    if (isUniqueViolation(err)) {
+      return c.json(
+        fieldError(["name"], "This school already has a learning area by that name"),
+        HttpStatusCodes.UNPROCESSABLE_ENTITY,
+      );
+    }
+    throw err;
+  }
 };
 
 export const removeArea: TenantRouteHandler<RemoveAreaRoute> = async (c) => {
