@@ -12,6 +12,8 @@ import { requireAuth, requireRole } from "@/middlewares/auth";
 
 import {
   createSchoolSchema,
+  grantedMembershipSchema,
+  grantMembershipSchema,
   onboardedSchoolSchema,
   selectSchoolSchema,
   updateSchoolStatusSchema,
@@ -104,6 +106,36 @@ export const setStatus = createRoute({
   },
 });
 
+export const grantMembership = createRoute({
+  tags,
+  method: "post",
+  path: "/superadmin/schools/{id}/memberships",
+  summary: "Give someone a role at a school",
+  description:
+    "Onboarding a school leaves nobody able to sign into it, so this is what "
+    + "makes it usable: the first admin has to be granted from outside the "
+    + "tenant, because the tenant-side equivalent would be guarded by a role "
+    + "that does not exist yet. The account must already exist — this grants "
+    + "access rather than creating people. Idempotent: granting a role someone "
+    + "already holds returns it rather than failing.",
+  middleware: guard,
+  request: {
+    params: IdUUIDParamsSchema,
+    body: jsonContentRequired(grantMembershipSchema, "Who, and as what"),
+  },
+  responses: {
+    [HttpStatusCodes.CREATED]: jsonContent(grantedMembershipSchema, "The membership"),
+    [HttpStatusCodes.NOT_FOUND]: jsonContent(notFoundSchema, "No such school"),
+    [HttpStatusCodes.UNPROCESSABLE_ENTITY]: jsonContent(
+      createErrorSchema(grantMembershipSchema),
+      "Validation error, or nobody signed up with that address",
+    ),
+    [HttpStatusCodes.UNAUTHORIZED]: jsonContent(unauthorizedSchema, "Not signed in"),
+    [HttpStatusCodes.FORBIDDEN]: jsonContent(forbiddenSchema, "Not a superadmin"),
+  },
+});
+
 export type ListRoute = typeof list;
 export type CreateRoute = typeof create;
 export type SetStatusRoute = typeof setStatus;
+export type GrantMembershipRoute = typeof grantMembership;

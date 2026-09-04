@@ -562,6 +562,10 @@ Two more are needed before v1 ships and are not yet built:
 - **`sms_messages`** — Africa's Talking charges per unit and reports delivery asynchronously, so schools will ask what they are spending. Needs recipient, body, provider id, status, cost, and the guardian or student it concerns.
 - **`audit_log`** — who changed a mark, who reversed a payment, who released a report card. For a product holding children's records and school money this is both a safeguard and a sales point.
 
+**No parent portal exists.** `guardians.user_id` is in the schema and no route writes it; no route reads it either, because there are no guardian-scoped endpoints. A guardian who signs in reaches `/school`, `/terms`, `/grade-levels` and `/streams` — the four that admit `anyMember` — and nothing about their own children. CLAUDE.md §9 calls the parent portal a v1 surface and §8 calls the parent view the thing that convinces a head; neither is demonstrable today, and the demo seed says so in its own running order rather than promising it.
+
+A third gap, found by building the demo seed and **now closed**: onboarding a school left nobody able to sign into it. `POST /superadmin/schools/{id}/memberships` grants the first role from outside the tenant, because the tenant-side equivalent would be guarded by `admin` — a role that does not exist yet at a school that has just been created. Still missing, and wanted before a real school runs itself: the tenant-side version, so a head can add their own bursar without the platform operator.
+
 ---
 
 ## 7. Build order
@@ -575,7 +579,7 @@ Two more are needed before v1 ships and are not yet built:
 7. **Put it in front of one real school before writing anything else.**
 8. ~~Curriculum seed + assessment + report cards (§5.4–5.6).~~ **Done.** — the learning areas are real; the strands are marked `(placeholder)` rather than transcribed from KICD's published designs. Replacing them is a data change and nothing else.
 
-The demo seed (§8) is **not** a phase-8 activity. Grow `seed/01…06` alongside steps 3–6: it is what makes each step testable, and running it in CI is what catches a migration that broke something real.
+~~The demo seed (§8) is **not** a phase-8 activity. Grow `seed/01…06` alongside steps 3–6.~~ **Built** — as `seed/`, run by `pnpm seed:demo` and by `seed/seed.test.ts` in CI. It arrived late rather than alongside, which cost the thing it was meant to give: every step from 3 to 8 was tested against two or three hand-made rows, and the first run against three hundred children found real gaps within minutes.
 
 Fees ships first because it is what a bursar will pay for — someone is currently matching M-Pesa messages to a ledger by hand. It also forces the spine into existence, since you cannot invoice a student without terms, classes, and enrollment.
 
@@ -585,9 +589,10 @@ Fees ships first because it is what a bursar will pay for — someone is current
 
 Treat as a product surface, not throwaway fixtures. It closes sales and doubles as an integration test.
 
-- **A real tenant**, `status: 'demo'`, at `demo.<domain>`, seeded through the actual API. Never a special code path — it will drift and embarrass you mid-presentation.
+- **A real tenant**, `status: 'demo'`, at `demo.<domain>`, seeded through the actual API. Never a special code path — it will drift and embarrass you mid-presentation. **One write is not through the API and cannot be**: promoting the operator account to `superadmin`. No endpoint grants that role, correctly — an endpoint that promoted its own caller would undo the isolation model. Everything downstream of it is HTTP.
 - **Nightly reset.** Drop and reseed.
-- **Deterministic.** Fixed UUIDs, fixed random seed, dates relative to today. A demo whose current term expired in March is worse than no demo.
+- **Deterministic.** Fixed random seed, dates relative to today. A demo whose current term expired in March is worse than no demo — so the three terms are built *around* today rather than on the calendar year, which is the only arrangement that holds in every month.
+  **Not fixed UUIDs.** That requirement and "through the actual API" cannot both hold: fixing ids means every create endpoint accepting a client-supplied primary key, which is a special code path and a security smell, and §8 is explicit that the no-special-path rule is the load-bearing one. Deep links use the admission number instead — school-scoped, human-facing, stable across resets, and already the M-Pesa account reference.
 - **Scale:** one school, Grades 1–9, two streams in lower grades, one in junior. ~320 students.
 
 Realism details that matter:
@@ -620,6 +625,8 @@ seed/
 Run the seed in CI against Docker Postgres — if it breaks, a migration broke something real.
 
 Four demo logins: head, bursar, class teacher, parent. The parent view is what convinces a head that fee follow-up gets easier.
+
+The seed prints a **running order** alongside the data it describes — which reference to reconcile, which assessment is unpublished — because those are exactly the details nobody remembers under pressure, and keeping them next to the generator is what stops the script and the database drifting apart.
 
 ---
 

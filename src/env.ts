@@ -86,6 +86,20 @@ const EnvSchema = z.object({
    */
   ROOT_DOMAIN: z.string().min(1).default("localhost"),
 
+  /**
+   * The shared password for the demo tenant's four staff logins.
+   *
+   * Shared and printed on purpose — these accounts are handed to a prospect in
+   * a meeting, at a `status: 'demo'` school holding invented children and
+   * reset nightly. What the override buys is that a public deployment is not
+   * stuck with a value anybody can read out of this repository.
+   *
+   * The demo operator's superadmin password is NOT here and must never be: it
+   * is generated per run and discarded (see `seed/lib/client.ts`), because
+   * that account reaches every school rather than only the demo one.
+   */
+  DEMO_PASSWORD: z.string().min(8).default("demo-password-2026"),
+
   // --- M-Pesa ---
   // Picks the Daraja host: sandbox.safaricom.co.ke vs api.safaricom.co.ke.
   MPESA_ENV: z.enum(["sandbox", "production"]).default("sandbox"),

@@ -1,15 +1,20 @@
-import { asc, eq } from "drizzle-orm";
+import { and, asc, eq } from "drizzle-orm";
 import * as HttpStatusCodes from "stoker/http-status-codes";
 import * as HttpStatusPhrases from "stoker/http-status-phrases";
 
 import type { AppRouteHandler } from "@/lib/types";
 
 import db from "@/db";
-import { academicYears, gradeLevels, schools, terms } from "@/db/schema";
+import { academicYears, gradeLevels, memberships, schools, terms, user } from "@/db/schema";
 import { GRADE_LEVELS, termsForYear } from "@/lib/academic-spine";
 import { isUniqueViolation } from "@/lib/db-errors";
 
-import type { CreateRoute, ListRoute, SetStatusRoute } from "./superadmin.routes";
+import type {
+  CreateRoute,
+  GrantMembershipRoute,
+  ListRoute,
+  SetStatusRoute,
+} from "./superadmin.routes";
 
 /**
  * These handlers use the OWNER connection on purpose — see db/index.ts.
@@ -132,4 +137,90 @@ export const setStatus: AppRouteHandler<SetStatusRoute> = async (c) => {
   const { mpesaCredentials: _omit, ...safe } = updated;
 
   return c.json(safe, HttpStatusCodes.OK);
+};
+
+export const grantMembership: AppRouteHandler<GrantMembershipRoute> = async (c) => {
+  const { id } = c.req.valid("param");
+  const { email, role } = c.req.valid("json");
+
+  const [school] = await db
+    .select({ id: schools.id })
+    .from(schools)
+    .where(eq(schools.id, id));
+
+  if (!school) {
+    return c.json(
+      { message: HttpStatusPhrases.NOT_FOUND },
+      HttpStatusCodes.NOT_FOUND,
+    );
+  }
+
+  const [person] = await db
+    .select({ id: user.id })
+    .from(user)
+    .where(eq(user.email, email));
+
+  /*
+   * A 422 naming the field, not a 404.
+   *
+   * The school was found; it is the address that matches nobody, and the
+   * person running this needs to be told to have them sign up first rather
+   * than left wondering which half of the request was wrong.
+   */
+  if (!person) {
+    return c.json(
+      {
+        success: false as const,
+        error: {
+          issues: [{
+            code: "custom" as const,
+            path: ["email"],
+            message: "Nobody has signed up with that address yet",
+          }],
+          name: "ZodError",
+        },
+      },
+      HttpStatusCodes.UNPROCESSABLE_ENTITY,
+    );
+  }
+
+  /*
+   * Idempotent, because the unique is on (user, school, role) and re-running
+   * an onboarding script is the normal case rather than an error. A person may
+   * hold several roles at one school — a teacher who is also a parent — so
+   * this adds a role and never replaces one.
+   */
+  const [granted] = await db
+    .insert(memberships)
+    .values({ userId: person.id, schoolId: id, role })
+    .onConflictDoNothing()
+    .returning();
+
+  if (granted)
+    return c.json({ ...granted, created: true }, HttpStatusCodes.CREATED);
+
+  /*
+   * A row already existed — reactivate it rather than hand it back as it is.
+   *
+   * `withMembership` only accepts memberships with `isActive` true, so
+   * returning a deactivated row would answer 201 with a membership that grants
+   * nothing: the endpoint would report success and the person would still be
+   * unable to act, with nothing in the response to say why. Granting access is
+   * this route's whole purpose, so it has to mean it.
+   *
+   * Nothing sets `isActive` false today — there is no deactivation route yet —
+   * so this is the correct behaviour waiting for the obvious next feature
+   * rather than a bug anyone can currently reach.
+   */
+  const [reactivated] = await db
+    .update(memberships)
+    .set({ isActive: true })
+    .where(and(
+      eq(memberships.userId, person.id),
+      eq(memberships.schoolId, id),
+      eq(memberships.role, role),
+    ))
+    .returning();
+
+  return c.json({ ...reactivated, created: false }, HttpStatusCodes.CREATED);
 };

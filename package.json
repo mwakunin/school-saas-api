@@ -17,7 +17,9 @@
     "db:migrate": "drizzle-kit migrate",
     "db:studio": "drizzle-kit studio",
     "db:migrate:test": "cross-env NODE_ENV=test drizzle-kit migrate",
-    "db:migrate:deploy": "node ./dist/src/db/migrate.js"
+    "db:migrate:deploy": "node ./dist/src/db/migrate.js",
+    "seed:demo": "cross-env LOG_LEVEL=warn tsx seed/index.ts",
+    "seed:demo:deploy": "cross-env NODE_ENV=production LOG_LEVEL=warn node ./dist/seed/index.js"
   },
   "dependencies": {
     "@hono/node-server": "^2.1.1",

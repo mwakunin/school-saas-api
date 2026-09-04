@@ -6,9 +6,11 @@ import db from "@/db";
 import { academicYears, gradeLevels, memberships, schools, terms } from "@/db/schema";
 import {
   makeSchool,
+  nextEmail,
   nextPhone,
   resetDb,
   signIn,
+  signUpWithEmail,
   tenantHeaders,
 } from "@/test/helpers";
 
@@ -317,6 +319,132 @@ describe("superadmin plane", () => {
 
       expect(years).toHaveLength(1);
       expect(years[0]).toMatchObject({ year: 2026, isCurrent: true });
+    });
+  });
+
+  /**
+   * Granting the first membership.
+   *
+   * Without this, onboarding a school leaves NOBODY able to sign into it —
+   * `withMembership` finds no row and every tenant route refuses. It lives on
+   * this plane rather than the tenant one because the tenant equivalent would
+   * be guarded by `admin`, which is the role that does not exist yet.
+   */
+  describe("granting access to a new school", () => {
+    it("lets a granted admin work at a school that had nobody", async () => {
+      const boss = await signIn(nextPhone(), "superadmin");
+      const alpha = await makeSchool({ subdomain: "alpha" });
+      const head = await signUpWithEmail(nextEmail());
+
+      // 404 rather than 403, deliberately: a signed-in non-member must not be
+      // able to tell a school that exists from one that does not, or the
+      // subdomain space becomes a directory of our customers.
+      const before = await app.request("/school", { headers: tenantHeaders("alpha", head) });
+      expect(before.status).toBe(404);
+
+      const res = await postJson(
+        `/superadmin/schools/${alpha.id}/memberships`,
+        { email: head.email, role: "admin" },
+        boss.headers,
+      );
+
+      expect(res.status).toBe(201);
+      expect(await res.json()).toMatchObject({ role: "admin", created: true });
+
+      const after = await app.request("/school", { headers: tenantHeaders("alpha", head) });
+      expect(after.status).toBe(200);
+    });
+
+    it("adds a role rather than replacing one", async () => {
+      const boss = await signIn(nextPhone(), "superadmin");
+      const alpha = await makeSchool({ subdomain: "alpha" });
+      const person = await signUpWithEmail(nextEmail());
+
+      for (const role of ["teacher", "guardian"] as const) {
+        await postJson(
+          `/superadmin/schools/${alpha.id}/memberships`,
+          { email: person.email, role },
+          boss.headers,
+        );
+      }
+
+      // One login has to cover a teacher who is also a parent at the same
+      // school — the reason role lives on the membership (CLAUDE.md §5.1).
+      const held = await db
+        .select()
+        .from(memberships)
+        .where(eq(memberships.userId, person.id));
+
+      expect(held.map(m => m.role).sort()).toEqual(["guardian", "teacher"]);
+    });
+
+    it("is idempotent, so re-running an onboarding script is safe", async () => {
+      const boss = await signIn(nextPhone(), "superadmin");
+      const alpha = await makeSchool({ subdomain: "alpha" });
+      const head = await signUpWithEmail(nextEmail());
+      const body = { email: head.email, role: "admin" as const };
+
+      const first = await postJson(`/superadmin/schools/${alpha.id}/memberships`, body, boss.headers);
+      const again = await postJson(`/superadmin/schools/${alpha.id}/memberships`, body, boss.headers);
+
+      expect((await first.json()).created).toBe(true);
+      expect((await again.json()).created).toBe(false);
+    });
+
+    it("reactivates a membership that had been switched off", async () => {
+      const boss = await signIn(nextPhone(), "superadmin");
+      const alpha = await makeSchool({ subdomain: "alpha" });
+      const bursar = await signUpWithEmail(nextEmail());
+      const body = { email: bursar.email, role: "bursar" as const };
+
+      await postJson(`/superadmin/schools/${alpha.id}/memberships`, body, boss.headers);
+      await db.update(memberships).set({ isActive: false }).where(eq(memberships.userId, bursar.id));
+
+      // `withMembership` only accepts active rows, so returning the row
+      // untouched would answer 201 with a membership granting nothing — the
+      // endpoint reporting success while the person still cannot sign in.
+      const locked = await app.request("/school", { headers: tenantHeaders("alpha", bursar) });
+      expect(locked.status).toBe(404);
+
+      const res = await postJson(`/superadmin/schools/${alpha.id}/memberships`, body, boss.headers);
+      expect(await res.json()).toMatchObject({ created: false, isActive: true });
+
+      const restored = await app.request("/school", { headers: tenantHeaders("alpha", bursar) });
+      expect(restored.status).toBe(200);
+    });
+
+    it("422s an address nobody has signed up with", async () => {
+      const boss = await signIn(nextPhone(), "superadmin");
+      const alpha = await makeSchool({ subdomain: "alpha" });
+
+      const res = await postJson(
+        `/superadmin/schools/${alpha.id}/memberships`,
+        { email: "nobody@example.test", role: "admin" },
+        boss.headers,
+      );
+
+      // The school was found; it is the address that matches nobody, so the
+      // caller is told which half of the request to fix.
+      expect(res.status).toBe(422);
+      expect((await res.json()).error.issues[0].path).toEqual(["email"]);
+    });
+
+    it("403s a school admin trying to grant themselves more", async () => {
+      const alpha = await makeSchool({ subdomain: "alpha" });
+      const admin = await signUpWithEmail(nextEmail());
+      await db.insert(memberships).values({
+        userId: admin.id,
+        schoolId: alpha.id,
+        role: "admin",
+      });
+
+      const res = await postJson(
+        `/superadmin/schools/${alpha.id}/memberships`,
+        { email: admin.email, role: "admin" },
+        admin.headers,
+      );
+
+      expect(res.status).toBe(403);
     });
   });
 });
