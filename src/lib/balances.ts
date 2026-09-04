@@ -243,3 +243,142 @@ export async function recomputeInvoiceTotal(
 
   return Number(row.total);
 }
+
+export interface ClassBalance {
+  streamId: string;
+  streamName: string;
+  gradeLevelId: string;
+  gradeLevelName: string;
+  gradeLevelSequence: number;
+  /** Actively enrolled students in this class. */
+  studentCount: number;
+  billedCents: number;
+  paidCents: number;
+  /** Billed minus paid across the class. Families in credit pull this down. */
+  netCents: number;
+  /** Debts only — what the class actually owes the school. */
+  outstandingCents: number;
+  /** How many families are behind, which is the number a bursar chases. */
+  owingCount: number;
+}
+
+/**
+ * Outstanding per class — the bursar dashboard's headline figure.
+ *
+ * Aggregated in SQL rather than by fetching every student and summing in
+ * JavaScript. That matters less for correctness than for what it forces: the
+ * rules about what counts have to be written a second time, and a second copy
+ * that drifts is how one screen says a class owes 40,000 and another says
+ * 55,000 with nothing to explain the difference.
+ *
+ * So the two omissions from `sum(invoices) - sum(payments)` are repeated here
+ * deliberately and identically — a VOIDED invoice is not owed, a REVERSED
+ * payment was not paid — and `balances.test.ts` pins this against
+ * `balancesFor` so the pair cannot come apart unnoticed.
+ *
+ * Only actively enrolled students count. A class list that included last
+ * term's withdrawn pupils would inflate every figure on the dashboard, and the
+ * open enrollment row is what "which class is this child in" means
+ * (CLAUDE.md §5.3).
+ */
+export async function outstandingByClass(
+  db: AppDb,
+  filters: { academicYearId?: string; gradeLevelId?: string } = {},
+): Promise<ClassBalance[]> {
+  /*
+   * Each side aggregated separately before being joined to the student.
+   *
+   * Joining invoices to payments directly multiplies rows — three invoices and
+   * two payments become six — and both sums come out inflated by a factor
+   * nobody notices until the totals are checked by hand. The same reason
+   * `balancesFor` runs two queries rather than one join.
+   */
+  const rows = await db.execute<{
+    stream_id: string;
+    stream_name: string;
+    grade_level_id: string;
+    grade_level_name: string;
+    grade_level_sequence: number;
+    student_count: string;
+    billed_cents: string;
+    paid_cents: string;
+    outstanding_cents: string;
+    owing_count: string;
+  }>(sql`
+    WITH per_student AS (
+      SELECT
+        e.stream_id,
+        coalesce(i.billed, 0)                        AS billed,
+        coalesce(p.paid, 0)                          AS paid,
+        coalesce(i.billed, 0) - coalesce(p.paid, 0)  AS balance
+      FROM students st
+      JOIN enrollments e
+        ON e.student_id = st.id
+       AND e.ended_on IS NULL
+      LEFT JOIN (
+        SELECT student_id, sum(total_cents) AS billed
+        FROM invoices
+        WHERE voided_at IS NULL
+        GROUP BY student_id
+      ) i ON i.student_id = st.id
+      LEFT JOIN (
+        SELECT student_id, sum(amount_cents) AS paid
+        FROM payments
+        WHERE reversed_at IS NULL
+        GROUP BY student_id
+      ) p ON p.student_id = st.id
+      WHERE st.status = 'active'
+    )
+    SELECT
+      s.id                                   AS stream_id,
+      s.name                                 AS stream_name,
+      gl.id                                  AS grade_level_id,
+      gl.name                                AS grade_level_name,
+      gl.sequence                            AS grade_level_sequence,
+      count(ps.*)                            AS student_count,
+      coalesce(sum(ps.billed), 0)            AS billed_cents,
+      coalesce(sum(ps.paid), 0)              AS paid_cents,
+      -- Debts only. A family in credit must not net off against one that owes,
+      -- or the figure a head reads is smaller than the money actually missing.
+      coalesce(sum(ps.balance) FILTER (WHERE ps.balance > 0), 0) AS outstanding_cents,
+      count(*) FILTER (WHERE ps.balance > 0)  AS owing_count
+    FROM streams s
+    JOIN grade_levels gl ON gl.id = s.grade_level_id
+    -- LEFT, so a class with nobody enrolled still appears rather than
+    -- vanishing from a dashboard that is meant to cover the whole school.
+    LEFT JOIN per_student ps ON ps.stream_id = s.id
+    WHERE ${filters.academicYearId
+      ? sql`s.academic_year_id = ${filters.academicYearId}::uuid`
+      : sql`true`}
+      AND ${filters.gradeLevelId
+        ? sql`s.grade_level_id = ${filters.gradeLevelId}::uuid`
+        : sql`true`}
+    GROUP BY s.id, s.name, gl.id, gl.name, gl.sequence
+    /*
+     * Grade order first, then worst debt within it.
+     *
+     * The dashboard reads like a school — Grade 1 through Grade 9 — but inside
+     * a grade the class a bursar needs to act on should be at the top. The
+     * stream name is the tie-break so the order is stable between refreshes;
+     * without it two classes owing the same amount could swap places and make
+     * the screen look like it had changed when nothing had.
+     */
+    ORDER BY gl.sequence,
+             coalesce(sum(ps.balance) FILTER (WHERE ps.balance > 0), 0) DESC,
+             s.name
+  `).then(r => r.rows);
+
+  return rows.map(row => ({
+    streamId: row.stream_id,
+    streamName: row.stream_name,
+    gradeLevelId: row.grade_level_id,
+    gradeLevelName: row.grade_level_name,
+    gradeLevelSequence: Number(row.grade_level_sequence),
+    studentCount: Number(row.student_count),
+    billedCents: Number(row.billed_cents),
+    paidCents: Number(row.paid_cents),
+    netCents: Number(row.billed_cents) - Number(row.paid_cents),
+    outstandingCents: Number(row.outstanding_cents),
+    owingCount: Number(row.owing_count),
+  }));
+}

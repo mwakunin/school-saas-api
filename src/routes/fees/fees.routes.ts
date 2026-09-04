@@ -12,6 +12,7 @@ import { requireMembershipRole } from "@/middlewares/auth";
 
 import {
   addInvoiceLineSchema,
+  classBalanceSchema,
   createFeeItemSchema,
   createFeeStructureSchema,
   feeStructureSchema,
@@ -354,6 +355,43 @@ export const listBalances = createRoute({
   },
 });
 
+export const listClassBalances = createRoute({
+  tags,
+  method: "get",
+  path: "/balances/by-class",
+  summary: "Outstanding per class",
+  description:
+    "The bursar dashboard's headline: which classes are behind, and by how "
+    + "much. Aggregated in the database from the same rules as every other "
+    + "balance — a voided invoice is not owed, a reversed payment was not "
+    + "paid — so this cannot disagree with the per-student figures.\n\n"
+    + "`outstandingCents` counts debts only. Families in credit do not net off "
+    + "against families who owe, or the total reads smaller than the money "
+    + "actually missing. `netCents` is the un-netted figure for anyone who "
+    + "wants it.",
+  middleware: [money],
+  request: {
+    query: z.object({
+      academicYearId: z.uuid().optional(),
+      gradeLevelId: z.uuid().optional(),
+    }),
+  },
+  responses: {
+    [HttpStatusCodes.OK]: jsonContent(
+      z.object({
+        classes: z.array(classBalanceSchema),
+        /** School-wide, so a head reads one number rather than adding up. */
+        totalOutstandingCents: z.number().int(),
+        totalOwingCount: z.number().int(),
+        totalStudentCount: z.number().int(),
+      }),
+      "Outstanding per class, worst first within each grade",
+    ),
+    ...errorResponses,
+  },
+});
+
+export type ListClassBalancesRoute = typeof listClassBalances;
 export type ListStructuresRoute = typeof listStructures;
 export type CreateStructureRoute = typeof createStructure;
 export type AddItemRoute = typeof addItem;

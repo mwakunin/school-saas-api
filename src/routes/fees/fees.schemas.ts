@@ -205,3 +205,23 @@ export const studentBalanceSchema = toZodV4SchemaTyped(
     balanceCents: z.number().int(),
   }),
 );
+
+/** One class on the bursar dashboard. */
+export const classBalanceSchema = toZodV4SchemaTyped(
+  z.object({
+    streamId: z.uuid(),
+    streamName: z.string(),
+    gradeLevelId: z.uuid(),
+    gradeLevelName: z.string(),
+    gradeLevelSequence: z.number().int(),
+    studentCount: z.number().int(),
+    billedCents: z.number().int(),
+    paidCents: z.number().int(),
+    /** Billed minus paid across the class; families in credit pull this down. */
+    netCents: z.number().int(),
+    /** Debts only — what the class actually owes. */
+    outstandingCents: z.number().int(),
+    /** Families behind on fees, which is the number a bursar chases. */
+    owingCount: z.number().int(),
+  }),
+);

@@ -419,7 +419,17 @@ export const reportCards = pgTable('report_cards', {
 
 **Do not average performance levels.** A student who is `exceeding` in one sub-strand and `below_expectation` in another is not `meeting` — that is a mean of ordinals masquerading as a competency judgement, and it hides exactly what the level system exists to surface. Take the mode. Show the per-sub-strand breakdown underneath. Any reduction rule must be explicit and configurable, never silently arithmetic.
 
-**Position is derived and derived late.** Class rank is the most contested number on a Kenyan report card. Compute at finalisation, store in the snapshot, never recompute. Gate on `schools.showsPositions` — some schools have moved away from publishing positions under CBE.
+`lib/assessment.ts` implements this. Three rules are offered — `mode_ties_low` (the default), `mode_ties_high`, `lowest` — and there is deliberately no `mean`. Ties resolve **down**: overstating is the direction that costs a family a conversation they should have had earlier. The rule is stored on each `term_results` row and copied into the snapshot from there, so a printed document says which policy actually produced its levels — and a school that changes the rule between terms does not have last term's levels relabelled under the new one.
+
+`term_results` is the one table in this group the runtime role may `DELETE` from. It is a computation over `assessment_scores`, reconstructible at any time — and recomputing has to be able to remove a result nothing published stands behind any more, because stale reads as fact while absent reads as "not marked yet". Scores, report cards and everything rule 5 names keep no `DELETE`.
+
+**Term results cover everyone enrolled *during* the term**, not everyone enrolled now — a child who transferred out mid-term was taught, sat what they sat, and needs a report for it.
+
+**An absence is not a zero.** A CHECK forbids a mark or a level on an absent row, and the term mean skips them — counting a missed paper as zero drags a child's mean down for something they never sat, and afterwards the two are indistinguishable.
+
+**Position is derived and derived late.** Class rank is the most contested number on a Kenyan report card. Compute at finalisation, store in the snapshot, never recompute. Gate on `schools.showsPositions` — some schools have moved away from publishing positions under CBE, and where they have, the rank is **absent from the snapshot entirely** rather than hidden one query away from a screen that decides to show it.
+
+A trigger freezes a finalised snapshot: it cannot be rewritten, only commented on and released. Reprinting a 2026 report card in 2028 produces the same page.
 
 Report card layout that works: competency breakdown as the body, exam mean and position in a summary strip. Both audiences get what they came for.
 
@@ -560,9 +570,9 @@ Two more are needed before v1 ships and are not yet built:
 3. ~~Students, guardians, enrollment (§5.3).~~ **Done.**
 4. ~~Fees: structures → invoice generation for one term (§5.7).~~ **Done.**
 5. ~~C2B webhook, matcher and reconciliation queue (§5.8).~~ **Done.** — but **`registerC2bUrls` has never been run against Daraja's sandbox.** It is written and wired; exercising it needs real credentials and a publicly reachable tunnel, and until that happens no school's callbacks are actually registered with Safaricom. Everything downstream of a delivered confirmation is tested.
-6. Bursar dashboard: outstanding balances per class.
+6. Bursar dashboard: outstanding balances per class. — **API done** (`GET /balances/by-class`). The dashboard *screen* is the first piece of the Next app, which has not started.
 7. **Put it in front of one real school before writing anything else.**
-8. Curriculum seed + assessment + report cards (§5.4–5.6).
+8. ~~Curriculum seed + assessment + report cards (§5.4–5.6).~~ **Done.** — the learning areas are real; the strands are marked `(placeholder)` rather than transcribed from KICD's published designs. Replacing them is a data change and nothing else.
 
 The demo seed (§8) is **not** a phase-8 activity. Grow `seed/01…06` alongside steps 3–6: it is what makes each step testable, and running it in CI is what catches a migration that broke something real.
 

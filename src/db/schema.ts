@@ -7,6 +7,8 @@ import {
   index,
   integer,
   jsonb,
+  numeric,
+  pgEnum,
   pgTable,
   primaryKey,
   text,
@@ -719,6 +721,375 @@ export const payments = pgTable("payments", {
   ),
 ]);
 
+// ---------------------------------------------------------------------------
+// 5.4 Curriculum
+// ---------------------------------------------------------------------------
+
+/**
+ * A subject, as CBE names them.
+ *
+ * `gradeLevelId` is nullable because some learning areas run the whole way
+ * through and some belong to one grade. Junior school (Grade 7-9) carries
+ * additional areas that primary does not, which is why anything reasoning
+ * about the difference filters on `gradeLevels.phase` rather than on a number.
+ */
+export const learningAreas = pgTable("learning_areas", {
+  id: uuid().primaryKey().defaultRandom(),
+  schoolId: uuid().notNull().references(() => schools.id),
+  gradeLevelId: uuid(),
+  name: text().notNull(),
+  code: text(),
+  isCore: boolean().default(true).notNull(),
+  /** Report card ordering — Mathematics before Music, as the school prints it. */
+  sequence: integer().notNull(),
+}, t => [
+  unique("learning_areas_school_id_id_key").on(t.schoolId, t.id),
+  /*
+   * One area per name per school, case-insensitively.
+   *
+   * The seed skips an area the school already has by name, but nothing stopped
+   * a second "Mathematics" arriving through the ordinary create route — after
+   * which the seed's own skip check becomes ambiguous and a report card prints
+   * the subject twice. Case-insensitive because "mathematics" and
+   * "Mathematics" are the same subject to everyone except a byte comparison.
+   */
+  uniqueIndex("learning_areas_school_name_unique")
+    .on(t.schoolId, sql`lower(${t.name})`),
+  foreignKey({
+    columns: [t.schoolId, t.gradeLevelId],
+    foreignColumns: [gradeLevels.schoolId, gradeLevels.id],
+    name: "learning_areas_school_grade_level_fk",
+  }),
+  index().on(t.schoolId, t.gradeLevelId),
+]);
+
+/**
+ * Strand, then sub-strand. Self-referencing so the depth stays flexible.
+ *
+ * KICD designs nest to two levels today and there is no guarantee they always
+ * will, so the shape is a tree rather than two tables. A root row is a strand;
+ * a row with a parent is a sub-strand; nothing stops a third level if a
+ * curriculum revision introduces one.
+ */
+export const competencies = pgTable("competencies", {
+  id: uuid().primaryKey().defaultRandom(),
+  schoolId: uuid().notNull().references(() => schools.id),
+  learningAreaId: uuid().notNull(),
+  parentId: uuid(),
+  /** '1.2', '1.2.3' — the numbering a teacher recognises from the design. */
+  code: text(),
+  title: text().notNull(),
+  sequence: integer().notNull(),
+}, t => [
+  unique("competencies_school_id_id_key").on(t.schoolId, t.id),
+  foreignKey({
+    columns: [t.schoolId, t.learningAreaId],
+    foreignColumns: [learningAreas.schoolId, learningAreas.id],
+    name: "competencies_school_learning_area_fk",
+  }),
+  // Self-referencing, and still tenant-carrying: a sub-strand cannot hang off
+  // another school's strand.
+  foreignKey({
+    columns: [t.schoolId, t.parentId],
+    foreignColumns: [t.schoolId, t.id],
+    name: "competencies_school_parent_fk",
+  }),
+  index().on(t.schoolId, t.learningAreaId),
+]);
+
+// ---------------------------------------------------------------------------
+// 5.5 Assessment
+// ---------------------------------------------------------------------------
+
+export const performanceLevel = pgEnum("performance_level", [
+  "below_expectation",
+  "approaching",
+  "meeting",
+  "exceeding",
+]);
+
+export const assessments = pgTable("assessments", {
+  id: uuid().primaryKey().defaultRandom(),
+  schoolId: uuid().notNull().references(() => schools.id),
+  termId: uuid().notNull(),
+  learningAreaId: uuid().notNull(),
+  /** Null = the whole grade sits it, rather than one class. */
+  streamId: uuid(),
+
+  title: text().notNull(),
+  kind: text().$type<
+    "exam" | "cat" | "project" | "practical" | "observation" | "national"
+  >().notNull(),
+
+  /** Null for pure observation, which produces a level and no mark. */
+  maxScore: integer(),
+  /** How much this counts towards the term mean. */
+  weight: numeric({ precision: 5, scale: 2 }),
+
+  administeredOn: date(),
+  createdBy: userRef("created_by").references(() => user.id),
+  /**
+   * Null = teachers are still entering marks.
+   *
+   * Gates parent visibility. Marks go in over days and get corrected; a parent
+   * seeing a half-entered exam would ring the school about a mark that is
+   * about to change.
+   */
+  publishedAt: timestamp({ withTimezone: true }),
+}, t => [
+  unique("assessments_school_id_id_key").on(t.schoolId, t.id),
+  foreignKey({
+    columns: [t.schoolId, t.termId],
+    foreignColumns: [terms.schoolId, terms.id],
+    name: "assessments_school_term_fk",
+  }),
+  foreignKey({
+    columns: [t.schoolId, t.learningAreaId],
+    foreignColumns: [learningAreas.schoolId, learningAreas.id],
+    name: "assessments_school_learning_area_fk",
+  }),
+  foreignKey({
+    columns: [t.schoolId, t.streamId],
+    foreignColumns: [streams.schoolId, streams.id],
+    name: "assessments_school_stream_fk",
+  }),
+  index().on(t.schoolId, t.termId),
+  check("assessments_max_score_positive", sql`${t.maxScore} IS NULL OR ${t.maxScore} > 0`),
+  check("assessments_weight_positive", sql`${t.weight} IS NULL OR ${t.weight} > 0`),
+]);
+
+/**
+ * One mark, or one competency judgement.
+ *
+ * **`competencyId` nullable is what lets both grading systems live in one
+ * table** (CLAUDE.md §5.5). Null means one overall result for the assessment —
+ * the percentage-exam path. Populated means one row per sub-strand — the
+ * competency path. CBE schools run both: national assessment is
+ * competency-based, but internal exams are still marked out of 100 and parents
+ * still expect a mark and a position. A system that refuses to store a
+ * percentage gets rejected.
+ *
+ * Hangs off `enrollmentId`, never `studentId` (rule 6): a mark is this child,
+ * in this stream, in this year.
+ */
+export const assessmentScores = pgTable("assessment_scores", {
+  id: uuid().primaryKey().defaultRandom(),
+  schoolId: uuid().notNull().references(() => schools.id),
+  assessmentId: uuid().notNull(),
+  enrollmentId: uuid().notNull(),
+  competencyId: uuid(),
+
+  rawScore: numeric({ precision: 6, scale: 2 }),
+  level: performanceLevel(),
+  isAbsent: boolean().default(false).notNull(),
+  comment: text(),
+
+  enteredBy: userRef("entered_by").references(() => user.id),
+  enteredAt: timestamp({ withTimezone: true }).defaultNow().notNull(),
+}, t => [
+  unique("assessment_scores_school_id_id_key").on(t.schoolId, t.id),
+  /*
+   * NULLS NOT DISTINCT is the whole point of this constraint.
+   *
+   * Postgres treats NULLs as distinct by default, so a plain unique over
+   * (assessment, enrollment, competency) would happily accept two overall
+   * marks for the same child on the same exam — the exact duplicate it exists
+   * to prevent, and the common case, since the percentage path always has a
+   * null competency. Requires Postgres 15+, which the Docker image and Neon
+   * both are.
+   */
+  unique("assessment_scores_unique_entry")
+    .on(t.assessmentId, t.enrollmentId, t.competencyId)
+    .nullsNotDistinct(),
+  foreignKey({
+    columns: [t.schoolId, t.assessmentId],
+    foreignColumns: [assessments.schoolId, assessments.id],
+    name: "assessment_scores_school_assessment_fk",
+  }),
+  foreignKey({
+    columns: [t.schoolId, t.enrollmentId],
+    foreignColumns: [enrollments.schoolId, enrollments.id],
+    name: "assessment_scores_school_enrollment_fk",
+  }),
+  foreignKey({
+    columns: [t.schoolId, t.competencyId],
+    foreignColumns: [competencies.schoolId, competencies.id],
+    name: "assessment_scores_school_competency_fk",
+  }),
+  index().on(t.schoolId, t.assessmentId),
+  index().on(t.schoolId, t.enrollmentId),
+  check("assessment_scores_raw_score_positive", sql`${t.rawScore} IS NULL OR ${t.rawScore} >= 0`),
+  /*
+   * An absence is not a zero.
+   *
+   * Storing it as one drags a child's mean down for an exam they never sat,
+   * and the difference is invisible afterwards. Absent rows carry no mark and
+   * no level, and the term mean skips them.
+   */
+  check(
+    "assessment_scores_absent_has_no_result",
+    sql`NOT ${t.isAbsent} OR (${t.rawScore} IS NULL AND ${t.level} IS NULL)`,
+  ),
+]);
+
+/**
+ * Portfolio evidence: the photograph of the work, the recording of the recital.
+ *
+ * CBE assessment is partly observational, and teachers currently keep this on
+ * their phones and lose it. A genuine selling point rather than a nicety.
+ */
+export const scoreAttachments = pgTable("score_attachments", {
+  id: uuid().primaryKey().defaultRandom(),
+  schoolId: uuid().notNull().references(() => schools.id),
+  assessmentScoreId: uuid().notNull(),
+  url: text().notNull(),
+  kind: text().$type<"image" | "audio" | "video" | "document">().notNull(),
+  caption: text(),
+  uploadedBy: userRef("uploaded_by").references(() => user.id),
+  uploadedAt: timestamp({ withTimezone: true }).defaultNow().notNull(),
+}, t => [
+  foreignKey({
+    columns: [t.schoolId, t.assessmentScoreId],
+    foreignColumns: [assessmentScores.schoolId, assessmentScores.id],
+    name: "score_attachments_school_score_fk",
+  }),
+  index().on(t.schoolId, t.assessmentScoreId),
+]);
+
+// ---------------------------------------------------------------------------
+// 5.6 Results and report cards
+// ---------------------------------------------------------------------------
+
+export const termResults = pgTable("term_results", {
+  id: uuid().primaryKey().defaultRandom(),
+  schoolId: uuid().notNull().references(() => schools.id),
+  enrollmentId: uuid().notNull(),
+  termId: uuid().notNull(),
+  learningAreaId: uuid().notNull(),
+
+  /** Exam side: weighted mean of scored assessments, as a percentage. */
+  meanScore: numeric({ precision: 5, scale: 2 }),
+  /** Derived late and frozen at finalisation — never recomputed. */
+  streamPosition: integer(),
+  gradePosition: integer(),
+  outOf: integer(),
+
+  /**
+   * Competency side: the MODE across sub-strands, never the mean.
+   *
+   * A child who is `exceeding` in one sub-strand and `below_expectation` in
+   * another is not `meeting` — that is an average of ordinals wearing a
+   * competency judgement's clothes, and it hides exactly what the level system
+   * exists to surface. See lib/assessment.ts.
+   */
+  overallLevel: performanceLevel(),
+
+  /**
+   * The reduction rule that produced `overallLevel`.
+   *
+   * Stored with the result rather than assumed at print time. "Explicit and
+   * configurable" (CLAUDE.md §5.6) means a report card can say which policy
+   * turned four sub-strand judgements into one — and a school that changed the
+   * rule between terms must not have last term's levels relabelled under the
+   * new one.
+   */
+  levelReduction: text()
+    .$type<"mode_ties_low" | "mode_ties_high" | "lowest">()
+    .notNull()
+    .default("mode_ties_low"),
+
+  teacherComment: text(),
+  computedAt: timestamp({ withTimezone: true }).defaultNow().notNull(),
+}, t => [
+  unique().on(t.enrollmentId, t.termId, t.learningAreaId),
+  unique("term_results_school_id_id_key").on(t.schoolId, t.id),
+  foreignKey({
+    columns: [t.schoolId, t.enrollmentId],
+    foreignColumns: [enrollments.schoolId, enrollments.id],
+    name: "term_results_school_enrollment_fk",
+  }),
+  foreignKey({
+    columns: [t.schoolId, t.termId],
+    foreignColumns: [terms.schoolId, terms.id],
+    name: "term_results_school_term_fk",
+  }),
+  foreignKey({
+    columns: [t.schoolId, t.learningAreaId],
+    foreignColumns: [learningAreas.schoolId, learningAreas.id],
+    name: "term_results_school_learning_area_fk",
+  }),
+  index().on(t.schoolId, t.termId),
+  /*
+   * The rule has to be one this code can actually apply.
+   *
+   * `.$type<>()` is a TypeScript fiction — it constrains nothing in the
+   * database, and `reduceLevels` treats any rule it does not recognise as
+   * `mode_ties_low` SILENTLY. So an unrecognised value here would produce
+   * levels computed one way and labelled another, then get copied verbatim
+   * into a report card snapshot and frozen there. That is the same defect
+   * fixed by storing the rule in the first place, arriving by a different
+   * door: a backfill, a manual correction, or a fourth rule added to the
+   * enum without a migration.
+   */
+  check(
+    "term_results_level_reduction_known",
+    sql`${t.levelReduction} IN ('mode_ties_low', 'mode_ties_high', 'lowest')`,
+  ),
+]);
+
+/**
+ * The printed thing, frozen (CLAUDE.md §3 rule 7).
+ *
+ * `snapshot` holds the computed content as it stood at finalisation, so
+ * regenerating a 2026 report card in 2028 produces the same document — after
+ * the fee structure changed, after a mark was corrected, after the class was
+ * renamed. Anything read back for printing comes from the snapshot, never from
+ * a fresh computation.
+ */
+export const reportCards = pgTable("report_cards", {
+  id: uuid().primaryKey().defaultRandom(),
+  schoolId: uuid().notNull().references(() => schools.id),
+  enrollmentId: uuid().notNull(),
+  termId: uuid().notNull(),
+
+  snapshot: jsonb().notNull(),
+  pdfUrl: text(),
+
+  classTeacherComment: text(),
+  headComment: text(),
+  attendancePresent: integer(),
+  attendanceTotal: integer(),
+
+  finalisedBy: userRef("finalised_by").references(() => user.id),
+  finalisedAt: timestamp({ withTimezone: true }),
+  /** Null = not visible to guardians yet. */
+  releasedAt: timestamp({ withTimezone: true }),
+}, t => [
+  unique().on(t.enrollmentId, t.termId),
+  unique("report_cards_school_id_id_key").on(t.schoolId, t.id),
+  foreignKey({
+    columns: [t.schoolId, t.enrollmentId],
+    foreignColumns: [enrollments.schoolId, enrollments.id],
+    name: "report_cards_school_enrollment_fk",
+  }),
+  foreignKey({
+    columns: [t.schoolId, t.termId],
+    foreignColumns: [terms.schoolId, terms.id],
+    name: "report_cards_school_term_fk",
+  }),
+  index().on(t.schoolId, t.termId),
+  check("report_cards_attendance_sane", sql`
+    (${t.attendancePresent} IS NULL AND ${t.attendanceTotal} IS NULL)
+    OR (${t.attendancePresent} >= 0 AND ${t.attendanceTotal} >= ${t.attendancePresent})
+  `),
+  // Released implies finalised: a guardian must never see a document that was
+  // never frozen, because it would change under them.
+  check(
+    "report_cards_released_after_finalised",
+    sql`${t.releasedAt} IS NULL OR ${t.finalisedAt} IS NOT NULL`,
+  ),
+]);
+
 /**
  * Every tenant-scoped table, for the migration that puts RLS on them.
  *
@@ -742,6 +1113,13 @@ export const TENANT_TABLES = [
   "invoice_lines",
   "payments",
   "mpesa_transactions",
+  "learning_areas",
+  "competencies",
+  "assessments",
+  "assessment_scores",
+  "score_attachments",
+  "term_results",
+  "report_cards",
 ] as const;
 
 // ---------------------------------------------------------------------------
@@ -861,6 +1239,85 @@ export const paymentsRelations = relations(payments, ({ one }) => ({
     fields: [payments.mpesaTransactionId],
     references: [mpesaTransactions.id],
   }),
+}));
+
+export const learningAreasRelations = relations(learningAreas, ({ one, many }) => ({
+  school: one(schools, { fields: [learningAreas.schoolId], references: [schools.id] }),
+  gradeLevel: one(gradeLevels, {
+    fields: [learningAreas.gradeLevelId],
+    references: [gradeLevels.id],
+  }),
+  competencies: many(competencies),
+  assessments: many(assessments),
+}));
+
+export const competenciesRelations = relations(competencies, ({ one, many }) => ({
+  learningArea: one(learningAreas, {
+    fields: [competencies.learningAreaId],
+    references: [learningAreas.id],
+  }),
+  parent: one(competencies, {
+    fields: [competencies.parentId],
+    references: [competencies.id],
+    relationName: "competency_tree",
+  }),
+  children: many(competencies, { relationName: "competency_tree" }),
+}));
+
+export const assessmentsRelations = relations(assessments, ({ one, many }) => ({
+  school: one(schools, { fields: [assessments.schoolId], references: [schools.id] }),
+  term: one(terms, { fields: [assessments.termId], references: [terms.id] }),
+  learningArea: one(learningAreas, {
+    fields: [assessments.learningAreaId],
+    references: [learningAreas.id],
+  }),
+  stream: one(streams, { fields: [assessments.streamId], references: [streams.id] }),
+  scores: many(assessmentScores),
+}));
+
+export const assessmentScoresRelations = relations(assessmentScores, ({ one, many }) => ({
+  assessment: one(assessments, {
+    fields: [assessmentScores.assessmentId],
+    references: [assessments.id],
+  }),
+  enrollment: one(enrollments, {
+    fields: [assessmentScores.enrollmentId],
+    references: [enrollments.id],
+  }),
+  competency: one(competencies, {
+    fields: [assessmentScores.competencyId],
+    references: [competencies.id],
+  }),
+  attachments: many(scoreAttachments),
+}));
+
+export const scoreAttachmentsRelations = relations(scoreAttachments, ({ one }) => ({
+  score: one(assessmentScores, {
+    fields: [scoreAttachments.assessmentScoreId],
+    references: [assessmentScores.id],
+  }),
+}));
+
+export const termResultsRelations = relations(termResults, ({ one }) => ({
+  school: one(schools, { fields: [termResults.schoolId], references: [schools.id] }),
+  enrollment: one(enrollments, {
+    fields: [termResults.enrollmentId],
+    references: [enrollments.id],
+  }),
+  term: one(terms, { fields: [termResults.termId], references: [terms.id] }),
+  learningArea: one(learningAreas, {
+    fields: [termResults.learningAreaId],
+    references: [learningAreas.id],
+  }),
+}));
+
+export const reportCardsRelations = relations(reportCards, ({ one }) => ({
+  school: one(schools, { fields: [reportCards.schoolId], references: [schools.id] }),
+  enrollment: one(enrollments, {
+    fields: [reportCards.enrollmentId],
+    references: [enrollments.id],
+  }),
+  term: one(terms, { fields: [reportCards.termId], references: [terms.id] }),
 }));
 
 export const mpesaTransactionsRelations = relations(mpesaTransactions, ({ one }) => ({

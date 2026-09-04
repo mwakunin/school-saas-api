@@ -19,6 +19,7 @@ import {
 import {
   balancesFor,
   invoiceBalancesFor,
+  outstandingByClass,
   recomputeInvoiceTotal,
 } from "@/lib/balances";
 import { isForeignKeyViolation, isUniqueViolation } from "@/lib/db-errors";
@@ -31,6 +32,7 @@ import type {
   GenerateRoute,
   GetInvoiceRoute,
   ListBalancesRoute,
+  ListClassBalancesRoute,
   ListInvoicesRoute,
   ListPaymentsRoute,
   ListStructuresRoute,
@@ -850,5 +852,23 @@ export const listBalances: TenantRouteHandler<ListBalancesRoute> = async (c) => 
     totalOutstandingCents: rows
       .filter(r => r.balanceCents > 0)
       .reduce((sum, r) => sum + r.balanceCents, 0),
+  }, HttpStatusCodes.OK);
+};
+
+export const listClassBalances: TenantRouteHandler<ListClassBalancesRoute> = async (c) => {
+  const query = c.req.valid("query");
+
+  const classes = await outstandingByClass(c.var.db, {
+    academicYearId: query.academicYearId,
+    gradeLevelId: query.gradeLevelId,
+  });
+
+  return c.json({
+    classes,
+    // Summed from the classes returned, so the header and the rows below it
+    // can never disagree about what is being shown.
+    totalOutstandingCents: classes.reduce((n, r) => n + r.outstandingCents, 0),
+    totalOwingCount: classes.reduce((n, r) => n + r.owingCount, 0),
+    totalStudentCount: classes.reduce((n, r) => n + r.studentCount, 0),
   }, HttpStatusCodes.OK);
 };
