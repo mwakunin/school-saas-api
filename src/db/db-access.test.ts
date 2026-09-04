@@ -74,15 +74,31 @@ async function sourceFiles(dir: string): Promise<string[]> {
   return found;
 }
 
+/** The connection module, however it is spelled: `@/db`, `../db`, `@/db/index`. */
+const DB_MODULE = String.raw`(?:@\/db|\.\.?\/(?:\.\.\/)*db)(?:\/index)?`;
+
+/**
+ * Every export a namespace-style import reaches.
+ *
+ * `import * as m` and `await import(...)` both hand back the whole module, so
+ * `m.default` and `m.pool` are equally available. Reported under all four
+ * names rather than a new one, so both allowlists judge them exactly as they
+ * judge a direct import — and a file doing it has to justify itself on both.
+ */
+const ALL_CONNECTIONS = ["default", "pool", "appDb", "appPool"] as const;
+
 /**
  * Import specifiers pulled from `@/db` or a relative path to it.
  *
- * The module specifier accepts an optional `/index`, and the clause is matched
- * for a bare default, a `{ default as x }` rename, and the named connections.
- * All three of the latter used to slip past: `@/db/index` did not match the
- * specifier at all, and `{ default as ownerDb }` matched neither the
- * bare-default pattern (it starts with `{`) nor the named list. Any of them
- * would have handed a route the RLS-exempt connection with the guard green.
+ * Both static and dynamic forms. The specifier accepts an optional `/index`,
+ * and the static clause is matched for a bare default, a `{ default as x }`
+ * rename, a namespace import, and the named connections.
+ *
+ * Each of those was once a way through: `@/db/index` did not match the
+ * specifier, `{ default as ownerDb }` matched neither the bare-default pattern
+ * nor the named list, `import{pool}from` had no space to match on, and
+ * `await import("@/db")` was not looked for at all. Any of them would have
+ * handed a route the RLS-exempt connection with the guard green.
  */
 function dbImportsIn(source: string): string[] {
   const names: string[] = [];
@@ -100,10 +116,12 @@ function dbImportsIn(source: string): string[] {
    * `\bfrom` keeps an identifier like `fromCache` from ending the clause early;
    * no closing `\b` is needed, since the `["']` that must follow provides it.
    */
-  const pattern
-    = /\bimport(?=[\s{*"'])([^;"']+?)\bfrom\s*["'](?:@\/db|\.\.?\/(?:\.\.\/)*db)(?:\/index)?["']/g;
+  const staticPattern = new RegExp(
+    String.raw`\bimport(?=[\s{*"'])([^;"']+?)\bfrom\s*["']${DB_MODULE}["']`,
+    "g",
+  );
 
-  for (const match of source.matchAll(pattern)) {
+  for (const match of source.matchAll(staticPattern)) {
     const clause = match[1];
 
     // `import db from "@/db"` — the default export is the owner connection.
@@ -114,18 +132,32 @@ function dbImportsIn(source: string): string[] {
     if (/\bdefault\s+as\s+\w+/.test(clause))
       names.push("default");
 
-    /*
-     * `import * as dbMod from "@/db"` reaches everything the module exports —
-     * `dbMod.default` and `dbMod.pool` included — so a namespace import is
-     * treated as taking all of them. Reported under every name rather than a
-     * new one, so both allowlists judge it the way they judge a direct import.
-     */
+    // `import * as dbMod from "@/db"` reaches every export through the object.
     if (/^\s*\*\s*as\s+\w+/.test(clause))
-      names.push("default", "pool", "appDb", "appPool");
+      names.push(...ALL_CONNECTIONS);
 
     for (const named of clause.matchAll(/\b(pool|appDb|appPool)\b/g))
       names.push(named[1]);
   }
+
+  /*
+   * `await import("@/db")` — a dynamic import, and the last shape of this hole.
+   *
+   * It reaches the module the same way a namespace import does, so it is
+   * treated the same: every connection, regardless of what the caller
+   * destructures off it. Matching the destructuring instead would mean parsing
+   * the surrounding statement, and getting that wrong fails open.
+   *
+   * The lookahead on the static pattern above deliberately excludes `(`, so
+   * the two cannot both match the same text.
+   */
+  const dynamicPattern = new RegExp(
+    String.raw`\bimport\s*\(\s*["']${DB_MODULE}["']\s*\)`,
+    "g",
+  );
+
+  for (const _ of source.matchAll(dynamicPattern))
+    names.push(...ALL_CONNECTIONS);
 
   return names;
 }
@@ -238,5 +270,33 @@ describe("database access", () => {
 
   it("is not confused by an identifier containing `from` in the clause", () => {
     expect(dbImportsIn(`import { fromCache, pool } from "@/db";`)).toContain("pool");
+  });
+
+  it.each([
+    ["awaited default", `const { default: db } = await import("@/db");`],
+    ["awaited named", `const { pool } = await import("@/db");`],
+    ["via /index", `const m = await import("@/db/index");`],
+    ["relative", `const m = await import("../db");`],
+    ["relative /index", `const m = await import("../../db/index");`],
+    ["no await", `const p = import("@/db");`],
+    ["single quotes and spacing", `await import( '@/db' )`],
+  ])("sees a dynamic import: %s", (_case, source) => {
+    // A dynamic import hands back the whole module, so it counts as taking
+    // every connection — whatever the caller destructures off it.
+    const names = dbImportsIn(source);
+    expect(names).toContain("default");
+    expect(names).toContain("pool");
+    expect(names).toContain("appDb");
+  });
+
+  it("ignores a dynamic import of a different module", () => {
+    expect(dbImportsIn(`await import("@/db/schema");`)).toEqual([]);
+    expect(dbImportsIn(`await import("@/lib/db-errors");`)).toEqual([]);
+    expect(dbImportsIn(`await import("node:fs/promises");`)).toEqual([]);
+  });
+
+  it("does not mistake a call on an identifier ending in `import`", () => {
+    expect(dbImportsIn(`reimport("@/db");`)).toEqual([]);
+    expect(dbImportsIn(`const imported = ["@/db"];`)).toEqual([]);
   });
 });
