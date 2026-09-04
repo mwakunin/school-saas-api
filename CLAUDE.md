@@ -560,7 +560,7 @@ Two more are needed before v1 ships and are not yet built:
 3. ~~Students, guardians, enrollment (§5.3).~~ **Done.**
 4. ~~Fees: structures → invoice generation for one term (§5.7).~~ **Done.**
 5. ~~C2B webhook, matcher and reconciliation queue (§5.8).~~ **Done.** — but **`registerC2bUrls` has never been run against Daraja's sandbox.** It is written and wired; exercising it needs real credentials and a publicly reachable tunnel, and until that happens no school's callbacks are actually registered with Safaricom. Everything downstream of a delivered confirmation is tested.
-6. Bursar dashboard: outstanding balances per class.
+6. Bursar dashboard: outstanding balances per class. — **API done** (`GET /balances/by-class`). The dashboard *screen* is the first piece of the Next app, which has not started.
 7. **Put it in front of one real school before writing anything else.**
 8. Curriculum seed + assessment + report cards (§5.4–5.6).
 

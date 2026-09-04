@@ -24,6 +24,8 @@ router
   .openapi(routes.recordPayment, handlers.recordPayment)
   .openapi(routes.listPayments, handlers.listPayments)
   .openapi(routes.reversePayment, handlers.reversePayment)
+  // Before /balances, so "by-class" is not parsed as a query on the list.
+  .openapi(routes.listClassBalances, handlers.listClassBalances)
   .openapi(routes.listBalances, handlers.listBalances);
 
 export default router;

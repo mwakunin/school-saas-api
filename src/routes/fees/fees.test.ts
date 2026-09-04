@@ -422,6 +422,217 @@ describe("fees", () => {
     });
   });
 
+  describe("outstanding per class", () => {
+    async function billedAcrossTwoClasses(subdomain: string) {
+      const s = await seed(subdomain);
+      const east = await makeStream(s.school, 5, "East");
+      const grade5 = s.school.gradeLevels.find(g => g.sequence === 5)!;
+
+      await s.setFees([TUITION]);
+      await post("/fee-structures", {
+        termId: s.term1.id,
+        gradeLevelId: grade5.id,
+        boardingStatus: "day",
+        items: [{ name: "Tuition", amountCents: 2_200_000 }],
+      }, jsonHeaders(subdomain, s.bursar));
+
+      // Two more children, in Grade 5 East.
+      const inEast = [];
+      for (const n of ["2026/010", "2026/011"]) {
+        inEast.push(await makeStudent(s.school, n, {
+          givenName: `East${n.slice(-3)}`,
+          streamId: east.id,
+          boardingStatus: "day",
+        }));
+      }
+
+      await post("/invoices/generate", {
+        termId: s.term1.id,
+        issuedOn: "2026-01-06",
+      }, jsonHeaders(subdomain, s.bursar));
+
+      return { ...s, east, inEast };
+    }
+
+    it("reports each class with its own totals", async () => {
+      const { bursar, blue, east } = await billedAcrossTwoClasses("alpha");
+
+      const body = await (await app.request("/balances/by-class", {
+        headers: tenantHeaders("alpha", bursar),
+      })).json();
+
+      const byId = Object.fromEntries(
+        body.classes.map((c: { streamId: string }) => [c.streamId, c]),
+      );
+
+      expect(byId[blue.id]).toMatchObject({
+        gradeLevelName: "Grade 4",
+        studentCount: 3,
+        outstandingCents: 3 * 1_800_000,
+        owingCount: 3,
+      });
+      expect(byId[east.id]).toMatchObject({
+        gradeLevelName: "Grade 5",
+        studentCount: 2,
+        outstandingCents: 2 * 2_200_000,
+        owingCount: 2,
+      });
+    });
+
+    it("agrees with the per-student figures it is aggregating", async () => {
+      const { bursar, blue, kids } = await billedAcrossTwoClasses("alpha");
+
+      // Part-pay one child, so the two views have something to disagree about.
+      const [invoice] = await db
+        .select()
+        .from(invoices)
+        .where(eq(invoices.studentId, kids[0].id));
+      await post("/payments", {
+        studentId: kids[0].id,
+        invoiceId: invoice.id,
+        method: "cash",
+        amountCents: 500_000,
+      }, jsonHeaders("alpha", bursar));
+
+      const perClass = await (await app.request(`/balances/by-class`, {
+        headers: tenantHeaders("alpha", bursar),
+      })).json();
+      const perStudent = await (await app.request(`/balances?streamId=${blue.id}`, {
+        headers: tenantHeaders("alpha", bursar),
+      })).json();
+
+      /*
+       * The aggregation is a second expression of one rule. If the SQL and
+       * `balancesFor` ever drift, one screen says a class owes X and another
+       * says Y, with nothing in either to explain the gap.
+       */
+      const blueClass = perClass.classes.find(
+        (c: { streamId: string }) => c.streamId === blue.id,
+      );
+      const summed = perStudent.balances
+        .filter((b: { balanceCents: number }) => b.balanceCents > 0)
+        .reduce((n: number, b: { balanceCents: number }) => n + b.balanceCents, 0);
+
+      expect(blueClass.outstandingCents).toBe(summed);
+      expect(blueClass.outstandingCents).toBe(2 * 1_800_000 + 1_300_000);
+    });
+
+    it("does not let a family in credit hide another family's debt", async () => {
+      const { bursar, blue, kids } = await billedAcrossTwoClasses("alpha");
+
+      // One family massively overpays.
+      const [invoice] = await db
+        .select()
+        .from(invoices)
+        .where(eq(invoices.studentId, kids[0].id));
+      await post("/payments", {
+        studentId: kids[0].id,
+        invoiceId: invoice.id,
+        method: "bank",
+        amountCents: 9_000_000,
+      }, jsonHeaders("alpha", bursar));
+
+      const body = await (await app.request("/balances/by-class", {
+        headers: tenantHeaders("alpha", bursar),
+      })).json();
+      const blueClass = body.classes.find(
+        (c: { streamId: string }) => c.streamId === blue.id,
+      );
+
+      // Two children still owe 18,000 each. The credit must not net against
+      // them, or the dashboard understates what is missing.
+      expect(blueClass.outstandingCents).toBe(2 * 1_800_000);
+      expect(blueClass.owingCount).toBe(2);
+      // `netCents` is the un-netted figure, and is legitimately negative here.
+      expect(blueClass.netCents).toBeLessThan(0);
+    });
+
+    it("excludes a student who has left", async () => {
+      const { school, bursar, blue, kids } = await billedAcrossTwoClasses("alpha");
+
+      await post(`/students/${kids[0].id}/exit`, {
+        status: "transferred_out",
+        exitedOn: "2026-02-01",
+      }, jsonHeaders("alpha", await signInAt(school.id, "admin")));
+
+      const body = await (await app.request("/balances/by-class", {
+        headers: tenantHeaders("alpha", bursar),
+      })).json();
+      const blueClass = body.classes.find(
+        (c: { streamId: string }) => c.streamId === blue.id,
+      );
+
+      // A withdrawn pupil on a class list inflates every figure on the
+      // dashboard — and their enrollment is closed, so they are in no class.
+      expect(blueClass.studentCount).toBe(2);
+      expect(blueClass.outstandingCents).toBe(2 * 1_800_000);
+    });
+
+    it("shows a class with nobody in it rather than dropping it", async () => {
+      const { school, bursar } = await billedAcrossTwoClasses("alpha");
+      const empty = await makeStream(school, 9, "Junior");
+
+      const body = await (await app.request("/balances/by-class", {
+        headers: tenantHeaders("alpha", bursar),
+      })).json();
+
+      // A dashboard meant to cover the school must not silently omit a class.
+      const emptyClass = body.classes.find(
+        (c: { streamId: string }) => c.streamId === empty.id,
+      );
+      expect(emptyClass).toMatchObject({ studentCount: 0, outstandingCents: 0 });
+    });
+
+    it("orders by grade, so the dashboard reads like a school", async () => {
+      const { bursar } = await billedAcrossTwoClasses("alpha");
+
+      const body = await (await app.request("/balances/by-class", {
+        headers: tenantHeaders("alpha", bursar),
+      })).json();
+
+      const sequences = body.classes.map(
+        (c: { gradeLevelSequence: number }) => c.gradeLevelSequence,
+      );
+      expect(sequences).toEqual([...sequences].sort((a, b) => a - b));
+    });
+
+    it("totals the school, not just the page", async () => {
+      const { bursar } = await billedAcrossTwoClasses("alpha");
+
+      const body = await (await app.request("/balances/by-class", {
+        headers: tenantHeaders("alpha", bursar),
+      })).json();
+
+      expect(body.totalStudentCount).toBe(5);
+      expect(body.totalOwingCount).toBe(5);
+      expect(body.totalOutstandingCents).toBe(3 * 1_800_000 + 2 * 2_200_000);
+    });
+
+    it("shows one school none of another's classes", async () => {
+      await billedAcrossTwoClasses("alpha");
+      const beta = await seed("beta");
+
+      const body = await (await app.request("/balances/by-class", {
+        headers: tenantHeaders("beta", beta.bursar),
+      })).json();
+
+      // Beta has one class, seeded but never billed.
+      expect(body.classes.every((c: { outstandingCents: number }) => c.outstandingCents === 0)).toBe(true);
+      expect(body.totalOutstandingCents).toBe(0);
+    });
+
+    it("403s a teacher", async () => {
+      const { school } = await billedAcrossTwoClasses("alpha");
+      const teacher = await signInAt(school.id, "teacher");
+
+      const res = await app.request("/balances/by-class", {
+        headers: tenantHeaders("alpha", teacher),
+      });
+
+      expect(res.status).toBe(403);
+    });
+  });
+
   describe("payments and balances", () => {
     async function billed(subdomain: string) {
       const s = await seed(subdomain);
