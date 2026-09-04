@@ -1,5 +1,6 @@
 import { readdir, readFile } from "node:fs/promises";
 import path from "node:path";
+import ts from "typescript";
 import { describe, expect, it } from "vitest";
 
 /**
@@ -74,8 +75,13 @@ async function sourceFiles(dir: string): Promise<string[]> {
   return found;
 }
 
-/** The connection module, however it is spelled: `@/db`, `../db`, `@/db/index`. */
-const DB_MODULE = String.raw`(?:@\/db|\.\.?\/(?:\.\.\/)*db)(?:\/index)?`;
+/**
+ * The connection module, however it is spelled.
+ *
+ * Anchored, unlike the pattern this replaced: `@/db/schema` and `@/lib/db-errors`
+ * are different modules and must not match.
+ */
+const DB_MODULE = /^(?:@\/db|\.\.?\/(?:\.\.\/)*db)(?:\/index)?$/;
 
 /**
  * Every export a namespace-style import reaches.
@@ -87,77 +93,170 @@ const DB_MODULE = String.raw`(?:@\/db|\.\.?\/(?:\.\.\/)*db)(?:\/index)?`;
  */
 const ALL_CONNECTIONS = ["default", "pool", "appDb", "appPool"] as const;
 
+/** The named exports that ARE a connection. `AppDb` is a type and reaches none. */
+const CONNECTION_EXPORTS = new Set(["pool", "appDb", "appPool"]);
+
 /**
- * Import specifiers pulled from `@/db` or a relative path to it.
+ * Connections a file reaches through `@/db`, classified from the syntax tree.
  *
- * Both static and dynamic forms. The specifier accepts an optional `/index`,
- * and the static clause is matched for a bare default, a `{ default as x }`
- * rename, a namespace import, and the named connections.
+ * This was a regular expression for four rounds, and was wrong in a new way
+ * each time — `@/db/index`, `{ default as ownerDb }`, `import{pool}from`, then
+ * dynamic imports. Each fix was correct and each time another form existed,
+ * because "which module does this file import, and what does it take from it"
+ * is a question about syntax, and a character stream does not have the answer.
+ * The parser does.
  *
- * Each of those was once a way through: `@/db/index` did not match the
- * specifier, `{ default as ownerDb }` matched neither the bare-default pattern
- * nor the named list, `import{pool}from` had no space to match on, and
- * `await import("@/db")` was not looked for at all. Any of them would have
- * handed a route the RLS-exempt connection with the guard green.
+ * What the change buys beyond the forms already found:
+ *
+ *   - a comment or a string that merely mentions an import is not an import,
+ *     so the guard stops reporting files that import nothing
+ *   - `import type { AppDb }` is erased at compile time and reaches no
+ *     connection, which the regex only got right by accident
+ *   - a template-literal specifier resolves like any other literal
+ *   - a specifier that is not literal at all cannot be resolved, so it FAILS
+ *     CLOSED — reported as reaching everything rather than waved through
+ *
+ * TypeScript is already a devDependency, so this costs nothing to run.
  */
-function dbImportsIn(source: string): string[] {
+function dbImportsIn(source: string, fileName = "probe.ts"): string[] {
   const names: string[] = [];
-  /*
-   * `import` may be followed by no whitespace at all — `import{pool}from"@/db"`
-   * is valid JavaScript, and requiring a space missed it. The lookahead is what
-   * keeps that from also matching the word `imported`: only whitespace, a
-   * brace, a star or a quote can follow the keyword in a real import.
-   *
-   * The clause is `[^;"']+?` with no `\s*` in front. Both would match
-   * whitespace, and a quantifier that can consume the same characters two ways
-   * backtracks polynomially on a hostile input. `+?` rather than `*?` because
-   * the lookahead already guarantees a character follows the keyword.
-   *
-   * `\bfrom` keeps an identifier like `fromCache` from ending the clause early;
-   * no closing `\b` is needed, since the `["']` that must follow provides it.
-   */
-  const staticPattern = new RegExp(
-    String.raw`\bimport(?=[\s{*"'])([^;"']+?)\bfrom\s*["']${DB_MODULE}["']`,
-    "g",
+  const tree = ts.createSourceFile(
+    fileName,
+    source,
+    ts.ScriptTarget.Latest,
+    // Parent pointers are not needed, and setting them costs memory per file.
+    false,
   );
 
-  for (const match of source.matchAll(staticPattern)) {
-    const clause = match[1];
-
-    // `import db from "@/db"` — the default export is the owner connection.
-    if (/^\s*\w+\s*(?:,|$)/.test(clause))
-      names.push("default");
-
-    // `import { default as ownerDb } from "@/db"` — the same thing, renamed.
-    if (/\bdefault\s+as\s+\w+/.test(clause))
-      names.push("default");
-
-    // `import * as dbMod from "@/db"` reaches every export through the object.
-    if (/^\s*\*\s*as\s+\w+/.test(clause))
-      names.push(...ALL_CONNECTIONS);
-
-    for (const named of clause.matchAll(/\b(pool|appDb|appPool)\b/g))
-      names.push(named[1]);
+  /** A specifier we can read, or null when it is computed at runtime. */
+  function literalSpecifier(node: ts.Expression): string | null {
+    // Covers both quote styles and a backtick with no substitutions —
+    // `import(\`@/db\`)` is as knowable as `import("@/db")`.
+    return ts.isStringLiteralLike(node) ? node.text : null;
   }
 
-  /*
-   * `await import("@/db")` — a dynamic import, and the last shape of this hole.
-   *
-   * It reaches the module the same way a namespace import does, so it is
-   * treated the same: every connection, regardless of what the caller
-   * destructures off it. Matching the destructuring instead would mean parsing
-   * the surrounding statement, and getting that wrong fails open.
-   *
-   * The lookahead on the static pattern above deliberately excludes `(`, so
-   * the two cannot both match the same text.
-   */
-  const dynamicPattern = new RegExp(
-    String.raw`\bimport\s*\(\s*["']${DB_MODULE}["']\s*\)`,
-    "g",
-  );
+  function visit(node: ts.Node): void {
+    // `import ... from "@/db"`
+    if (ts.isImportDeclaration(node)) {
+      const specifier = literalSpecifier(node.moduleSpecifier);
 
-  for (const _ of source.matchAll(dynamicPattern))
-    names.push(...ALL_CONNECTIONS);
+      if (specifier && DB_MODULE.test(specifier))
+        names.push(...staticImportNames(node.importClause));
+    }
+
+    /*
+     * `export { pool } from "@/db"` — a re-export.
+     *
+     * The file does not use the connection, but it hands it to anything that
+     * imports the file, which launders exactly the access the allowlist
+     * exists to account for.
+     */
+    if (ts.isExportDeclaration(node) && node.moduleSpecifier && !node.isTypeOnly) {
+      const specifier = literalSpecifier(node.moduleSpecifier);
+
+      if (specifier && DB_MODULE.test(specifier)) {
+        if (!node.exportClause || ts.isNamespaceExport(node.exportClause)) {
+          // `export * from` / `export * as m from` — everything.
+          names.push(...ALL_CONNECTIONS);
+        }
+        else {
+          for (const element of node.exportClause.elements) {
+            if (element.isTypeOnly)
+              continue;
+            const imported = (element.propertyName ?? element.name).text;
+            if (imported === "default")
+              names.push("default");
+            else if (CONNECTION_EXPORTS.has(imported))
+              names.push(imported);
+          }
+        }
+      }
+    }
+
+    // `await import("@/db")`
+    if (ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword) {
+      const [argument] = node.arguments;
+
+      if (argument) {
+        const specifier = literalSpecifier(argument);
+
+        if (specifier === null) {
+          /*
+           * A specifier assembled at runtime — `import(path)`, or a template
+           * with a substitution. What it resolves to cannot be known here, so
+           * it is treated as reaching everything.
+           *
+           * Failing closed is the whole point of a guard: a false positive
+           * costs an allowlist entry and an explanation, while a false
+           * negative hands a route the RLS-exempt connection silently.
+           */
+          names.push(...ALL_CONNECTIONS);
+        }
+        else if (DB_MODULE.test(specifier)) {
+          // A dynamic import yields the whole module namespace, so it takes
+          // everything regardless of what the caller destructures off it.
+          names.push(...ALL_CONNECTIONS);
+        }
+      }
+    }
+
+    ts.forEachChild(node, visit);
+  }
+
+  visit(tree);
+
+  return names;
+}
+
+/** What an import clause actually binds at runtime. */
+function staticImportNames(clause: ts.ImportClause | undefined): string[] {
+  /*
+   * `import "@/db"` with no clause binds nothing. It still runs the module —
+   * which builds the pools — but gives the importing file no way to reach a
+   * connection, so it is not what this guard is about.
+   */
+  if (!clause)
+    return [];
+
+  /*
+   * `import type { AppDb } from "@/db"` is erased before anything runs.
+   *
+   * This matters in practice rather than in principle: several handlers take
+   * the `AppDb` type from this module and are deliberately NOT allowlisted.
+   * Treating a type import as access would flag every one of them, and the
+   * fix people would reach for is adding them to the allowlist — which is how
+   * an allowlist stops meaning anything.
+   */
+  if (clause.isTypeOnly)
+    return [];
+
+  const names: string[] = [];
+
+  // `import db from "@/db"` — the default export is the owner connection.
+  if (clause.name)
+    names.push("default");
+
+  if (clause.namedBindings) {
+    if (ts.isNamespaceImport(clause.namedBindings)) {
+      // `import * as dbMod` reaches every export through the object.
+      names.push(...ALL_CONNECTIONS);
+    }
+    else {
+      for (const element of clause.namedBindings.elements) {
+        if (element.isTypeOnly)
+          continue;
+
+        // `{ default as ownerDb }` — propertyName is what was imported,
+        // name is what it was called locally.
+        const imported = (element.propertyName ?? element.name).text;
+
+        if (imported === "default")
+          names.push("default");
+        else if (CONNECTION_EXPORTS.has(imported))
+          names.push(imported);
+      }
+    }
+  }
 
   return names;
 }
@@ -215,8 +314,8 @@ describe("database access", () => {
       expect(present, `${entry} is allowlisted but does not exist`).toContain(entry);
   });
 
-  it("detects a violation when one is introduced", async () => {
-    // Guards the guard. A regex that silently stopped matching would make
+  it("detects a violation when one is introduced", () => {
+    // Guards the guard. A classifier that silently stopped matching would make
     // every assertion above pass while enforcing nothing.
     expect(dbImportsIn(`import db from "@/db";`)).toContain("default");
     expect(dbImportsIn(`import db, { pool } from "@/db";`)).toContain("pool");
@@ -226,50 +325,100 @@ describe("database access", () => {
   });
 
   it.each([
-    // Both of these reach the same module and used to match nothing.
     ["explicit /index", `import db from "@/db/index";`],
     ["named default rename", `import { default as ownerDb } from "@/db";`],
     ["named default rename via /index", `import { default as x } from "@/db/index";`],
     ["relative /index", `import db from "../db/index";`],
+    ["no whitespace", `import{default as d}from"@/db";`],
   ])("sees through %s", (_case, source) => {
     expect(dbImportsIn(source)).toContain("default");
   });
 
-  it("sees a named connection reached through /index", () => {
-    expect(dbImportsIn(`import { pool } from "@/db/index";`)).toContain("pool");
-    expect(dbImportsIn(`import { appDb } from "@/db/index";`)).toContain("appDb");
-  });
-
-  it("still ignores sibling modules that merely start with db", () => {
-    // `@/db/schema` and `@/db-errors` are not the connection module.
-    expect(dbImportsIn(`import { schools } from "@/db/schema";`)).toEqual([]);
-    expect(dbImportsIn(`import { pgErrorCode } from "@/lib/db-errors";`)).toEqual([]);
-  });
-
-  it("matches an import written without whitespace", () => {
-    // Valid JavaScript, and what a minifier or a deliberate bypass produces.
-    expect(dbImportsIn(`import{pool}from"@/db";`)).toContain("pool");
-    expect(dbImportsIn(`import{appDb}from'@/db/index';`)).toContain("appDb");
-    expect(dbImportsIn(`import{default as x}from"@/db";`)).toContain("default");
-  });
-
   it("treats a namespace import as taking everything", () => {
-    // `dbMod.default` and `dbMod.pool` are both reachable through it.
     const names = dbImportsIn(`import * as dbMod from "@/db";`);
     expect(names).toContain("default");
     expect(names).toContain("pool");
     expect(names).toContain("appDb");
   });
 
-  it("does not mistake an identifier ending in `import` for one", () => {
-    // The lookahead exists for this: allowing zero whitespace after the
-    // keyword must not start matching the middle of a longer word.
-    expect(dbImportsIn(`const imported = collectFrom("@/db");`)).toEqual([]);
-    expect(dbImportsIn(`reimported from "@/db"`)).toEqual([]);
+  it.each([
+    ["awaited default", `const { default: db } = await import("@/db");`],
+    ["awaited named", `const { pool } = await import("@/db");`],
+    ["via /index", `const m = await import("@/db/index");`],
+    ["relative", `const m = await import("../db");`],
+    ["no await", `const p = import("@/db");`],
+    ["single quotes", `await import('@/db')`],
+  ])("sees a dynamic import: %s", (_case, source) => {
+    const names = dbImportsIn(source);
+    expect(names).toContain("default");
+    expect(names).toContain("pool");
   });
 
-  it("is not confused by an identifier containing `from` in the clause", () => {
-    expect(dbImportsIn(`import { fromCache, pool } from "@/db";`)).toContain("pool");
+  it("resolves a template-literal specifier", () => {
+    // A backtick with no substitution is as knowable as a quote. The regex
+    // only looked for quotes, so this was a way through.
+    expect(dbImportsIn("const m = await import(`@/db`);")).toContain("default");
+    expect(dbImportsIn("import db from `@/db`;")).not.toEqual([]);
+  });
+
+  it.each([
+    ["an identifier", `const p = "@/db"; await import(p);`],
+    // Written as an escaped template so the `${` is data, not a substitution
+    // in this file.
+    ["a template with a substitution", `await import(\`@/\${name}\`);`],
+    ["a ternary", `await import(cond ? "@/db" : "@/db/schema");`],
+    ["a concatenation", `await import("@/" + "db");`],
+  ])("fails closed on a specifier computed at runtime: %s", (_case, source) => {
+    /*
+     * What it resolves to cannot be known from the syntax, so it is treated as
+     * reaching everything. A false positive costs an allowlist entry and an
+     * explanation; a false negative hands a route the RLS-exempt connection
+     * silently.
+     */
+    const names = dbImportsIn(source);
+    expect(names).toContain("default");
+    expect(names).toContain("pool");
+  });
+
+  it("does not treat a comment or a string as an import", () => {
+    /*
+     * The regex reported these, so a file whose only mention of the connection
+     * was a comment explaining why it must NOT be used got flagged — and the
+     * obvious way to quieten it is an allowlist entry, which is how an
+     * allowlist stops meaning anything.
+     */
+    expect(dbImportsIn(`// import db from "@/db"\nconst x = 1;`)).toEqual([]);
+    expect(dbImportsIn(`/* import { pool } from "@/db" */`)).toEqual([]);
+    expect(dbImportsIn(`const doc = 'import db from "@/db"';`)).toEqual([]);
+  });
+
+  it("ignores a type-only import, which reaches nothing at runtime", () => {
+    // Several handlers take the AppDb TYPE from this module and are
+    // deliberately not allowlisted; treating that as access would flag every
+    // one of them.
+    expect(dbImportsIn(`import type { AppDb } from "@/db";`)).toEqual([]);
+    expect(dbImportsIn(`import { type AppDb } from "@/db";`)).toEqual([]);
+    expect(dbImportsIn(`import { type AppDb, pool } from "@/db";`)).toEqual(["pool"]);
+  });
+
+  it("catches a re-export, which launders the connection onward", () => {
+    expect(dbImportsIn(`export { pool } from "@/db";`)).toContain("pool");
+    expect(dbImportsIn(`export { default } from "@/db";`)).toContain("default");
+    expect(dbImportsIn(`export * from "@/db";`)).toContain("default");
+    expect(dbImportsIn(`export type { AppDb } from "@/db";`)).toEqual([]);
+  });
+
+  it("ignores a bare side-effect import, which binds nothing", () => {
+    // It runs the module, but gives the importing file no way to reach a
+    // connection — which is not what this guard is about.
+    expect(dbImportsIn(`import "@/db";`)).toEqual([]);
+  });
+
+  it("still ignores sibling modules that merely start with db", () => {
+    expect(dbImportsIn(`import { schools } from "@/db/schema";`)).toEqual([]);
+    expect(dbImportsIn(`import { pgErrorCode } from "@/lib/db-errors";`)).toEqual([]);
+    expect(dbImportsIn(`await import("@/db/schema");`)).toEqual([]);
+    expect(dbImportsIn(`import { x } from "@/database";`)).toEqual([]);
   });
 
   it.each([
