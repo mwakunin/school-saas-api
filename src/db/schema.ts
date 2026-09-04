@@ -12,6 +12,7 @@ import {
   text,
   timestamp,
   unique,
+  uniqueIndex,
   uuid,
 } from "drizzle-orm/pg-core";
 
@@ -103,10 +104,22 @@ export const schools = pgTable("schools", {
   logoUrl: text(),
 
   // Per-tenant M-Pesa. Money NEVER routes through our account: each school
-  // collects on its own paybill (CLAUDE.md §5.8). Credentials are encrypted
-  // at rest — the encryption lands with the C2B work in step 5.
+  // collects on its own paybill (CLAUDE.md §5.8).
   mpesaShortcode: text(),
+  /** AES-256-GCM, `v1.iv.tag.ciphertext` — see lib/crypto.ts. Never returned. */
   mpesaCredentials: text(),
+  /**
+   * The school's own segment of the C2B confirmation URL.
+   *
+   * CLAUDE.md §5.8 resolves the tenant from the `shortcode` in the payload.
+   * That cannot work: the confirmation endpoint is unauthenticated and the
+   * shortcode is a public field an attacker supplies, so anyone could file
+   * fabricated payments against any school. The tenant comes from this token
+   * in the path instead — 256 bits, never published — and a payload whose
+   * shortcode disagrees with the school's is stored `rejected` rather than
+   * believed.
+   */
+  mpesaCallbackToken: text().unique(),
 
   // Percentage -> performance level cut points; schools differ.
   levelThresholds: jsonb()
@@ -563,12 +576,68 @@ export const invoiceLines = pgTable("invoice_lines", {
 ]);
 
 /**
+ * Everything Safaricom sent, exactly as sent. Append-only.
+ *
+ * This is half of what makes M-Pesa reconciliation trustworthy, and the
+ * separation from `payments` is the entire feature (CLAUDE.md §5.8). The
+ * webhook writes here and stops — it never guesses which child a payment
+ * belongs to, never allocates, and never rejects a reference it does not
+ * recognise. Matching happens afterwards, against a row that is already safe.
+ *
+ * Because the raw row is never rewritten, a mis-allocation is always
+ * reversible and "where did this KES 15,000 go" always has an answer. A
+ * trigger enforces that: only `status` and the review columns may change.
+ */
+export const mpesaTransactions = pgTable("mpesa_transactions", {
+  id: uuid().primaryKey().defaultRandom(),
+  schoolId: uuid().notNull().references(() => schools.id),
+
+  /**
+   * The Safaricom receipt number, e.g. `RKTQDM7W6S`.
+   *
+   * Unique across the whole table rather than per school, which is what makes
+   * the webhook idempotent: Safaricom retries a confirmation it did not see
+   * acknowledged, and a retry must not become a second payment. Receipts are
+   * globally unique in Safaricom's own numbering, so this cannot collide
+   * between two genuine transactions at different schools.
+   */
+  transactionId: text().notNull().unique(),
+
+  /** As Safaricom reported it. Checked against the school's own, not trusted. */
+  shortcode: text().notNull(),
+  /** What the parent actually typed. Frequently not an admission number. */
+  accountReference: text(),
+  msisdn: text().notNull(),
+  payerName: text(),
+  amountCents: integer().notNull(),
+  /** When Safaricom says the money moved, parsed from `TransTime` in EAT. */
+  transactedAt: timestamp({ withTimezone: true }).notNull(),
+  /** The whole envelope, so a field we did not model is still recoverable. */
+  rawPayload: jsonb().notNull(),
+
+  status: text()
+    .$type<"unmatched" | "allocated" | "rejected">()
+    .notNull()
+    .default("unmatched"),
+  /** Why a bursar set it aside, or why the system refused it. */
+  statusReason: text(),
+
+  receivedAt: timestamp({ withTimezone: true }).defaultNow().notNull(),
+}, t => [
+  unique("mpesa_transactions_school_id_id_key").on(t.schoolId, t.id),
+  // The reconciliation queue: unmatched first, oldest first.
+  index().on(t.schoolId, t.status),
+  index().on(t.schoolId, t.accountReference),
+  wholeShillingsPositive("mpesa_transactions_amount_whole", t.amountCents),
+]);
+
+/**
  * A ledger entry against a student.
  *
- * M-Pesa is one method among four. The reconciliation machinery that turns a
- * raw Daraja confirmation into one of these arrives in step 5; cash, bank and
- * cheque need none of it, and a bursar recording a cash receipt is the same
- * ledger entry either way.
+ * M-Pesa is one method among four, and the only one that is never entered by
+ * hand: an `mpesa` payment exists because a raw confirmation was matched to a
+ * child, so `mpesaTransactionId` points back at what Safaricom actually said.
+ * Cash, bank and cheque carry no such row and are recorded directly.
  */
 export const payments = pgTable("payments", {
   id: uuid().primaryKey().defaultRandom(),
@@ -577,6 +646,8 @@ export const payments = pgTable("payments", {
   /** Null = a credit on account, not yet applied to a particular term. */
   invoiceId: uuid(),
   method: text().$type<"mpesa" | "bank" | "cash" | "cheque">().notNull(),
+  /** The raw confirmation this came from, for an `mpesa` payment. */
+  mpesaTransactionId: uuid(),
   amountCents: integer().notNull(),
   reference: text(),
   recordedBy: userRef("recorded_by").references(() => user.id),
@@ -609,12 +680,42 @@ export const payments = pgTable("payments", {
     foreignColumns: [invoices.schoolId, invoices.id, invoices.studentId],
     name: "payments_school_invoice_student_fk",
   }),
+  foreignKey({
+    columns: [t.schoolId, t.mpesaTransactionId],
+    foreignColumns: [mpesaTransactions.schoolId, mpesaTransactions.id],
+    name: "payments_school_mpesa_transaction_fk",
+  }),
   index().on(t.schoolId, t.studentId),
   index().on(t.schoolId, t.invoiceId),
+  /*
+   * At most one LIVE payment per confirmation.
+   *
+   * A plain unique would be wrong: reversing a mis-allocated payment leaves
+   * the row in place (rule 5), so it would hold the confirmation hostage and
+   * the money could never be re-allocated to the right child — which is the
+   * whole recovery path. Partial on `reversed_at IS NULL`, so a reversed
+   * payment releases the transaction while staying on the record.
+   *
+   * What it does prevent is the realistic mistake: a bursar double-clicking
+   * "allocate" and crediting one M-Pesa receipt to two families.
+   */
+  uniqueIndex("payments_one_live_per_mpesa_transaction")
+    .on(t.mpesaTransactionId)
+    .where(sql`${t.reversedAt} IS NULL`),
   wholeShillingsPositive("payments_amount_whole", t.amountCents),
   check(
     "payments_reversal_has_reason",
     sql`(${t.reversedAt} IS NULL) = (${t.reversalReason} IS NULL)`,
+  ),
+  /*
+   * `mpesa` is the one method that cannot be entered by hand. A payment with
+   * that method must point at the confirmation it came from, and a payment
+   * with any other method must not — otherwise "this money came from
+   * Safaricom" stops being checkable.
+   */
+  check(
+    "payments_mpesa_has_transaction",
+    sql`(${t.method} = 'mpesa') = (${t.mpesaTransactionId} IS NOT NULL)`,
   ),
 ]);
 
@@ -640,6 +741,7 @@ export const TENANT_TABLES = [
   "invoices",
   "invoice_lines",
   "payments",
+  "mpesa_transactions",
 ] as const;
 
 // ---------------------------------------------------------------------------
@@ -755,6 +857,17 @@ export const paymentsRelations = relations(payments, ({ one }) => ({
   student: one(students, { fields: [payments.studentId], references: [students.id] }),
   invoice: one(invoices, { fields: [payments.invoiceId], references: [invoices.id] }),
   recordedByUser: one(user, { fields: [payments.recordedBy], references: [user.id] }),
+  mpesaTransaction: one(mpesaTransactions, {
+    fields: [payments.mpesaTransactionId],
+    references: [mpesaTransactions.id],
+  }),
+}));
+
+export const mpesaTransactionsRelations = relations(mpesaTransactions, ({ one }) => ({
+  school: one(schools, {
+    fields: [mpesaTransactions.schoolId],
+    references: [schools.id],
+  }),
 }));
 
 export const enrollmentsRelations = relations(enrollments, ({ one }) => ({

@@ -22,6 +22,7 @@ import {
   recomputeInvoiceTotal,
 } from "@/lib/balances";
 import { isForeignKeyViolation, isUniqueViolation } from "@/lib/db-errors";
+import { releaseReversedTransaction } from "@/lib/mpesa-matching";
 
 import type {
   AddItemRoute,
@@ -731,13 +732,31 @@ export const reversePayment: TenantRouteHandler<ReversePaymentRoute> = async (c)
     );
   }
 
-  // Reversed, not deleted: "where did this KES 15,000 go" has to stay
-  // answerable, and the row is the only thing that can answer it.
-  const [updated] = await db
-    .update(payments)
-    .set({ reversedAt: new Date(), reversalReason: reason })
-    .where(eq(payments.id, id))
-    .returning();
+  const updated = await db.transaction(async (tx) => {
+    // Reversed, not deleted: "where did this KES 15,000 go" has to stay
+    // answerable, and the row is the only thing that can answer it.
+    const [row] = await tx
+      .update(payments)
+      .set({ reversedAt: new Date(), reversalReason: reason })
+      .where(eq(payments.id, id))
+      .returning();
+
+    /*
+     * An M-Pesa payment reversed is a confirmation back in the queue.
+     *
+     * This is the pair that makes a mis-allocation recoverable: the payment
+     * stays on the record as reversed, and the money Safaricom really sent
+     * becomes allocatable again. Without it the confirmation would read
+     * `allocated` for ever while no live payment existed — money that arrived,
+     * was acknowledged, and now belongs to nobody.
+     *
+     * Same transaction as the reversal, so the two can never disagree.
+     */
+    if (row.mpesaTransactionId)
+      await releaseReversedTransaction(tx, row.mpesaTransactionId);
+
+    return row;
+  });
 
   return c.json(updated, HttpStatusCodes.OK);
 };

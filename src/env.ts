@@ -16,12 +16,22 @@ expand(config({
  * land. They're optional in dev and test so the API boots without them, but
  * required in production — enforced in the superRefine below.
  */
+/**
+ * Credentials production cannot run without.
+ *
+ * The platform-level `MPESA_CONSUMER_KEY` / `SECRET` / `SHORTCODE` / `PASSKEY`
+ * are deliberately NOT here. They belong to the dormant STK-push client, and
+ * under C2B every school transacts on its own paybill with its own credentials
+ * (CLAUDE.md §5.8) — money never routes through our account. Requiring them
+ * would make an operator invent values for a feature that is switched off, and
+ * config nobody can explain is config nobody maintains.
+ *
+ * What production does need is the key those per-school credentials are
+ * encrypted under, and the origin Safaricom posts confirmations back to.
+ */
 const PRODUCTION_REQUIRED = [
-  "MPESA_CONSUMER_KEY",
-  "MPESA_CONSUMER_SECRET",
-  "MPESA_SHORTCODE",
-  "MPESA_PASSKEY",
-  "MPESA_CALLBACK_URL",
+  "CREDENTIALS_ENCRYPTION_KEY",
+  "MPESA_C2B_BASE_URL",
   "RESEND_API_KEY",
   "RESEND_FROM_EMAIL",
   "IMAGEKIT_PUBLIC_KEY",
@@ -96,6 +106,31 @@ const EnvSchema = z.object({
    * when empty the endpoint relies on its other checks instead.
    */
   MPESA_CALLBACK_ALLOWED_IPS: z.string().optional(),
+
+  /**
+   * Base64 of 32 random bytes, encrypting each school's Daraja credentials.
+   *
+   * A leak of `schools.mpesa_credentials` is a leak of every tenant's ability
+   * to transact on their own paybill, so it is encrypted at rest rather than
+   * merely access-controlled — a backup or a replica must not be enough.
+   *
+   * Generate with:
+   *   node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"
+   *
+   * Required in production. Optional in dev and test so the API boots without
+   * it; anything that actually touches a credential fails with an explanation
+   * at that point instead.
+   */
+  CREDENTIALS_ENCRYPTION_KEY: z.string().optional(),
+
+  /**
+   * The public base URL Safaricom posts C2B confirmations to.
+   *
+   * Each school gets its own unguessable path underneath it, so this is the
+   * origin only — `https://api.example.co.ke`. Must be HTTPS and reachable
+   * from the internet; use a tunnel in development.
+   */
+  MPESA_C2B_BASE_URL: z.url().optional(),
 
   /**
    * How many of your own proxies sit in front of the app.
