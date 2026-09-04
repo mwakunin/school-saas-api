@@ -62,6 +62,7 @@ These are load-bearing. Do not deviate without discussion.
 8. **Say CBE, not CBC**, in table names, code, and all UI copy. The rename came out of the Presidential Working Party on Education Reform.
 9. **Dates are `date`; instants are `timestamp`.** Term boundaries are dates. Payment receipt is a timestamp.
 10. **Phone numbers stored E.164** (`+2547...`). Normalise on write.
+11. **A `.$type<"a" | "b">()` column carries a matching `CHECK`.** The type constrains this codebase and nothing else — the column is `text`, and a seed, a backfill or a hand-run correction can put anything in it. The resulting failure is silent rather than loud: an unrecognised value is not a crash, it is a row that stops matching filters, so a pupil whose status is neither `active` nor `withdrawn` is missing from the register and the leavers' list at once. Declare it with `oneOf(...)` in the table's extras; `db/enum-checks.test.ts` fails the build on a column that has the union and not the constraint, on a constraint whose values have drifted from it, and on one declared in `schema.ts` that no migration ever applied.
 
 ---
 

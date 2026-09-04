@@ -79,6 +79,51 @@ export function wholeShillingsPositive(name: string, column: unknown) {
 }
 
 /**
+ * A text column restricted to a known set of values.
+ *
+ * `.$type<"a" | "b">()` is a TypeScript fiction: it constrains what this
+ * codebase can assign and nothing else. The database will take any string, so
+ * a seed, a migration, a backfill or a hand-run correction can put a value in
+ * that every switch in the app silently falls through — and the failure is
+ * quiet, because an unrecognised status is not a crash, it is a row that stops
+ * matching filters. A withdrawn pupil who is neither active nor withdrawn
+ * simply stops appearing.
+ *
+ * `pgEnum` is the other way to say this, and `performance_level` uses it. The
+ * difference that matters here is evolution: adding a value to an enum type is
+ * `ALTER TYPE ... ADD VALUE`, which cannot then be used in the same
+ * transaction, while a CHECK is dropped and re-added in one ordinary
+ * migration. These sets change with the product — a fifth payment method, a
+ * sixth assessment kind — so the constraint that is cheap to change is the
+ * right one.
+ *
+ * NULL passes a CHECK, so a nullable column needs no special case; the column
+ * definition is what decides whether the value may be absent.
+ */
+export function oneOf(name: string, column: unknown, values: readonly string[]) {
+  /*
+   * `sql.raw`, and the guard that makes it safe.
+   *
+   * An interpolated `sql`${value}`` is a BIND PARAMETER, not a literal — which
+   * is right for a query and wrong for DDL. drizzle-kit rendered the first
+   * version of this as `IN ($1, $2)`, a migration that cannot run. A constraint
+   * definition has to carry the values themselves.
+   *
+   * Nothing here is user input; every set is written in this file. The guard is
+   * so that stays true — a value with a quote in it would otherwise end up
+   * concatenated into DDL, and this is the one place in the codebase where that
+   * could happen.
+   */
+  for (const value of values) {
+    if (!/^[a-z_]+$/.test(value))
+      throw new Error(`oneOf(${name}): unexpected value ${JSON.stringify(value)}`);
+  }
+
+  const list = values.map(v => `'${v}'`).join(", ");
+  return check(name, sql`${column} IN (${sql.raw(list)})`);
+}
+
+/**
  * A foreign key to the Better Auth user table.
  *
  * `text`, NOT `uuid`. Better Auth generates its own string ids and declares
@@ -137,7 +182,12 @@ export const schools = pgTable("schools", {
     .notNull(),
 
   createdAt: createdAt(),
-});
+}, t => [
+  // `suspended` is what stops a non-payer's tenant resolving at all, so a
+  // status this table does not recognise is a school that is neither serving
+  // nor stopped.
+  oneOf("schools_status_known", t.status, ["trial", "active", "suspended", "demo"]),
+]);
 
 /**
  * Which people may act at which school, and as what.
@@ -160,6 +210,10 @@ export const memberships = pgTable("memberships", {
   unique().on(t.userId, t.schoolId, t.role),
   // The lookup every single tenant request makes.
   index().on(t.userId, t.schoolId),
+  // `requireMembershipRole` compares against these four. A fifth string is a
+  // person who passes no role check and fails every one, at a school that
+  // thinks they are staff.
+  oneOf("memberships_role_known", t.role, ["admin", "bursar", "teacher", "guardian"]),
 ]);
 
 // ---------------------------------------------------------------------------
@@ -232,6 +286,9 @@ export const gradeLevels = pgTable("grade_levels", {
   unique().on(t.schoolId, t.sequence),
   unique("grade_levels_school_id_id_key").on(t.schoolId, t.id),
   check("grade_levels_sequence_valid", sql`${t.sequence} BETWEEN 1 AND 9`),
+  // Filtered on rather than the grade number (CLAUDE.md §5.2), so a third
+  // value is a grade whose learning areas nothing selects.
+  oneOf("grade_levels_phase_known", t.phase, ["primary", "junior"]),
 ]);
 
 /** The yearly instance — "Grade 4 Blue, 2026" — which holds actual children. */
@@ -318,6 +375,22 @@ export const students = pgTable("students", {
   // without a UPI yet do not collide.
   unique().on(t.schoolId, t.upiNumber),
   unique("students_school_id_id_key").on(t.schoolId, t.id),
+  // Nullable — plenty of admission forms leave it blank, and a CHECK passes
+  // on NULL. What it refuses is a third spelling of the two it knows.
+  oneOf("students_sex_known", t.sex, ["male", "female"]),
+  /*
+   * Nothing hard-deletes (CLAUDE.md §3 rule 5), so this column is the ONLY
+   * thing separating a pupil who left from one who is here. An unrecognised
+   * status is a child who is neither: absent from the active register, absent
+   * from the leavers' list, and still countable in a fee run.
+   */
+  oneOf("students_status_known", t.status, [
+    "active",
+    "transferred_out",
+    "graduated",
+    "withdrawn",
+    "deceased",
+  ]),
   // "Find all the Wanjikus" is a query bursars run constantly.
   index().on(t.schoolId, t.familyName),
   // A child cannot leave before they arrived.
@@ -412,6 +485,9 @@ export const enrollments = pgTable("enrollments", {
   endedOn: date(),
 }, t => [
   unique("enrollments_school_id_id_key").on(t.schoolId, t.id),
+  // Picks which fee structure a child is billed from, so a third value is an
+  // enrolment no invoice run can price.
+  oneOf("enrollments_boarding_status_known", t.boardingStatus, ["day", "boarder"]),
   foreignKey({
     columns: [t.schoolId, t.studentId],
     foreignColumns: [students.schoolId, students.id],
@@ -452,6 +528,9 @@ export const feeStructures = pgTable("fee_structures", {
 }, t => [
   unique().on(t.termId, t.gradeLevelId, t.boardingStatus),
   unique("fee_structures_school_id_id_key").on(t.schoolId, t.id),
+  // The other half of that pairing: a structure nothing matches is fees a
+  // school entered and no child is ever charged.
+  oneOf("fee_structures_boarding_status_known", t.boardingStatus, ["day", "boarder"]),
   foreignKey({
     columns: [t.schoolId, t.termId],
     foreignColumns: [terms.schoolId, terms.id],
@@ -631,6 +710,13 @@ export const mpesaTransactions = pgTable("mpesa_transactions", {
   index().on(t.schoolId, t.status),
   index().on(t.schoolId, t.accountReference),
   wholeShillingsPositive("mpesa_transactions_amount_whole", t.amountCents),
+  /*
+   * The reconciliation queue is `status = 'unmatched'`, and the immutability
+   * trigger lets this column be one of the two things a bursar may change. A
+   * fourth value is real money that has arrived, is attributed to nobody, and
+   * appears in no queue for anyone to notice.
+   */
+  oneOf("mpesa_transactions_status_known", t.status, ["unmatched", "allocated", "rejected"]),
 ]);
 
 /**
@@ -661,6 +747,10 @@ export const payments = pgTable("payments", {
   createdAt: createdAt(),
 }, t => [
   unique("payments_school_id_id_key").on(t.schoolId, t.id),
+  // How a family paid is what a bursar reconciles against — the M-Pesa
+  // statement, the bank slip, the cash book. A method belonging to none of
+  // them cannot be checked against anything.
+  oneOf("payments_method_known", t.method, ["mpesa", "bank", "cash", "cheque"]),
   foreignKey({
     columns: [t.schoolId, t.studentId],
     foreignColumns: [students.schoolId, students.id],
@@ -838,6 +928,14 @@ export const assessments = pgTable("assessments", {
   publishedAt: timestamp({ withTimezone: true }),
 }, t => [
   unique("assessments_school_id_id_key").on(t.schoolId, t.id),
+  oneOf("assessments_kind_known", t.kind, [
+    "exam",
+    "cat",
+    "project",
+    "practical",
+    "observation",
+    "national",
+  ]),
   foreignKey({
     columns: [t.schoolId, t.termId],
     foreignColumns: [terms.schoolId, terms.id],
@@ -954,6 +1052,9 @@ export const scoreAttachments = pgTable("score_attachments", {
     name: "score_attachments_school_score_fk",
   }),
   index().on(t.schoolId, t.assessmentScoreId),
+  // Decides how a screen renders the artefact. An unknown kind is portfolio
+  // evidence a teacher uploaded and nothing knows how to show.
+  oneOf("score_attachments_kind_known", t.kind, ["image", "audio", "video", "document"]),
 ]);
 
 // ---------------------------------------------------------------------------
@@ -1031,10 +1132,11 @@ export const termResults = pgTable("term_results", {
    * door: a backfill, a manual correction, or a fourth rule added to the
    * enum without a migration.
    */
-  check(
-    "term_results_level_reduction_known",
-    sql`${t.levelReduction} IN ('mode_ties_low', 'mode_ties_high', 'lowest')`,
-  ),
+  oneOf("term_results_level_reduction_known", t.levelReduction, [
+    "mode_ties_low",
+    "mode_ties_high",
+    "lowest",
+  ]),
 ]);
 
 /**
