@@ -20,6 +20,7 @@ router
   .openapi(routes.listAcademicYears, handlers.listAcademicYears)
   .openapi(routes.createAcademicYear, handlers.createAcademicYear)
   .openapi(routes.listTerms, handlers.listTerms)
+  .openapi(routes.createTerm, handlers.createTerm)
   .openapi(routes.updateTerm, handlers.updateTerm)
   .openapi(routes.listGradeLevels, handlers.listGradeLevels)
   .openapi(routes.listStreams, handlers.listStreams)

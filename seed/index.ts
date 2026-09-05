@@ -11,6 +11,8 @@ import { seedStudents } from "./03-students";
 import { seedHistory } from "./04-history";
 import { seedFees } from "./05-fees";
 import { seedCurrentTerm } from "./06-current";
+import { seedLeavers } from "./07-leavers";
+import { seedMessaging } from "./08-messaging";
 import { TERM_DATES } from "./lib/calendar";
 import { DEMO_PASSWORD } from "./lib/client";
 
@@ -31,6 +33,14 @@ export interface SeedSummary {
   subdomain: string;
   /** The term in progress, for callers that need to ask about it. */
   currentTermId: string;
+  /**
+   * This year's finished terms, oldest first.
+   *
+   * Ids rather than numbers: the demo now has a previous year too, so "term 3"
+   * names two different terms and anything matching on the number alone picks
+   * whichever sorts first.
+   */
+  finishedTermIds: string[];
   logins: Array<{ role: string; email: string; password: string }>;
   terms: typeof TERM_DATES;
   pupils: number;
@@ -39,6 +49,12 @@ export interface SeedSummary {
   reportCards: number;
   invoices: number;
   unmatched: number;
+  certificates: number;
+  graduated: number;
+  auditEntries: number;
+  /** The receipt the seed deliberately reverses. */
+  reversedReceiptCode: string | null;
+  smsQueued: number;
   /** The guardians with a child in more than one class. */
   siblingGuardianIds: string[];
   /** The arrears meant to make a head wince. */
@@ -79,12 +95,24 @@ export async function seedDemo(): Promise<SeedSummary> {
   log("the term in progress");
   const current = await seedCurrentTerm(ctx, curriculum, register);
 
+  log("last year's leavers and their certificates");
+  const leavers = await seedLeavers(ctx, curriculum, register);
+
+  log("a fee-reminder batch");
+  const messaging = await seedMessaging(ctx);
+
+  // Read back rather than counted as we go: the log is written by the handlers
+  // themselves, so anything this claims has to come from the same place a head
+  // would read it.
+  const audit = await ctx.api("head").get("/audit-log?limit=1");
+
   const shillings = (cents: number) =>
     `KES ${(cents / 100).toLocaleString("en-KE")}`;
 
   return {
     subdomain: ctx.subdomain,
     currentTermId: ctx.terms.find(t => t.number === 3)!.id,
+    finishedTermIds: ctx.terms.filter(t => t.number < 3).map(t => t.id),
     logins: Object.entries(LOGINS).map(([role, login]) => ({
       role,
       email: login.email,
@@ -93,10 +121,17 @@ export async function seedDemo(): Promise<SeedSummary> {
     terms: TERM_DATES,
     pupils: register.pupils.length,
     streams: ctx.streams.length,
-    assessments: history.assessments + current.published + 1,
+    // Every one of them, including last year's — a printed figure that is
+    // quietly short is worse than no figure.
+    assessments: history.assessments + current.published + 1 + leavers.assessments,
     reportCards: history.reportCards,
     invoices: fees.invoicesGenerated,
     unmatched: fees.stillUnmatched,
+    certificates: leavers.certificatesIssued,
+    graduated: leavers.graduated,
+    auditEntries: audit.total,
+    reversedReceiptCode: fees.reversedReceiptCode,
+    smsQueued: messaging.sent,
     siblingGuardianIds: register.siblingGroups.map(g => g.guardianId),
     alarmingBalanceCents: fees.alarming.balanceCents,
 
@@ -128,6 +163,33 @@ export async function seedDemo(): Promise<SeedSummary> {
       ``,
       `Search the register for one of the sibling families. Two children, one guardian,`,
       `  one phone number, one fee reminder.`,
+      ``,
+      `Scan the QR on a report card, or open this certificate's link on a phone:`,
+      `  ${leavers.sample.verificationUrl}`,
+      `  It confirms ${leavers.sample.studentName}'s ${leavers.sample.milestone} against the`,
+      `  frozen document. Change a mark behind it and check again: it does not move.`,
+      ...(fees.reversedReceiptCode
+        ? [
+            ``,
+            `Then verify the reversed receipt: /verify/${fees.reversedReceiptCode}`,
+            `  It answers "withdrawn", not merely authentic — the paper is real and`,
+            `  the money is not on the account. That is usually why somebody is checking.`,
+          ]
+        : []),
+      ``,
+      `Open the audit log as the head. ${audit.total} entries, including who reversed`,
+      `  that payment and why. The bursar cannot open this screen, and neither the`,
+      `  app nor a compromised handler can edit it — the runtime role has no UPDATE.`,
+      ``,
+      messaging.dryRun
+        ? `SMS: the Grade 8 reminder was PREVIEWED, not sent — ${messaging.previewed} families,`
+        : `SMS: ${messaging.sent} Grade 8 reminders sent, costing about`,
+      messaging.dryRun
+        ? `  about KES ${(messaging.estimatedCostCents / 100).toFixed(2)}. Set AT_USERNAME/AT_API_KEY`
+        + ` (AT_ENV=sandbox) to populate the ledger.`
+        : `  KES ${(messaging.estimatedCostCents / 100).toFixed(2)}. Every message is a row with its own cost.`,
+      `  The preview is the DEFAULT: sending is what you opt into, because four`,
+      `  hundred delivered messages cannot be recalled.`,
       ``,
       `NOT YET DEMONSTRABLE: the parent portal. The parent login is a real`,
       `  guardian membership, but no route serves a guardian their own child's`,

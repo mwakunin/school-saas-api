@@ -64,6 +64,27 @@ export const createAcademicYearSchema = toZodV4SchemaTyped(
  * and there is no legitimate reason to do it. Create and delete are likewise
  * absent — a Kenyan school year has exactly three terms, seeded at onboarding.
  */
+/**
+ * A term for a year the school is setting up itself.
+ *
+ * Onboarding seeds three terms for the FIRST year and nothing after that, so
+ * without this a school reaching its second year had no way to create a
+ * calendar at all — every route that takes a `termId` would have had nothing to
+ * point at. The seed found it by trying to build a previous year.
+ */
+export const createTermSchema = toZodV4SchemaTyped(
+  z.object({
+    academicYearId: z.uuid(),
+    number: z.number().int().min(1).max(3),
+    startsOn: z.iso.date(),
+    endsOn: z.iso.date(),
+    isCurrent: z.boolean().default(false),
+  }).refine(
+    v => v.endsOn > v.startsOn,
+    { message: "A term has to end after it starts", path: ["endsOn"] },
+  ),
+);
+
 export const updateTermSchema = toZodV4SchemaTyped(
   z.object({
     startsOn: z.iso.date().optional(),

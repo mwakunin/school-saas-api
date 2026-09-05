@@ -82,6 +82,8 @@ const FEE_PLANS: FeePlan[] = [
 
 export interface FeesResult {
   invoicesGenerated: number;
+  /** The receipt a presenter can scan to see a withdrawn document. */
+  reversedReceiptCode: string | null;
   paymentsRecorded: number;
   confirmationsReceived: number;
   autoAllocated: number;
@@ -438,6 +440,31 @@ export async function seedFees(
    * the whole school and this read the first row of it. The demo then advised
    * chasing a family KES 1,500 in CREDIT.
    */
+  /*
+   * One payment reversed, because it is three demonstrations in one act.
+   *
+   * It puts a `payment.reversed` entry in the audit log with a person and a
+   * reason attached; it makes that family's receipt verify as `withdrawn`
+   * rather than merely authentic; and it returns the Safaricom confirmation to
+   * the reconciliation queue, which is the half of "mis-allocation is always
+   * reversible" that is otherwise only a claim.
+   */
+  const { payments: mpesaPayments } = await bursar.get(
+    "/payments?limit=200",
+  );
+  const reversible = mpesaPayments.find(
+    (p: { method: string; reversedAt: string | null }) =>
+      p.method === "mpesa" && !p.reversedAt,
+  );
+
+  let reversedReceiptCode: string | null = null;
+  if (reversible) {
+    const reversed = await bursar.post(`/payments/${reversible.id}/reverse`, {
+      reason: "Allocated to the wrong child — the reference was a sibling's.",
+    });
+    reversedReceiptCode = reversed.verificationCode ?? null;
+  }
+
   const { balances } = await bursar.get(
     `/balances?streamId=${alarmingPupil.streamId}&limit=500`,
   );
@@ -454,6 +481,7 @@ export async function seedFees(
 
   return {
     invoicesGenerated,
+    reversedReceiptCode,
     paymentsRecorded,
     confirmationsReceived,
     autoAllocated,

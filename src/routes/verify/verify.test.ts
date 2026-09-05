@@ -5,7 +5,7 @@ import type { TestUser } from "@/test/helpers";
 
 import app from "@/app";
 import db from "@/db";
-import { learningAreas, payments, reportCards } from "@/db/schema";
+import { learningAreas, payments } from "@/db/schema";
 import {
   makeSchool,
   makeStream,

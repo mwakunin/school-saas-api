@@ -27,6 +27,8 @@ export interface SeededPupil {
   streamId: string;
   gradeSequence: number;
   enrollmentId: string;
+  /** Last year's placement, for the children who came up a grade. */
+  priorEnrollmentId?: string;
   boardingStatus: "day" | "boarder";
 }
 
@@ -91,6 +93,17 @@ export async function seedStudents(ctx: SchoolContext): Promise<Register> {
       const ageYears = 5 + stream.sequence;
       const dateOfBirth = day(-(ageYears * 365 + rng.int(0, 364)));
 
+      /*
+       * Grade 7 children came UP from Grade 6 here last year.
+       *
+       * Enrolled in last year's class first and then moved, which is the only
+       * order the API allows — `POST /enrollments` opens a new placement and
+       * closes the old one, so history is written forwards, not back-dated.
+       * That is also what a school does, and it gives the demo a real
+       * progression: the same child, two classes, one certificate between them.
+       */
+      const cameUpFromGradeSix = stream.sequence === 7;
+
       const student = await office.post("/students", {
         admissionNumber,
         givenName: name.givenName,
@@ -102,11 +115,30 @@ export async function seedStudents(ctx: SchoolContext): Promise<Register> {
         // the intake year in the admission number true rather than decorative.
         admittedOn: day(TERM_OFFSETS[0].startsOn - (stream.sequence - 1) * 365),
         enrollment: {
+          streamId: cameUpFromGradeSix ? ctx.priorYear.gradeSixStreamId : stream.id,
+          boardingStatus,
+          startedOn: cameUpFromGradeSix
+            ? ctx.priorYear.startsOn
+            : day(TERM_OFFSETS[0].startsOn),
+        },
+      });
+
+      let enrollmentId = student.currentEnrollment.id;
+      let priorEnrollmentId: string | undefined;
+
+      if (cameUpFromGradeSix) {
+        priorEnrollmentId = enrollmentId;
+
+        // The overlap constraint refuses two enrolments covering one day, so
+        // last year has to be closed as this one opens.
+        const promoted = await office.post(`/students/${student.id}/enrollments`, {
           streamId: stream.id,
           boardingStatus,
           startedOn: day(TERM_OFFSETS[0].startsOn),
-        },
-      });
+          previousEndedOn: ctx.priorYear.endsOn,
+        });
+        enrollmentId = promoted.currentEnrollment.id;
+      }
 
       const pupil: SeededPupil = {
         id: student.id,
@@ -114,7 +146,8 @@ export async function seedStudents(ctx: SchoolContext): Promise<Register> {
         name,
         streamId: stream.id,
         gradeSequence: stream.sequence,
-        enrollmentId: student.currentEnrollment.id,
+        enrollmentId,
+        priorEnrollmentId,
         boardingStatus,
       };
 

@@ -38,7 +38,21 @@ let summary: SeedSummary;
  * which is the first thing anybody does with a demo and the last thing a
  * fixture-based seed would catch.
  */
+/*
+ * One sign-in per role, held for the file.
+ *
+ * Signing in per test blew the auth rate limit (10 a minute, by design) once
+ * this file grew past ten assertions — and the failure looked like a broken
+ * seed rather than a throttle. Reusing the session is what a real client does
+ * anyway.
+ */
+const sessions = new Map<keyof typeof LOGINS, ReturnType<typeof schoolApi>>();
+
 async function accessAs(as: keyof typeof LOGINS) {
+  const held = sessions.get(as);
+  if (held)
+    return held;
+
   const signIn = await app.request("/api/auth/sign-in/email", {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -56,7 +70,9 @@ async function accessAs(as: keyof typeof LOGINS) {
     .map(c => c.split(";")[0].trim())
     .join("; ");
 
-  return schoolApi(SUBDOMAIN, cookie);
+  const api = schoolApi(SUBDOMAIN, cookie);
+  sessions.set(as, api);
+  return api;
 }
 
 describe("the demo tenant", () => {
@@ -143,11 +159,8 @@ describe("the demo tenant", () => {
 
     it("keeps a half-entered assessment away from the term mean", async () => {
       const head = await accessAs("head");
-      const current = summary.terms.find(t => t.isCurrent)!;
-      const terms = await head.get("/terms");
-      const termId = terms.find((t: { number: number }) => t.number === current.number).id;
 
-      const all = await head.get(`/assessments?termId=${termId}`);
+      const all = await head.get(`/assessments?termId=${summary.currentTermId}`);
       const unpublished = all.filter((a: { publishedAt: string | null }) => !a.publishedAt);
 
       // §8: "One assessment with publishedAt null, to show parents don't see
@@ -179,11 +192,10 @@ describe("the demo tenant", () => {
 
     it("bills two children in one class different amounts", async () => {
       const head = await accessAs("head");
-      const current = summary.terms.find(t => t.isCurrent)!;
-      const terms = await head.get("/terms");
-      const termId = terms.find((t: { number: number }) => t.number === current.number).id;
 
-      const { invoices } = await head.get(`/invoices?termId=${termId}&limit=200`);
+      const { invoices } = await head.get(
+        `/invoices?termId=${summary.currentTermId}&limit=200`,
+      );
       const totals = new Set(invoices.map((i: { totalCents: number }) => i.totalCents));
 
       /*
@@ -237,10 +249,7 @@ describe("the demo tenant", () => {
 
     it("has released report cards a parent can already read", async () => {
       const head = await accessAs("head");
-      const finished = summary.terms.filter(t => !t.isCurrent)[0];
-      const terms = await head.get("/terms");
-      const termId = terms.find((t: { number: number }) => t.number === finished.number).id;
-      const cards = await head.get(`/report-cards?termId=${termId}`);
+      const cards = await head.get(`/report-cards?termId=${summary.finishedTermIds[0]}`);
 
       expect(cards.length).toBeGreaterThan(20);
       const released = cards.filter((c: { releasedAt: string | null }) => c.releasedAt);
@@ -249,16 +258,77 @@ describe("the demo tenant", () => {
 
     it("froze a position and a level into each one", async () => {
       const head = await accessAs("head");
-      const finished = summary.terms.filter(t => !t.isCurrent)[0];
-      const terms = await head.get("/terms");
-      const termId = terms.find((t: { number: number }) => t.number === finished.number).id;
-      const [card] = await head.get(`/report-cards?termId=${termId}`);
+      const [card] = await head.get(`/report-cards?termId=${summary.finishedTermIds[0]}`);
       const detail = await head.get(`/report-cards/${card.id}`);
 
       // Everything printed comes from the snapshot, never a fresh computation
       // (rule 7) — so this is what "reprinting in 2028" will read.
       expect(detail.snapshot.learningAreas.length).toBeGreaterThan(0);
       expect(detail.snapshot.levelReduction).toBeDefined();
+    });
+  });
+
+  describe("the documents and the trail", () => {
+    it("issues certificates for both CBE milestones", async () => {
+      const head = await accessAs("head");
+      const certificates = await head.get("/transition-certificates");
+
+      /*
+       * These can only exist because the seed builds a PREVIOUS year. The
+       * current one is mid-term-3 by design, and a certificate cannot be
+       * issued before its term has ended — so without last year the feature
+       * would be invisible in the one place anyone looks at it.
+       */
+      expect(summary.certificates).toBeGreaterThan(20);
+      const milestones = new Set(
+        certificates.map((c: { milestone: string }) => c.milestone),
+      );
+      expect([...milestones].sort()).toEqual(["grade_6", "grade_9"]);
+    });
+
+    it("has leavers who graduated and are still queryable", async () => {
+      const head = await accessAs("head");
+      const { students } = await head.get(
+        "/students?status=graduated&includeExited=true",
+      );
+
+      // Nothing hard-deletes (rule 5): last year's Grade 9 are gone from the
+      // register and entirely readable.
+      expect(students.length).toBe(summary.graduated);
+      expect(summary.graduated).toBeGreaterThan(0);
+    });
+
+    it("verifies a certificate through the public endpoint", async () => {
+      const head = await accessAs("head");
+      const [certificate] = await head.get("/transition-certificates");
+
+      // No session, no subdomain — the way the next school checks it.
+      const verified = await (await app.request(
+        `/verify/${certificate.verificationCode}`,
+      )).json();
+
+      expect(verified.documentType).toBe("transition_certificate");
+      expect(verified.status).toBe("valid");
+    });
+
+    it("has a receipt that verifies as withdrawn", async () => {
+      // The reversal the seed performs on purpose: authentic paper, money no
+      // longer on the account. Usually why somebody is checking at all.
+      const verified = await (await app.request(
+        `/verify/${summary.reversedReceiptCode}`,
+      )).json();
+
+      expect(verified.documentType).toBe("payment_receipt");
+      expect(verified.status).toBe("withdrawn");
+    });
+
+    it("has an audit trail a head can read and nobody can edit", async () => {
+      const head = await accessAs("head");
+      const listed = await head.get("/audit-log?action=payment.reversed");
+
+      expect(summary.auditEntries).toBeGreaterThan(100);
+      expect(listed.entries.length).toBe(1);
+      expect(listed.entries[0].summary).toContain("wrong child");
     });
   });
 
@@ -294,6 +364,8 @@ describe("the demo tenant", () => {
      * assertion that actually proves it.
      */
     await resetDb();
+    // Every session above belonged to users this just deleted.
+    sessions.clear();
     const again = await seedDemo();
 
     expect(again.pupils).toBe(summary.pupils);

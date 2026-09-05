@@ -64,6 +64,19 @@ export const TERM_DATES = TERM_OFFSETS.map(t => ({
   isCurrent: t.isCurrent,
 }));
 
+/**
+ * The same day, one year earlier.
+ *
+ * Shifting by 365 rather than adjusting the year keeps the offsets relative to
+ * today, which is the whole point of building the calendar this way — and a
+ * leap year moving a term boundary by a day matters to nobody here.
+ */
+export function shiftYear(isoDay: string, years = -1): string {
+  const d = new Date(`${isoDay}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + years * 365);
+  return d.toISOString().slice(0, 10);
+}
+
 /** The academic year label — the calendar year the current term sits in. */
 export const ACADEMIC_YEAR = Number(day(0).slice(0, 4));
 
