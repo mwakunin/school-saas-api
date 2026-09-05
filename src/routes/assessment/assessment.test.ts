@@ -1167,6 +1167,28 @@ describe("assessment", () => {
       expect(verified.student.admissionNumber).toBe("2020/007");
     });
 
+    it("refuses to certify a year that is not finished", async () => {
+      const ctx = await readyForCertificate("epsilon", 9);
+      const [termOne] = ctx.school.terms.filter(t => t.number === 1);
+
+      const res = await post("/transition-certificates", {
+        enrollmentId: ctx.enrolment.id,
+        termId: termOne.id,
+      }, jsonHeaders("epsilon", ctx.admin));
+
+      /*
+       * A certificate says the learner COMPLETED the level, so term 1 results
+       * would present a third of the year as the whole of it — on a document
+       * the family hands to the next school, where nobody will question it.
+       *
+       * Refused rather than warned about, because the snapshot is frozen and
+       * there is one per child per milestone: an early issue can never be
+       * replaced.
+       */
+      expect(res.status).toBe(422);
+      expect((await res.json()).error.issues[0].message).toContain("term 3");
+    });
+
     it("refuses a grade that is not a transition year", async () => {
       const ctx = await readyForCertificate("beta", 7);
 

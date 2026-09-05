@@ -158,6 +158,16 @@ export async function sendSms(input: {
       },
       body: form,
       signal: AbortSignal.timeout(SEND_TIMEOUT_MS),
+      /*
+       * Do not follow a redirect. This request carries the API key.
+       *
+       * `fetch` follows 3xx by default, and while it strips `Authorization`
+       * across origins it does NOT strip a custom header — so a redirect to
+       * another host would hand `apiKey` straight to it. Africa's Talking has
+       * no reason to redirect a POST to this path, so one arriving means
+       * something is wrong and failing is the right answer.
+       */
+      redirect: "error",
     });
 
     /*

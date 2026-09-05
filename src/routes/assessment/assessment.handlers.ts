@@ -930,6 +930,31 @@ export const issueCertificate: TenantRouteHandler<IssueCertificateRoute> = async
     );
   }
 
+  /*
+   * The final term, and only the final term.
+   *
+   * A transition certificate says a learner COMPLETED Grade 6 or Grade 9. Built
+   * from term 1 it would carry the opening term's results and present a third
+   * of a year as the whole of it — on a document a family hands to the next
+   * school, which is exactly where nobody will question it.
+   *
+   * A hard refusal rather than a warning because the mistake cannot be undone:
+   * the snapshot is frozen and there is one per child per milestone, so a
+   * certificate issued from the wrong term is refused a replacement for ever.
+   * A child leaving mid-year is a transfer, which is a different thing and has
+   * its own flow.
+   */
+  if (term.number !== 3) {
+    return c.json(
+      fieldError(
+        ["termId"],
+        `A transition certificate covers a completed year, so it is issued from `
+        + `term 3 — this is term ${term.number}`,
+      ),
+      HttpStatusCodes.UNPROCESSABLE_ENTITY,
+    );
+  }
+
   const results = await db
     .select({
       learningAreaName: learningAreas.name,
