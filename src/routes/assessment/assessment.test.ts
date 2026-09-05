@@ -14,6 +14,7 @@ import {
   termResults,
   terms,
 } from "@/db/schema";
+import { todayInBusinessZone } from "@/lib/dates";
 import { isCheckViolation, pgConstraintName } from "@/lib/db-errors";
 import {
   dayFromNow,
@@ -1217,9 +1218,20 @@ describe("assessment", () => {
 
     it("issues on the last day of term, when they are actually handed out", async () => {
       const ctx = await readyForCertificate("eta", 9);
+
+      /*
+       * Kenya's today, matching the handler — `dayFromNow(0)` is UTC's.
+       *
+       * Kenya is UTC+3, so its date is the same as UTC's or one day AHEAD,
+       * never behind. Between 21:00 and midnight UTC the two differ, and this
+       * test would have been setting the closing day to what is already
+       * YESTERDAY in Nairobi — passing, but no longer testing the boundary it
+       * names. An off-by-one in the handler (`>=` rather than `>`) would have
+       * gone unnoticed for three hours out of every twenty-four.
+       */
       await db
         .update(terms)
-        .set({ endsOn: dayFromNow(0) })
+        .set({ endsOn: todayInBusinessZone() })
         .where(eq(terms.id, ctx.term.id));
 
       const res = await post("/transition-certificates", {
@@ -1291,6 +1303,19 @@ describe("assessment", () => {
         .from(enrollments)
         .where(eq(enrollments.studentId, student.id));
 
+      /*
+       * Close the term first, or this tests the wrong refusal.
+       *
+       * The seeded term 3 ends in late October, so the open-term guard now
+       * answers before the empty-results check is ever reached — and asserting
+       * only "422" let that pass unnoticed. Both refusals are 422; the message
+       * is what says which one fired.
+       */
+      await db
+        .update(terms)
+        .set({ endsOn: dayFromNow(-1) })
+        .where(eq(terms.id, school.terms[2].id));
+
       const res = await post("/transition-certificates", {
         enrollmentId: enrolment.id,
         termId: school.terms[2].id,
@@ -1299,6 +1324,7 @@ describe("assessment", () => {
       // An empty certificate is worse than none: it is a document a family
       // carries to another school saying nothing was ever recorded.
       expect(res.status).toBe(422);
+      expect((await res.json()).error.issues[0].message).toContain("nothing to certify");
     });
   });
 
