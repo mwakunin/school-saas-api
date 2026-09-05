@@ -566,9 +566,16 @@ Three more, all now **built**:
 
 **Documents verify themselves.** Report cards, fee receipts and transition certificates carry a 160-bit code and a QR (`lib/verification.ts`), and `GET /verify/{code}` is public and unauthenticated — the person handed a report card at admission has no account here and should not need one. It shows no more than the paper does, and there is no parameter that could widen a result set, so its reach is exactly the documents a caller already holds. A reversed receipt answers `withdrawn` rather than merely "authentic": the paper is real, the money is not on the account, and that is usually why somebody is checking. This is nearly free because the content is already frozen — the snapshots exist for rule 7, and all that was missing was a code and somewhere to check it.
 
-**No parent portal exists.** `guardians.user_id` is in the schema and no route writes it; no route reads it either, because there are no guardian-scoped endpoints. A guardian who signs in reaches `/school`, `/terms`, `/grade-levels` and `/streams` — the four that admit `anyMember` — and nothing about their own children. CLAUDE.md §9 calls the parent portal a v1 surface and §8 calls the parent view the thing that convinces a head; neither is demonstrable today, and the demo seed says so in its own running order rather than promising it.
+**The parent portal** (`/portal/*`) is built. A guardian sees their own children, their balances, their released report cards and their results — and, however they ask, nobody else's.
 
-A third gap, found by building the demo seed and **now closed**: onboarding a school left nobody able to sign into it. `POST /superadmin/schools/{id}/memberships` grants the first role from outside the tenant, because the tenant-side equivalent would be guarded by `admin` — a role that does not exist yet at a school that has just been created. Still missing, and wanted before a real school runs itself: the tenant-side version, so a head can add their own bursar without the platform operator.
+That last part is a **second authorization axis**, and it is worth being explicit that RLS does nothing for it: every guardian at a school passes the same tenant policy, so isolation between families is done in the query and tested on its own. One helper resolves a caller to their linked `guardians` rows and thence to a set of student ids; every read is confined to that set, and another family's child answers **404 rather than 403** — a 403 would confirm the id names a real pupil and turn the URL into a way to walk the register.
+
+Linking an account to a guardian record happens two ways, and both are needed:
+
+- **`POST /portal/claim`** — self-service, matching a **verified** phone or email against what the school recorded. Verified is the whole safety of it: an unverified identifier would let anyone who knows a parent's number read a child's marks. A record another account already holds is never taken, because two parents can legitimately share a number and the first to claim it holds it.
+- **`POST /guardians/{id}/link`** — the office, by email. The fallback for the ordinary case self-service cannot cover: a parent who signed up with different details, or who cannot receive SMS. The counter staff confirm identity in person, which is a stronger check than any identifier match, and it is audited.
+
+**Membership management is tenant-side too** (`/memberships`). The superadmin plane still grants the FIRST one, because a school that has just been created has no admin to do it — everything after that is the head's. The last active admin cannot be deactivated: a school that locked itself out would need the platform operator to get back in, which is the dependency these routes exist to remove.
 
 ---
 

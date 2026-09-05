@@ -1,0 +1,2 @@
+ALTER TABLE "audit_log" DROP CONSTRAINT "audit_log_action_known";--> statement-breakpoint
+ALTER TABLE "audit_log" ADD CONSTRAINT "audit_log_action_known" CHECK ("audit_log"."action" IN ('assessment.published', 'assessment.unpublished', 'certificate.issued', 'guardian.linked', 'invoice.voided', 'marks.saved', 'membership.granted', 'membership.revoked', 'mpesa.allocated', 'mpesa.rejected', 'payment.recorded', 'payment.reversed', 'report_card.finalised', 'report_card.released', 'sms.queued'));

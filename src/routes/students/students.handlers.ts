@@ -12,7 +12,9 @@ import {
   streams,
   studentGuardians,
   students,
+  user,
 } from "@/db/schema";
+import { recordAudit } from "@/lib/audit";
 import {
   isCheckViolation,
   isExclusionViolation,
@@ -27,6 +29,7 @@ import type {
   ExitRoute,
   GetGuardianRoute,
   GetOneRoute,
+  LinkGuardianAccountRoute,
   LinkGuardianRoute,
   ListGuardiansRoute,
   ListRoute,
@@ -843,4 +846,80 @@ export const unlinkGuardian: TenantRouteHandler<UnlinkGuardianRoute> = async (c)
   }
 
   return c.json(await requireStudentDetail(db, studentId), HttpStatusCodes.OK);
+};
+
+export const linkGuardianAccount: TenantRouteHandler<LinkGuardianAccountRoute> = async (c) => {
+  const { id } = c.req.valid("param");
+  const { email } = c.req.valid("json");
+  const db = c.var.db;
+
+  const [guardian] = await db
+    .select({ id: guardians.id, name: guardians.name, userId: guardians.userId })
+    .from(guardians)
+    .where(eq(guardians.id, id));
+
+  if (!guardian) {
+    return c.json(
+      { message: HttpStatusPhrases.NOT_FOUND },
+      HttpStatusCodes.NOT_FOUND,
+    );
+  }
+
+  const [person] = await db
+    .select({ id: user.id, email: user.email })
+    .from(user)
+    .where(eq(user.email, email));
+
+  if (!person) {
+    return c.json(
+      {
+        success: false as const,
+        error: {
+          issues: [{
+            code: "custom" as const,
+            path: ["email"],
+            message: "Nobody has signed up with that address yet",
+          }],
+          name: "ZodError",
+        },
+      },
+      HttpStatusCodes.UNPROCESSABLE_ENTITY,
+    );
+  }
+
+  /*
+   * Never quietly move a record off somebody else's account.
+   *
+   * Re-linking is a real need — a family changes phones, a parent loses an
+   * address — but doing it silently would take one person's view of their
+   * children away with nothing recorded. Unlink first, deliberately.
+   */
+  if (guardian.userId && guardian.userId !== person.id) {
+    return c.json(
+      {
+        message:
+          "This guardian is already linked to a different account. Unlink it "
+          + "first if the family has changed contact details.",
+      },
+      HttpStatusCodes.CONFLICT,
+    );
+  }
+
+  const [linked] = await db
+    .update(guardians)
+    .set({ userId: person.id })
+    .where(eq(guardians.id, id))
+    .returning();
+
+  await recordAudit(db, {
+    schoolId: c.var.school.id,
+    actorId: c.var.user!.id,
+    action: "guardian.linked",
+    entityType: "guardian",
+    entityId: guardian.id,
+    summary: `Linked ${guardian.name} to the account ${person.email}`,
+    detail: { guardianId: guardian.id, userId: person.id, byOffice: true },
+  });
+
+  return c.json(linked, HttpStatusCodes.OK);
 };

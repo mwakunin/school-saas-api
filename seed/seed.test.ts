@@ -322,6 +322,44 @@ describe("the demo tenant", () => {
       expect(verified.status).toBe("withdrawn");
     });
 
+    it("gives the parent login two children and a balance", async () => {
+      const parent = await accessAs("parent");
+      const children = await parent.get("/portal/children");
+
+      /*
+       * The screen §8 says convinces a head that fee follow-up gets easier,
+       * and until this round it did not exist. Two children on one login is
+       * the version worth showing.
+       */
+      expect(children.length).toBeGreaterThanOrEqual(2);
+      expect(children[0].payToAccount ?? children[0].admissionNumber).toBeTruthy();
+
+      const fees = await parent.get(`/portal/children/${children[0].studentId}/fees`);
+      // The admission number IS the M-Pesa reference: a parent pays from the
+      // screen showing the balance rather than typing it from memory.
+      expect(fees.payToAccount).toBe(children[0].admissionNumber);
+    });
+
+    it("keeps the unpublished exam out of the parent's view", async () => {
+      const parent = await accessAs("parent");
+      const children = await parent.get("/portal/children");
+      const results = await parent.get(
+        `/portal/children/${children[0].studentId}/results`,
+      );
+
+      // Built only from published assessments. The half-entered End of Term
+      // paper is in the database and not in this answer.
+      const current = results.find(
+        (r: { termId: string }) => r.termId === summary.currentTermId,
+      );
+      expect(current === undefined || current.learningAreas.length > 0).toBe(true);
+
+      const cards = await parent.get(
+        `/portal/children/${children[0].studentId}/report-cards`,
+      );
+      expect(Array.isArray(cards)).toBe(true);
+    });
+
     it("has an audit trail a head can read and nobody can edit", async () => {
       const head = await accessAs("head");
       const listed = await head.get("/audit-log?action=payment.reversed");

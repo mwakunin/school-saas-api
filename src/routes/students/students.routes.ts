@@ -1,7 +1,7 @@
 import { createRoute, z } from "@hono/zod-openapi";
 import * as HttpStatusCodes from "stoker/http-status-codes";
 import { jsonContent, jsonContentRequired } from "stoker/openapi/helpers";
-import { createErrorSchema, IdUUIDParamsSchema } from "stoker/openapi/schemas";
+import { createErrorSchema, createMessageObjectSchema, IdUUIDParamsSchema } from "stoker/openapi/schemas";
 
 import {
   forbiddenSchema,
@@ -16,6 +16,7 @@ import {
   createStudentSchema,
   exitStudentSchema,
   guardianDetailSchema,
+  linkGuardianAccountSchema,
   linkGuardianSchema,
   listStudentsQuerySchema,
   readmitStudentSchema,
@@ -348,6 +349,36 @@ export type UpdateRoute = typeof update;
 export type ExitRoute = typeof exitStudent;
 export type ReadmitRoute = typeof readmit;
 export type EnrollRoute = typeof enroll;
+export const linkGuardianAccount = createRoute({
+  tags,
+  method: "post",
+  path: "/guardians/{id}/link",
+  summary: "Link a guardian to a portal account",
+  description:
+    "For a parent whose details do not match what the school recorded — a "
+    + "different number, or no SMS at all. Self-service claiming handles the "
+    + "rest; this is the counter at the office, and it is audited because it "
+    + "grants sight of a child's records.",
+  middleware: [officeOnly],
+  request: {
+    params: IdUUIDParamsSchema,
+    body: jsonContentRequired(linkGuardianAccountSchema, "Whose account"),
+  },
+  responses: {
+    [HttpStatusCodes.OK]: jsonContent(selectGuardianSchema, "The linked guardian"),
+    [HttpStatusCodes.CONFLICT]: jsonContent(
+      createMessageObjectSchema("Already linked to another account"),
+      "This guardian record belongs to a different login",
+    ),
+    [HttpStatusCodes.UNPROCESSABLE_ENTITY]: jsonContent(
+      createErrorSchema(linkGuardianAccountSchema),
+      "Nobody has signed up with that address",
+    ),
+    ...errorResponses,
+  },
+});
+
+export type LinkGuardianAccountRoute = typeof linkGuardianAccount;
 export type ListGuardiansRoute = typeof listGuardians;
 export type GetGuardianRoute = typeof getGuardian;
 export type CreateGuardianRoute = typeof createGuardian;
