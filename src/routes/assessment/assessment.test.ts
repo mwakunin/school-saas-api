@@ -5,9 +5,18 @@ import type { TestUser } from "@/test/helpers";
 
 import app from "@/app";
 import db from "@/db";
-import { assessmentScores, enrollments, learningAreas, reportCards, schools, termResults } from "@/db/schema";
+import {
+  assessmentScores,
+  enrollments,
+  learningAreas,
+  reportCards,
+  schools,
+  termResults,
+  terms,
+} from "@/db/schema";
 import { isCheckViolation, pgConstraintName } from "@/lib/db-errors";
 import {
+  dayFromNow,
   makeSchool,
   makeStream,
   makeStudent,
@@ -1108,7 +1117,21 @@ describe("assessment", () => {
       const stream = await makeStream(school, gradeSequence, "East");
       const admin = await signInAt(school.id, "admin");
       const teacher = await signInAt(school.id, "teacher");
-      const term = school.terms[2];
+
+      /*
+       * Close term 3 before certifying it.
+       *
+       * The seeded term 3 runs to late October, so every certificate test here
+       * was quietly issuing a "completed year" for a year still in progress —
+       * and nothing complained, which is how the missing guard survived. The
+       * fixture now does what a school does: the year ends, then the
+       * certificates go out.
+       */
+      const [term] = await db
+        .update(terms)
+        .set({ endsOn: dayFromNow(-1) })
+        .where(eq(terms.id, school.terms[2].id))
+        .returning();
 
       await post("/curriculum/seed", { phase: "junior" }, jsonHeaders(subdomain, admin));
       const [area] = await db
@@ -1165,6 +1188,48 @@ describe("assessment", () => {
       const verified = await (await app.request(`/verify/${certificate.verificationCode}`)).json();
       expect(verified.documentType).toBe("transition_certificate");
       expect(verified.student.admissionNumber).toBe("2020/007");
+    });
+
+    it("refuses while term 3 is still running", async () => {
+      const ctx = await readyForCertificate("zeta", 9);
+      // Put the closing date back in the future: the term is under way again.
+      await db
+        .update(terms)
+        .set({ endsOn: dayFromNow(30) })
+        .where(eq(terms.id, ctx.term.id));
+
+      const res = await post("/transition-certificates", {
+        enrollmentId: ctx.enrolment.id,
+        termId: ctx.term.id,
+      }, jsonHeaders("zeta", ctx.admin));
+
+      /*
+       * Week two of term 3 is not a completed year.
+       *
+       * Naming the term was only half the guard: a certificate issued now is
+       * built from an opener CAT and asserts the child finished Grade 9. Same
+       * misrepresentation as issuing from term 1, less obvious, and just as
+       * impossible to replace afterwards.
+       */
+      expect(res.status).toBe(422);
+      expect((await res.json()).error.issues[0].message).toContain("runs until");
+    });
+
+    it("issues on the last day of term, when they are actually handed out", async () => {
+      const ctx = await readyForCertificate("eta", 9);
+      await db
+        .update(terms)
+        .set({ endsOn: dayFromNow(0) })
+        .where(eq(terms.id, ctx.term.id));
+
+      const res = await post("/transition-certificates", {
+        enrollmentId: ctx.enrolment.id,
+        termId: ctx.term.id,
+      }, jsonHeaders("eta", ctx.admin));
+
+      // The closing day counts: that is when the leavers' assembly happens and
+      // the end-of-term papers are already marked.
+      expect(res.status).toBe(201);
     });
 
     it("refuses to certify a year that is not finished", async () => {

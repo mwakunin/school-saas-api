@@ -23,6 +23,7 @@ import {
 } from "@/db/schema";
 import { computePositions, computeTermResults } from "@/lib/assessment";
 import { recordAudit } from "@/lib/audit";
+import { todayInBusinessZone } from "@/lib/dates";
 import { isForeignKeyViolation, isUniqueViolation } from "@/lib/db-errors";
 import { mintVerificationCode, qrSvgFor, verificationUrlFor } from "@/lib/verification";
 
@@ -919,7 +920,7 @@ export const issueCertificate: TenantRouteHandler<IssueCertificateRoute> = async
   }
 
   const [term] = await db
-    .select({ id: terms.id, number: terms.number })
+    .select({ id: terms.id, number: terms.number, endsOn: terms.endsOn })
     .from(terms)
     .where(eq(terms.id, body.termId));
 
@@ -950,6 +951,33 @@ export const issueCertificate: TenantRouteHandler<IssueCertificateRoute> = async
         ["termId"],
         `A transition certificate covers a completed year, so it is issued from `
         + `term 3 — this is term ${term.number}`,
+      ),
+      HttpStatusCodes.UNPROCESSABLE_ENTITY,
+    );
+  }
+
+  /*
+   * And term 3 has to have actually happened.
+   *
+   * Naming the term was half the guard. A certificate issued in week two of
+   * term 3 is built from an opener CAT and calls it a completed year — the
+   * same misrepresentation as issuing from term 1, just less obvious, and
+   * equally permanent: the snapshot is frozen and there is one per child per
+   * milestone, so it can never be replaced.
+   *
+   * The last day of term counts. That is when a leavers' assembly happens and
+   * certificates are actually handed out, and the end-of-term papers are
+   * marked by then. Kenya's today, not UTC's — for the first three hours of
+   * each Kenyan day UTC still reports yesterday, and a head issuing at 8am on
+   * the closing day should not be told the day has not come.
+   */
+  const today = todayInBusinessZone();
+  if (term.endsOn > today) {
+    return c.json(
+      fieldError(
+        ["termId"],
+        `This term runs until ${term.endsOn}. A transition certificate says the `
+        + "year was completed, so it cannot be issued before the term ends.",
       ),
       HttpStatusCodes.UNPROCESSABLE_ENTITY,
     );
