@@ -6,6 +6,7 @@ import type { AppDb } from "@/db";
 import type { TenantRouteHandler } from "@/lib/types";
 
 import { mpesaTransactions, schools, students } from "@/db/schema";
+import { recordAudit } from "@/lib/audit";
 import { balancesFor } from "@/lib/balances";
 import { encryptSecret, generateCallbackToken } from "@/lib/crypto";
 import { isForeignKeyViolation, isUniqueViolation } from "@/lib/db-errors";
@@ -260,6 +261,30 @@ export const allocate: TenantRouteHandler<AllocateRoute> = async (c) => {
     throw err;
   }
 
+  /*
+   * A hand allocation is the entry worth having most.
+   *
+   * The matcher's own allocations are reproducible from the reference; this
+   * one is a person deciding whose money it was, on a reference that did not
+   * match anything. If it turns out to be the wrong family, "who decided
+   * that" is the first question, and the raw confirmation cannot answer it.
+   */
+  await recordAudit(db, {
+    schoolId: c.var.school.id,
+    actorId: c.var.user!.id,
+    action: "mpesa.allocated",
+    entityType: "mpesa_transaction",
+    entityId: id,
+    summary:
+      `Allocated ${transaction.amountCents} cents from `
+      + `${transaction.accountReference ?? "a blank reference"} by hand`,
+    detail: {
+      studentId: body.studentId,
+      accountReference: transaction.accountReference,
+      transactionId: transaction.transactionId,
+    },
+  });
+
   const [updated] = await db
     .select()
     .from(mpesaTransactions)
@@ -297,6 +322,16 @@ export const reject: TenantRouteHandler<RejectRoute> = async (c) => {
     .set({ status: "rejected", statusReason: reason })
     .where(eq(mpesaTransactions.id, id))
     .returning();
+
+  await recordAudit(db, {
+    schoolId: c.var.school.id,
+    actorId: c.var.user!.id,
+    action: "mpesa.rejected",
+    entityType: "mpesa_transaction",
+    entityId: id,
+    summary: `Set a payment aside: ${reason}`,
+    detail: { reason, transactionId: updated.transactionId },
+  });
 
   return c.json(updated, HttpStatusCodes.OK);
 };

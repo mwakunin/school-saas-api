@@ -550,17 +550,21 @@ grade_levels, streams, enrollments
 students, guardians, student_guardians
 learning_areas, competencies
 assessments, assessment_scores, score_attachments
-term_results, report_cards
+term_results, report_cards, transition_certificates
 fee_structures, fee_items, invoices, invoice_lines
 mpesa_transactions, payments
+sms_messages, audit_log
 ```
 
-~22 tables. Everything deferred (attendance, timetables, transport, library, SMS templates) hangs off `enrollments` and `terms` without disturbing this.
+~25 tables. Everything deferred (attendance, timetables, transport, library, SMS templates) hangs off `enrollments` and `terms` without disturbing this.
 
-Two more are needed before v1 ships and are not yet built:
+Three more, all now **built**:
 
-- **`sms_messages`** — Africa's Talking charges per unit and reports delivery asynchronously, so schools will ask what they are spending. Needs recipient, body, provider id, status, cost, and the guardian or student it concerns.
-- **`audit_log`** — who changed a mark, who reversed a payment, who released a report card. For a product holding children's records and school money this is both a safeguard and a sales point.
+- **`sms_messages`** — Africa's Talking charges per unit and reports delivery asynchronously, so schools ask what they are spending. A row per message with recipient, body, provider id, status, cost and the guardian or student it concerns. Sends are **dry-run by default** (`POST /sms/fee-reminders`, `/sms/results-notice`): every other write here does what you ask, but four hundred delivered messages cost money and cannot be recalled, so the preview is the default and sending is the thing you opt into. Families skipped are returned with a reason, because a guardian with no phone number is otherwise invisible and "we texted everyone" quietly means "everyone we had a number for". One message per child, never one per linked guardian.
+- **`audit_log`** — who changed a mark, who reversed a payment, who released a report card. Written inside the same transaction as the action, so an entry cannot outlive a rolled-back change or go missing from one that stood. The runtime role holds `INSERT` and `SELECT` and neither `UPDATE` nor `DELETE`: this is the one table protected from *editing* as well as deletion, because a log the application can rewrite is evidence of nothing. Admin-only to read — the people it is a check on are not its audience.
+- **`transition_certificates`** — the two points a CBE learner moves on, Grade 6 → junior and Grade 9 → senior. Derived from `sequence`, never stored as a flag. Frozen at issue like a report card (rule 7), one per child per milestone; a reissue is a reprint, never a second document saying something different.
+
+**Documents verify themselves.** Report cards, fee receipts and transition certificates carry a 160-bit code and a QR (`lib/verification.ts`), and `GET /verify/{code}` is public and unauthenticated — the person handed a report card at admission has no account here and should not need one. It shows no more than the paper does, and there is no parameter that could widen a result set, so its reach is exactly the documents a caller already holds. A reversed receipt answers `withdrawn` rather than merely "authentic": the paper is real, the money is not on the account, and that is usually why somebody is checking. This is nearly free because the content is already frozen — the snapshots exist for rule 7, and all that was missing was a code and somewhere to check it.
 
 **No parent portal exists.** `guardians.user_id` is in the schema and no route writes it; no route reads it either, because there are no guardian-scoped endpoints. A guardian who signs in reaches `/school`, `/terms`, `/grade-levels` and `/streams` — the four that admit `anyMember` — and nothing about their own children. CLAUDE.md §9 calls the parent portal a v1 surface and §8 calls the parent view the thing that convinces a head; neither is demonstrable today, and the demo seed says so in its own running order rather than promising it.
 

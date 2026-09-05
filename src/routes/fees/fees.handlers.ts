@@ -16,6 +16,7 @@ import {
   students,
   terms,
 } from "@/db/schema";
+import { recordAudit } from "@/lib/audit";
 import {
   balancesFor,
   invoiceBalancesFor,
@@ -24,6 +25,7 @@ import {
 } from "@/lib/balances";
 import { isForeignKeyViolation, isUniqueViolation } from "@/lib/db-errors";
 import { releaseReversedTransaction } from "@/lib/mpesa-matching";
+import { mintVerificationCode } from "@/lib/verification";
 
 import type {
   AddItemRoute,
@@ -641,6 +643,16 @@ export const voidInvoice: TenantRouteHandler<VoidInvoiceRoute> = async (c) => {
     .set({ voidedAt: new Date(), voidReason: reason })
     .where(eq(invoices.id, id));
 
+  await recordAudit(db, {
+    schoolId: c.var.school.id,
+    actorId: c.var.user!.id,
+    action: "invoice.voided",
+    entityType: "invoice",
+    entityId: id,
+    summary: `Voided an invoice: ${reason}`,
+    detail: { reason },
+  });
+
   return c.json((await invoiceDetail(db, id))!, HttpStatusCodes.OK);
 };
 
@@ -664,8 +676,22 @@ export const recordPayment: TenantRouteHandler<RecordPaymentRoute> = async (c) =
         reference: body.reference,
         recordedBy: c.var.user!.id,
         receivedAt: body.receivedAt ? new Date(body.receivedAt) : new Date(),
+        // Printed on the receipt, so a parent's copy can be checked back
+        // against us — including after a reversal, which is the case a
+        // family most often turns up about.
+        verificationCode: mintVerificationCode(),
       })
       .returning();
+
+    await recordAudit(c.var.db, {
+      schoolId: c.var.school.id,
+      actorId: c.var.user!.id,
+      action: "payment.recorded",
+      entityType: "payment",
+      entityId: created.id,
+      summary: `Recorded ${body.method} payment of ${body.amountCents} cents`,
+      detail: { studentId: body.studentId, invoiceId: body.invoiceId ?? null },
+    });
 
     return c.json(created, HttpStatusCodes.CREATED);
   }
@@ -768,6 +794,28 @@ export const reversePayment: TenantRouteHandler<ReversePaymentRoute> = async (c)
      */
     if (row.mpesaTransactionId)
       await releaseReversedTransaction(tx, row.mpesaTransactionId);
+
+    /*
+     * Inside the transaction, so the log cannot outlive a rolled-back
+     * reversal or go missing from one that stood.
+     *
+     * This is the entry CLAUDE.md §6 names first. "Who reversed this payment,
+     * and why" is the question a head gets asked when a family says the money
+     * left their phone, and the answer has to be in a screen.
+     */
+    await recordAudit(tx, {
+      schoolId: c.var.school.id,
+      actorId: c.var.user!.id,
+      action: "payment.reversed",
+      entityType: "payment",
+      entityId: row.id,
+      summary: `Reversed a payment of ${row.amountCents} cents: ${reason}`,
+      detail: {
+        studentId: row.studentId,
+        reason,
+        mpesaTransactionId: row.mpesaTransactionId,
+      },
+    });
 
     return row;
   });

@@ -34,6 +34,12 @@ interface Column {
   union: string[];
 }
 
+/** A `text().$type<SomeAlias>()` this guard cannot read the members of. */
+interface Unreadable {
+  table: string;
+  property: string;
+}
+
 interface Constraint {
   table: string;
   property: string;
@@ -41,8 +47,21 @@ interface Constraint {
   values: string[];
 }
 
-/** The string literal members of `"a" | "b"`, or null for any other type. */
-function unionMembers(node: ts.TypeNode): string[] | null {
+/**
+ * The string literal members of `"a" | "b"`.
+ *
+ * `null` means "not a union of string literals" — a shape this guard has no
+ * opinion about. `undefined` means "names a type this guard cannot read", which
+ * is a different answer and a much more dangerous one: `$type<AuditAction>()`
+ * on a text column is almost certainly an aliased union, and resolving it would
+ * need a full type checker rather than one file's syntax tree. Reported rather
+ * than skipped, because silently skipping is how a column with no CHECK gets
+ * past a test written to find exactly that.
+ */
+function unionMembers(node: ts.TypeNode): string[] | null | undefined {
+  if (ts.isTypeReferenceNode(node))
+    return undefined;
+
   const parts = ts.isUnionTypeNode(node) ? node.types : [node];
   const members: string[] = [];
 
@@ -89,6 +108,7 @@ function chainRoot(node: ts.Expression): ts.Expression {
 function parseSchema(source: string) {
   const file = ts.createSourceFile(SCHEMA, source, ts.ScriptTarget.Latest, true);
   const columns: Column[] = [];
+  const unreadable: Unreadable[] = [];
   const constraints: Constraint[] = [];
 
   const visit = (node: ts.Node) => {
@@ -113,7 +133,9 @@ function parseSchema(source: string) {
             continue;
 
           const union = unionMembers(typeArg);
-          if (union)
+          if (union === undefined)
+            unreadable.push({ table, property: member.name.text });
+          else if (union)
             columns.push({ table, property: member.name.text, union });
         }
       }
@@ -150,7 +172,7 @@ function parseSchema(source: string) {
   };
 
   visit(file);
-  return { columns, constraints };
+  return { columns, unreadable, constraints };
 }
 
 describe("union-typed columns", () => {
@@ -170,6 +192,23 @@ describe("union-typed columns", () => {
       property: "status",
       union: ["active", "transferred_out", "graduated", "withdrawn", "deceased"],
     });
+  });
+
+  it("can read every union it is asked to check", async () => {
+    const { unreadable } = parseSchema(await readFile(SCHEMA, "utf8"));
+
+    /*
+     * A named type on a text column escapes this guard entirely.
+     *
+     * Reading `$type<AuditAction>()` would need a type checker, not one file's
+     * syntax tree — so the union goes inline in the column and the alias, where
+     * one is wanted, is DERIVED from it (`typeof table.$inferInsert`). That way
+     * the type and the CHECK cannot drift apart without this test noticing.
+     */
+    expect(
+      unreadable.map(u => `${u.table}.${u.property}`),
+      "write the union inline; derive any alias from the column, not the reverse",
+    ).toEqual([]);
   });
 
   it("has a CHECK for each one, listing exactly the same values", async () => {

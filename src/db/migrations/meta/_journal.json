@@ -78,6 +78,20 @@
       "when": 1788547195874,
       "tag": "0010_enum_checks",
       "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "7",
+      "when": 1788562615666,
+      "tag": "0011_documents_messaging_audit",
+      "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "7",
+      "when": 1788568930548,
+      "tag": "0012_verification_invariants",
+      "breakpoints": true
     }
   ]
 }

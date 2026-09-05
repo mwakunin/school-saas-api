@@ -4,13 +4,16 @@ import configureOpenAPI from "@/lib/configure-open-api";
 import createApp from "@/lib/create-app";
 import academic from "@/routes/academic/academic.index";
 import assessment from "@/routes/assessment/assessment.index";
+import audit from "@/routes/audit/audit.index";
 import curriculum from "@/routes/curriculum/curriculum.index";
 import fees from "@/routes/fees/fees.index";
 import health from "@/routes/health.route";
 import index from "@/routes/index.route";
+import messaging from "@/routes/messaging/messaging.index";
 import reconciliation from "@/routes/reconciliation/reconciliation.index";
 import students from "@/routes/students/students.index";
 import superadmin from "@/routes/superadmin/superadmin.index";
+import verify from "@/routes/verify/verify.index";
 import webhooks from "@/routes/webhooks/webhooks.index";
 
 const app = createApp();
@@ -32,6 +35,11 @@ const unscopedRoutes = [
   // Safaricom callbacks: no session, no subdomain — the tenant comes from an
   // unguessable token in the path. See routes/webhooks.
   webhooks,
+  // Public document verification. Same shape as the webhooks above: no
+  // session, no subdomain, and an unguessable code in the path doing the work
+  // — because the person checking a report card handed to them has no account
+  // here and should not need one.
+  verify,
 ] as const;
 
 /**
@@ -55,6 +63,8 @@ const tenantRoutes = [
   reconciliation,
   curriculum,
   assessment,
+  messaging,
+  audit,
 ] as unknown as readonly AppOpenAPI[];
 
 [...unscopedRoutes, ...tenantRoutes].forEach((route) => {

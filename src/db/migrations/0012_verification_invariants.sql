@@ -1,0 +1,1 @@
+ALTER TABLE "report_cards" ADD CONSTRAINT "report_cards_verified_after_finalised" CHECK ("report_cards"."verification_code" IS NULL OR "report_cards"."finalised_at" IS NOT NULL);

@@ -5,9 +5,19 @@ import type { TestUser } from "@/test/helpers";
 
 import app from "@/app";
 import db from "@/db";
-import { assessmentScores, enrollments, learningAreas, reportCards, schools, termResults } from "@/db/schema";
+import {
+  assessmentScores,
+  enrollments,
+  learningAreas,
+  reportCards,
+  schools,
+  termResults,
+  terms,
+} from "@/db/schema";
+import { todayInBusinessZone } from "@/lib/dates";
 import { isCheckViolation, pgConstraintName } from "@/lib/db-errors";
 import {
+  dayFromNow,
   makeSchool,
   makeStream,
   makeStudent,
@@ -100,6 +110,27 @@ async function makeAssessment(
   }, jsonHeaders(ctx.subdomain, ctx.teacher));
 
   return res.json();
+}
+
+/**
+ * A class with one marked, published exam — the state most of what follows
+ * needs before it can assert anything. At module scope because term results,
+ * merit lists and report cards all start here.
+ */
+async function withMarks(subdomain: string) {
+  const ctx = await seed(subdomain);
+  const assessment = await makeAssessment(ctx);
+
+  await put(`/assessments/${assessment.id}/scores`, {
+    scores: [
+      { enrollmentId: ctx.pupils[0].enrolmentId, rawScore: 90 },
+      { enrollmentId: ctx.pupils[1].enrolmentId, rawScore: 70 },
+      { enrollmentId: ctx.pupils[2].enrolmentId, rawScore: 50 },
+    ],
+  }, jsonHeaders(subdomain, ctx.teacher));
+  await post(`/assessments/${assessment.id}/publish`, {}, jsonHeaders(subdomain, ctx.teacher));
+
+  return { ...ctx, assessment };
 }
 
 describe("assessment", () => {
@@ -403,22 +434,6 @@ describe("assessment", () => {
   });
 
   describe("term results", () => {
-    async function withMarks(subdomain: string) {
-      const ctx = await seed(subdomain);
-      const assessment = await makeAssessment(ctx);
-
-      await put(`/assessments/${assessment.id}/scores`, {
-        scores: [
-          { enrollmentId: ctx.pupils[0].enrolmentId, rawScore: 90 },
-          { enrollmentId: ctx.pupils[1].enrolmentId, rawScore: 70 },
-          { enrollmentId: ctx.pupils[2].enrolmentId, rawScore: 50 },
-        ],
-      }, jsonHeaders(subdomain, ctx.teacher));
-      await post(`/assessments/${assessment.id}/publish`, {}, jsonHeaders(subdomain, ctx.teacher));
-
-      return { ...ctx, assessment };
-    }
-
     it("computes a mean and ranks the class", async () => {
       const ctx = await withMarks("alpha");
 
@@ -999,6 +1014,317 @@ describe("assessment", () => {
       }, jsonHeaders("alpha", ctx.teacher));
 
       expect(res.status).toBe(403);
+    });
+  });
+
+  describe("merit lists", () => {
+    it("ranks the class on the mean of its subject means", async () => {
+      const ctx = await withMarks("alpha");
+      await post("/term-results/compute", { termId: ctx.term.id }, jsonHeaders("alpha", ctx.admin));
+
+      const list = await (await app.request(
+        `/merit-list?termId=${ctx.term.id}&streamId=${ctx.blue.id}`,
+        { headers: tenantHeaders("alpha", ctx.admin) },
+      )).json();
+
+      expect(list).toHaveLength(3);
+      expect(list[0].position).toBe(1);
+      expect(list[0].name).toContain("Wanjiku");
+      expect(list[2].position).toBe(3);
+
+      // Descending, and the figure is the mean of the area means rather than
+      // of raw marks — otherwise whichever subject set the most papers would
+      // quietly weight the whole list.
+      expect(list[0].overallMean).toBeGreaterThan(list[2].overallMean);
+    });
+
+    it("gives two children on the same mean the same position", async () => {
+      const ctx = await seed("alpha");
+      const assessment = await makeAssessment(ctx);
+      await put(`/assessments/${assessment.id}/scores`, {
+        scores: [
+          { enrollmentId: ctx.pupils[0].enrolmentId, rawScore: 90 },
+          { enrollmentId: ctx.pupils[1].enrolmentId, rawScore: 70 },
+          { enrollmentId: ctx.pupils[2].enrolmentId, rawScore: 70 },
+        ],
+      }, jsonHeaders("alpha", ctx.teacher));
+      await post(`/assessments/${assessment.id}/publish`, {}, jsonHeaders("alpha", ctx.teacher));
+      await post("/term-results/compute", { termId: ctx.term.id }, jsonHeaders("alpha", ctx.admin));
+
+      const list = await (await app.request(
+        `/merit-list?termId=${ctx.term.id}&streamId=${ctx.blue.id}`,
+        { headers: tenantHeaders("alpha", ctx.admin) },
+      )).json();
+
+      /*
+       * 1, 2, 2 — the way SQL `rank()` does it everywhere else in the product.
+       *
+       * Numbering them 1, 2, 3 put two identical marks in different places and
+       * let the alphabet decide which child came second. Position is the most
+       * contested number on a Kenyan report card; a rank a parent can disprove
+       * by reading the two marks beside it is worse than no rank at all.
+       */
+      expect(list.map((r: { position: number }) => r.position)).toEqual([1, 2, 2]);
+      expect(list[1].overallMean).toBe(list[2].overallMean);
+    });
+
+    it("insists on ranking one class or one grade, never neither", async () => {
+      const ctx = await withMarks("alpha");
+      await post("/term-results/compute", { termId: ctx.term.id }, jsonHeaders("alpha", ctx.admin));
+
+      // With neither, this ranked the whole school — a list putting a Grade 1
+      // above a Grade 9 on marks out of different papers.
+      const unscoped = await app.request(`/merit-list?termId=${ctx.term.id}`, {
+        headers: tenantHeaders("alpha", ctx.admin),
+      });
+      expect(unscoped.status).toBe(422);
+
+      // With both, the second silently did nothing.
+      const both = await app.request(
+        `/merit-list?termId=${ctx.term.id}&streamId=${ctx.blue.id}`
+        + `&gradeLevelId=${ctx.school.gradeLevels[3].id}`,
+        { headers: tenantHeaders("alpha", ctx.admin) },
+      );
+      expect(both.status).toBe(422);
+    });
+
+    it("refuses at a school that has stopped ranking children", async () => {
+      const ctx = await withMarks("alpha");
+      await post("/term-results/compute", { termId: ctx.term.id }, jsonHeaders("alpha", ctx.admin));
+      await db.update(schools)
+        .set({ showsPositions: false })
+        .where(eq(schools.id, ctx.school.id));
+
+      const res = await app.request(
+        `/merit-list?termId=${ctx.term.id}&streamId=${ctx.blue.id}`,
+        { headers: tenantHeaders("alpha", ctx.admin) },
+      );
+
+      /*
+       * Refused rather than returned unranked.
+       *
+       * §5.6 keeps positions out of a report card snapshot entirely at such a
+       * school rather than nulling them at render time. A merit list IS the
+       * ranking, so handing one over — in any order — would give a head back
+       * exactly the thing they decided not to publish.
+       */
+      expect(res.status).toBe(409);
+    });
+  });
+
+  describe("transition certificates", () => {
+    async function readyForCertificate(subdomain: string, gradeSequence: number) {
+      const school = await makeSchool({ subdomain });
+      const stream = await makeStream(school, gradeSequence, "East");
+      const admin = await signInAt(school.id, "admin");
+      const teacher = await signInAt(school.id, "teacher");
+
+      /*
+       * Close term 3 before certifying it.
+       *
+       * The seeded term 3 runs to late October, so every certificate test here
+       * was quietly issuing a "completed year" for a year still in progress —
+       * and nothing complained, which is how the missing guard survived. The
+       * fixture now does what a school does: the year ends, then the
+       * certificates go out.
+       */
+      const [term] = await db
+        .update(terms)
+        .set({ endsOn: dayFromNow(-1) })
+        .where(eq(terms.id, school.terms[2].id))
+        .returning();
+
+      await post("/curriculum/seed", { phase: "junior" }, jsonHeaders(subdomain, admin));
+      const [area] = await db
+        .select()
+        .from(learningAreas)
+        .where(and(
+          eq(learningAreas.schoolId, school.id),
+          eq(learningAreas.name, "Mathematics"),
+        ));
+
+      const student = await makeStudent(school, "2020/007", {
+        givenName: "Chebet",
+        streamId: stream.id,
+      });
+      const [enrolment] = await db
+        .select()
+        .from(enrollments)
+        .where(eq(enrollments.studentId, student.id));
+
+      const assessment = await (await post("/assessments", {
+        termId: term.id,
+        learningAreaId: area.id,
+        streamId: stream.id,
+        title: "End of Term",
+        kind: "exam",
+        maxScore: 100,
+      }, jsonHeaders(subdomain, teacher))).json();
+
+      await put(`/assessments/${assessment.id}/scores`, {
+        scores: [{ enrollmentId: enrolment.id, rawScore: 71 }],
+      }, jsonHeaders(subdomain, teacher));
+      await post(`/assessments/${assessment.id}/publish`, {}, jsonHeaders(subdomain, teacher));
+      await post("/term-results/compute", { termId: term.id }, jsonHeaders(subdomain, admin));
+
+      return { school, admin, term, enrolment, subdomain };
+    }
+
+    it("issues one at Grade 9, with a QR that verifies publicly", async () => {
+      const ctx = await readyForCertificate("alpha", 9);
+
+      const res = await post("/transition-certificates", {
+        enrollmentId: ctx.enrolment.id,
+        termId: ctx.term.id,
+        headComment: "We wish her well in senior school.",
+      }, jsonHeaders("alpha", ctx.admin));
+
+      expect(res.status).toBe(201);
+      const certificate = await res.json();
+
+      // Derived from the grade's sequence, never passed in (§5.2).
+      expect(certificate.milestone).toBe("grade_9");
+      expect(certificate.verificationQrSvg).toContain("<svg");
+
+      const verified = await (await app.request(`/verify/${certificate.verificationCode}`)).json();
+      expect(verified.documentType).toBe("transition_certificate");
+      expect(verified.student.admissionNumber).toBe("2020/007");
+    });
+
+    it("refuses while term 3 is still running", async () => {
+      const ctx = await readyForCertificate("zeta", 9);
+      // Put the closing date back in the future: the term is under way again.
+      await db
+        .update(terms)
+        .set({ endsOn: dayFromNow(30) })
+        .where(eq(terms.id, ctx.term.id));
+
+      const res = await post("/transition-certificates", {
+        enrollmentId: ctx.enrolment.id,
+        termId: ctx.term.id,
+      }, jsonHeaders("zeta", ctx.admin));
+
+      /*
+       * Week two of term 3 is not a completed year.
+       *
+       * Naming the term was only half the guard: a certificate issued now is
+       * built from an opener CAT and asserts the child finished Grade 9. Same
+       * misrepresentation as issuing from term 1, less obvious, and just as
+       * impossible to replace afterwards.
+       */
+      expect(res.status).toBe(422);
+      expect((await res.json()).error.issues[0].message).toContain("runs until");
+    });
+
+    it("issues on the last day of term, when they are actually handed out", async () => {
+      const ctx = await readyForCertificate("eta", 9);
+
+      /*
+       * Kenya's today, matching the handler — `dayFromNow(0)` is UTC's.
+       *
+       * Kenya is UTC+3, so its date is the same as UTC's or one day AHEAD,
+       * never behind. Between 21:00 and midnight UTC the two differ, and this
+       * test would have been setting the closing day to what is already
+       * YESTERDAY in Nairobi — passing, but no longer testing the boundary it
+       * names. An off-by-one in the handler (`>=` rather than `>`) would have
+       * gone unnoticed for three hours out of every twenty-four.
+       */
+      await db
+        .update(terms)
+        .set({ endsOn: todayInBusinessZone() })
+        .where(eq(terms.id, ctx.term.id));
+
+      const res = await post("/transition-certificates", {
+        enrollmentId: ctx.enrolment.id,
+        termId: ctx.term.id,
+      }, jsonHeaders("eta", ctx.admin));
+
+      // The closing day counts: that is when the leavers' assembly happens and
+      // the end-of-term papers are already marked.
+      expect(res.status).toBe(201);
+    });
+
+    it("refuses to certify a year that is not finished", async () => {
+      const ctx = await readyForCertificate("epsilon", 9);
+      const [termOne] = ctx.school.terms.filter(t => t.number === 1);
+
+      const res = await post("/transition-certificates", {
+        enrollmentId: ctx.enrolment.id,
+        termId: termOne.id,
+      }, jsonHeaders("epsilon", ctx.admin));
+
+      /*
+       * A certificate says the learner COMPLETED the level, so term 1 results
+       * would present a third of the year as the whole of it — on a document
+       * the family hands to the next school, where nobody will question it.
+       *
+       * Refused rather than warned about, because the snapshot is frozen and
+       * there is one per child per milestone: an early issue can never be
+       * replaced.
+       */
+      expect(res.status).toBe(422);
+      expect((await res.json()).error.issues[0].message).toContain("term 3");
+    });
+
+    it("refuses a grade that is not a transition year", async () => {
+      const ctx = await readyForCertificate("beta", 7);
+
+      const res = await post("/transition-certificates", {
+        enrollmentId: ctx.enrolment.id,
+        termId: ctx.term.id,
+      }, jsonHeaders("beta", ctx.admin));
+
+      // Grade 6 and Grade 9 are the two points a CBE learner moves on, and the
+      // two a family needs paperwork for. Grade 7 is mid-junior-school.
+      expect(res.status).toBe(422);
+      expect((await res.json()).error.issues[0].message).toContain("Grade 6 and Grade 9");
+    });
+
+    it("refuses a second certificate for the same milestone", async () => {
+      const ctx = await readyForCertificate("gamma", 6);
+      const body = { enrollmentId: ctx.enrolment.id, termId: ctx.term.id };
+
+      expect((await post("/transition-certificates", body, jsonHeaders("gamma", ctx.admin))).status)
+        .toBe(201);
+
+      // A reissue is a reprint of the frozen document, never a second one
+      // saying something different — which is the whole point of freezing it.
+      const again = await post("/transition-certificates", body, jsonHeaders("gamma", ctx.admin));
+      expect(again.status).toBe(409);
+    });
+
+    it("will not certify a child with nothing computed", async () => {
+      const school = await makeSchool({ subdomain: "delta" });
+      const stream = await makeStream(school, 9, "East");
+      const admin = await signInAt(school.id, "admin");
+      const student = await makeStudent(school, "2020/008", { streamId: stream.id });
+      const [enrolment] = await db
+        .select()
+        .from(enrollments)
+        .where(eq(enrollments.studentId, student.id));
+
+      /*
+       * Close the term first, or this tests the wrong refusal.
+       *
+       * The seeded term 3 ends in late October, so the open-term guard now
+       * answers before the empty-results check is ever reached — and asserting
+       * only "422" let that pass unnoticed. Both refusals are 422; the message
+       * is what says which one fired.
+       */
+      await db
+        .update(terms)
+        .set({ endsOn: dayFromNow(-1) })
+        .where(eq(terms.id, school.terms[2].id));
+
+      const res = await post("/transition-certificates", {
+        enrollmentId: enrolment.id,
+        termId: school.terms[2].id,
+      }, jsonHeaders("delta", admin));
+
+      // An empty certificate is worse than none: it is a document a family
+      // carries to another school saying nothing was ever recorded.
+      expect(res.status).toBe(422);
+      expect((await res.json()).error.issues[0].message).toContain("nothing to certify");
     });
   });
 

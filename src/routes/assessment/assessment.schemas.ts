@@ -116,6 +116,20 @@ export const computeResultsResultSchema = toZodV4SchemaTyped(
 
 export const reportCardSchema = toZodV4SchemaTyped(rawReportCard);
 
+/**
+ * A report card ready to print, QR and all.
+ *
+ * Nullable because a card frozen before verification existed has no code —
+ * older documents stay readable rather than breaking, and a screen can tell
+ * the difference instead of printing a QR that leads nowhere.
+ */
+export const printableReportCardSchema = toZodV4SchemaTyped(
+  rawReportCard.extend({
+    verificationUrl: z.string().nullable(),
+    verificationQrSvg: z.string().nullable(),
+  }),
+);
+
 export const finaliseReportCardSchema = toZodV4SchemaTyped(
   z.object({
     enrollmentId: z.uuid(),
@@ -149,3 +163,91 @@ export const finaliseReportCardSchema = toZodV4SchemaTyped(
       },
     ),
 );
+
+/**
+ * A merit list: the whole cohort ranked on one number.
+ *
+ * The most-read and most-argued sheet a Kenyan school produces, and the reason
+ * `showsPositions` exists — a school that has moved away from ranking children
+ * under CBE gets a refusal here rather than a list it did not want, because
+ * hiding it one query away from a screen is not the same as not producing it.
+ */
+export const meritListEntrySchema = toZodV4SchemaTyped(
+  z.object({
+    position: z.number().int(),
+    enrollmentId: z.uuid(),
+    studentId: z.uuid(),
+    admissionNumber: z.string(),
+    name: z.string(),
+    streamName: z.string(),
+    gradeLevelName: z.string(),
+    /** Mean of the learning-area means, to two places. */
+    overallMean: z.number(),
+    /** How many areas that mean is over — two children may differ. */
+    learningAreas: z.number().int(),
+  }),
+);
+
+export const meritListQuerySchema = z.object({
+  termId: z.uuid(),
+  /** Rank within one class, or across the whole grade. One or the other. */
+  streamId: z.uuid().optional(),
+  gradeLevelId: z.uuid().optional(),
+}).refine(
+  v => Boolean(v.streamId) !== Boolean(v.gradeLevelId),
+  {
+    /*
+     * Exactly one, and neither is a default.
+     *
+     * With neither, the query ranked the whole school — a list putting a Grade
+     * 1 above a Grade 9 on marks out of different papers, which is not a
+     * meaningless answer so much as a misleading one. With both, the second
+     * silently did nothing. A merit list is always OF something.
+     */
+    message: "Rank one class or one grade — give exactly one of streamId or gradeLevelId",
+    path: ["streamId"],
+  },
+);
+
+export const issueCertificateSchema = toZodV4SchemaTyped(
+  z.object({
+    enrollmentId: z.uuid(),
+    /** The final term of the child's last year at this level. */
+    termId: z.uuid(),
+    headComment: z.string().max(2000).optional(),
+  }),
+);
+
+export const transitionCertificateSchema = toZodV4SchemaTyped(
+  z.object({
+    id: z.uuid(),
+    enrollmentId: z.uuid(),
+    termId: z.uuid(),
+    milestone: z.enum(["grade_6", "grade_9"]),
+    snapshot: z.record(z.string(), z.unknown()),
+    issuedAt: z.string(),
+    /** The code printed on the certificate, and where to check it. */
+    verificationCode: z.string(),
+    verificationUrl: z.string(),
+  }),
+);
+
+export const transitionCertificateDetailSchema = toZodV4SchemaTyped(
+  z.object({
+    id: z.uuid(),
+    enrollmentId: z.uuid(),
+    termId: z.uuid(),
+    milestone: z.enum(["grade_6", "grade_9"]),
+    snapshot: z.record(z.string(), z.unknown()),
+    issuedAt: z.string(),
+    verificationCode: z.string(),
+    verificationUrl: z.string(),
+    /** Inline SVG, ready to drop into the printed page. */
+    verificationQrSvg: z.string(),
+  }),
+);
+
+export const listCertificatesQuerySchema = z.object({
+  termId: z.uuid().optional(),
+  milestone: z.enum(["grade_6", "grade_9"]).optional(),
+});

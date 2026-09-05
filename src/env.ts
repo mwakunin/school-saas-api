@@ -100,6 +100,22 @@ const EnvSchema = z.object({
    */
   DEMO_PASSWORD: z.string().min(8).default("demo-password-2026"),
 
+  // --- SMS (Africa's Talking) ---
+  //
+  // Picks the host: api.sandbox.africastalking.com vs api.africastalking.com.
+  // Sandbox only ever delivers to the simulator, so a school configured
+  // against it silently sends nothing real — which is why it is explicit.
+  AT_ENV: z.enum(["sandbox", "production"]).default("sandbox"),
+  AT_USERNAME: z.string().optional(),
+  AT_API_KEY: z.string().optional(),
+  /**
+   * The alphanumeric sender a parent sees instead of a shortcode.
+   *
+   * Optional because it has to be registered with Safaricom first, which takes
+   * weeks; without one, Africa's Talking sends from a shared shortcode.
+   */
+  AT_SENDER_ID: z.string().optional(),
+
   // --- M-Pesa ---
   // Picks the Daraja host: sandbox.safaricom.co.ke vs api.safaricom.co.ke.
   MPESA_ENV: z.enum(["sandbox", "production"]).default("sandbox"),
@@ -187,6 +203,26 @@ const EnvSchema = z.object({
         }
       }
 
+      /*
+       * Africa's Talking must be explicitly told which host it is on.
+       *
+       * `AT_ENV` defaults to sandbox, and sandbox silently delivers to a
+       * simulator and nowhere else. A production deployment that configured
+       * credentials and forgot the host would send four hundred fee reminders
+       * into a void, report every one as sent, and bill nothing — a failure
+       * with no error anywhere to notice.
+       */
+      if ((input.AT_USERNAME || input.AT_API_KEY) && !process.env.AT_ENV) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["AT_ENV"],
+          message:
+            "Must be set explicitly when Africa's Talking is configured — "
+            + "sandbox delivers to a simulator, so the default cannot be "
+            + "allowed to stand in production",
+        });
+      }
+
       if (input.MPESA_CALLBACK_URL && !input.MPESA_CALLBACK_URL.startsWith("https://")) {
         ctx.addIssue({
           code: "custom",
@@ -236,6 +272,22 @@ const EnvSchema = z.object({
 
     // Guard against a stray `pnpm test` running against — and truncating —
     // the development database.
+    /*
+     * Both halves of the SMS credential or neither.
+     *
+     * `smsEnabled` is a single boolean over the pair, so half a configuration
+     * reads as "SMS is off" — and a school that set a username, missed the key
+     * and saw no error would believe messaging was live. Paired here, the same
+     * way the M-Pesa credentials are.
+     */
+    if (Boolean(input.AT_USERNAME) !== Boolean(input.AT_API_KEY)) {
+      ctx.addIssue({
+        code: "custom",
+        path: [input.AT_USERNAME ? "AT_API_KEY" : "AT_USERNAME"],
+        message: "AT_USERNAME and AT_API_KEY must be set together",
+      });
+    }
+
     if (input.NODE_ENV === "test" && !input.TEST_DATABASE_URL) {
       ctx.addIssue({
         code: "custom",

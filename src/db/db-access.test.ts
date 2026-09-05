@@ -34,6 +34,12 @@ const OWNER_ALLOWLIST = new Map([
   ["routes/health.route.ts", "liveness probe; reaches no tenant data"],
   ["routes/superadmin/superadmin.handlers.ts", "the cross-tenant plane by design"],
   [
+    "routes/verify/verify.handlers.ts",
+    "a document verifier carries no session and no subdomain; the code in the "
+    + "path is the whole lookup, and it can only ever return the one document "
+    + "the caller already holds",
+  ],
+  [
     "routes/webhooks/webhooks.handlers.ts",
     "Safaricom callbacks carry no session and no subdomain; the token in the "
     + "path is what establishes the tenant, and reading it is the bootstrap",

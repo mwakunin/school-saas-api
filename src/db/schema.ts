@@ -115,12 +115,34 @@ export function oneOf(name: string, column: unknown, values: readonly string[]) 
    * could happen.
    */
   for (const value of values) {
-    if (!/^[a-z_]+$/.test(value))
+    // Lowercase, digits, underscore and dot: enough for `grade_6` and
+    // `marks.saved`, and still nothing that could close a quote or end a
+    // statement. The point is the shape of what may reach DDL, not brevity.
+    if (!/^[a-z0-9_.]+$/.test(value))
       throw new Error(`oneOf(${name}): unexpected value ${JSON.stringify(value)}`);
   }
 
   const list = values.map(v => `'${v}'`).join(", ");
   return check(name, sql`${column} IN (${sql.raw(list)})`);
+}
+
+/**
+ * The code printed on a document so anyone holding it can check it is real.
+ *
+ * A Kenyan school gets handed report cards and fee receipts from elsewhere all
+ * the time — at admission, at a transfer, when a parent disputes a payment —
+ * and has no way to tell a genuine one from a photocopy somebody edited. A
+ * document that verifies itself is the cheapest trust we can offer, and it is
+ * nearly free here because the content is ALREADY frozen: rule 7 snapshots
+ * exist precisely so that reprinting one cannot produce different output.
+ *
+ * 160 bits, base64url. Unguessable for the same reason `mpesa_callback_token`
+ * is: the endpoint that answers it is public and unauthenticated, so the code
+ * is the only thing between a stranger and somebody else's document. Short
+ * enough to fit under a QR without wrapping.
+ */
+function verificationCode(name = "verification_code") {
+  return text(name);
 }
 
 /**
@@ -738,6 +760,8 @@ export const payments = pgTable("payments", {
   mpesaTransactionId: uuid(),
   amountCents: integer().notNull(),
   reference: text(),
+  /** Printed on the receipt, so a parent's copy can be checked against us. */
+  verificationCode: verificationCode(),
   recordedBy: userRef("recorded_by").references(() => user.id),
   /** An instant, not a day — when the money actually arrived. */
   receivedAt: timestamp({ withTimezone: true }).notNull(),
@@ -747,6 +771,7 @@ export const payments = pgTable("payments", {
   createdAt: createdAt(),
 }, t => [
   unique("payments_school_id_id_key").on(t.schoolId, t.id),
+  unique("payments_verification_code_key").on(t.verificationCode),
   // How a family paid is what a bursar reconciles against — the M-Pesa
   // statement, the bank slip, the cash book. A method belonging to none of
   // them cannot be checked against anything.
@@ -1157,6 +1182,14 @@ export const reportCards = pgTable("report_cards", {
   snapshot: jsonb().notNull(),
   pdfUrl: text(),
 
+  /**
+   * Printed on the document so a stranger holding it can check it is real.
+   *
+   * Set at finalisation, alongside the snapshot it verifies — before that
+   * there is nothing frozen to stand behind. See `verificationCode` above.
+   */
+  verificationCode: verificationCode(),
+
   classTeacherComment: text(),
   headComment: text(),
   attendancePresent: integer(),
@@ -1168,6 +1201,7 @@ export const reportCards = pgTable("report_cards", {
   releasedAt: timestamp({ withTimezone: true }),
 }, t => [
   unique().on(t.enrollmentId, t.termId),
+  unique("report_cards_verification_code_key").on(t.verificationCode),
   unique("report_cards_school_id_id_key").on(t.schoolId, t.id),
   foreignKey({
     columns: [t.schoolId, t.enrollmentId],
@@ -1190,6 +1224,14 @@ export const reportCards = pgTable("report_cards", {
     "report_cards_released_after_finalised",
     sql`${t.releasedAt} IS NULL OR ${t.finalisedAt} IS NOT NULL`,
   ),
+  // And a code implies something to verify. The code is minted with the
+  // snapshot at finalisation; one on an unfrozen row would resolve publicly to
+  // a document whose contents could still change — which is the opposite of
+  // what it is for.
+  check(
+    "report_cards_verified_after_finalised",
+    sql`${t.verificationCode} IS NULL OR ${t.finalisedAt} IS NOT NULL`,
+  ),
 ]);
 
 /**
@@ -1199,6 +1241,208 @@ export const reportCards = pgTable("report_cards", {
  * omission rather than an invisible one — `rls.test.ts` asserts that every
  * table carrying a `school_id` column appears here with a policy.
  */
+// ---------------------------------------------------------------------------
+// 5.9 Verifiable documents, messaging and the audit trail
+// ---------------------------------------------------------------------------
+
+/**
+ * Certificates for the two points a CBE learner moves on.
+ *
+ * Grade 6 to junior school, Grade 9 to senior school — the transitions a
+ * Kenyan family actually needs paperwork for, and the years `sequence` already
+ * marks as candidate years (KPSEA and KJSEA). Derived from the sequence rather
+ * than stored as a flag, exactly as §5.2 requires.
+ *
+ * A frozen snapshot, like a report card and for the same reason: a certificate
+ * reprinted in 2030 for a child applying somewhere has to say what it said
+ * when it was issued, whatever happened to the marks behind it since.
+ */
+export const transitionCertificates = pgTable("transition_certificates", {
+  id: uuid().primaryKey().defaultRandom(),
+  schoolId: uuid().notNull().references(() => schools.id),
+  enrollmentId: uuid().notNull(),
+  termId: uuid().notNull(),
+
+  /** Which milestone. Derived from the grade's sequence at issue time. */
+  milestone: text().$type<"grade_6" | "grade_9">().notNull(),
+
+  snapshot: jsonb().notNull(),
+  verificationCode: verificationCode().notNull(),
+
+  issuedBy: userRef("issued_by").references(() => user.id),
+  issuedAt: timestamp({ withTimezone: true }).defaultNow().notNull(),
+}, t => [
+  // One per child per milestone. A reissue is a reprint of the same frozen
+  // document, never a second one saying something different.
+  unique().on(t.enrollmentId, t.milestone),
+  unique("transition_certificates_verification_code_key").on(t.verificationCode),
+  unique("transition_certificates_school_id_id_key").on(t.schoolId, t.id),
+  foreignKey({
+    columns: [t.schoolId, t.enrollmentId],
+    foreignColumns: [enrollments.schoolId, enrollments.id],
+    name: "transition_certificates_school_enrollment_fk",
+  }),
+  foreignKey({
+    columns: [t.schoolId, t.termId],
+    foreignColumns: [terms.schoolId, terms.id],
+    name: "transition_certificates_school_term_fk",
+  }),
+  index().on(t.schoolId, t.termId),
+  oneOf("transition_certificates_milestone_known", t.milestone, ["grade_6", "grade_9"]),
+]);
+
+/**
+ * Every SMS the school has sent, and what it cost.
+ *
+ * CLAUDE.md §6 asks for this before v1 because Africa's Talking charges per
+ * unit and reports delivery asynchronously, so a school WILL ask what they are
+ * spending and whether a message actually arrived. Without a row per message
+ * neither question has an answer, and "did the parent get the fee reminder"
+ * becomes an argument rather than a lookup.
+ */
+export const smsMessages = pgTable("sms_messages", {
+  id: uuid().primaryKey().defaultRandom(),
+  schoolId: uuid().notNull().references(() => schools.id),
+
+  /** Who it concerns. Both nullable: a message may be about neither. */
+  guardianId: uuid(),
+  studentId: uuid(),
+
+  /** E.164, normalised on write (rule 10) — this is what the provider dials. */
+  toPhone: text().notNull(),
+  body: text().notNull(),
+
+  /** Groups one broadcast, so a school can see and cost a send as one act. */
+  batchId: uuid(),
+  kind: text().$type<"results" | "fees" | "announcement">().notNull(),
+
+  /** The provider's id, which is how an async delivery report finds this row. */
+  providerMessageId: text(),
+  status: text()
+    .$type<"queued" | "sent" | "delivered" | "failed" | "rejected">()
+    .notNull()
+    .default("queued"),
+  statusReason: text(),
+
+  /*
+   * Cost in cents, and the whole-shilling CHECK deliberately does NOT apply.
+   *
+   * Rule 3 says money is integer cents, and it is — but an SMS costs a
+   * fraction of a shilling (Africa's Talking quotes "KES 0.8000"), so this is
+   * one of the few amounts in the system that is genuinely sub-shilling.
+   * Applying `wholeShillings` here would reject every real price.
+   */
+  costCents: integer(),
+  /** Long messages bill as several units; a school is charged per unit. */
+  segments: integer(),
+
+  requestedBy: userRef("requested_by").references(() => user.id),
+  queuedAt: timestamp({ withTimezone: true }).defaultNow().notNull(),
+  sentAt: timestamp({ withTimezone: true }),
+}, t => [
+  unique("sms_messages_school_id_id_key").on(t.schoolId, t.id),
+  foreignKey({
+    columns: [t.schoolId, t.guardianId],
+    foreignColumns: [guardians.schoolId, guardians.id],
+    name: "sms_messages_school_guardian_fk",
+  }),
+  foreignKey({
+    columns: [t.schoolId, t.studentId],
+    foreignColumns: [students.schoolId, students.id],
+    name: "sms_messages_school_student_fk",
+  }),
+  index().on(t.schoolId, t.queuedAt),
+  index().on(t.schoolId, t.batchId),
+  // The provider's id is how a delivery report finds the row it belongs to.
+  index().on(t.providerMessageId),
+  oneOf("sms_messages_status_known", t.status, [
+    "queued",
+    "sent",
+    "delivered",
+    "failed",
+    "rejected",
+  ]),
+  oneOf("sms_messages_kind_known", t.kind, ["results", "fees", "announcement"]),
+  check("sms_messages_cost_not_negative", sql`${t.costCents} IS NULL OR ${t.costCents} >= 0`),
+]);
+
+/**
+ * Who changed a mark, who reversed a payment, who released a report card.
+ *
+ * CLAUDE.md §6 asks for this and names those three events. It is both a
+ * safeguard and a sales point: a product holding children's records and school
+ * money should be able to answer "who did this" without a database dump, and a
+ * head asked that question by a parent or a board needs the answer in a
+ * screen.
+ *
+ * Append-only at the database level, not by convention — the runtime role gets
+ * INSERT and SELECT and nothing else. A log the application can rewrite is
+ * evidence of nothing, and the whole value here is that it cannot be tidied
+ * after the fact by whoever wishes it were different.
+ */
+export const auditLog = pgTable("audit_log", {
+  id: uuid().primaryKey().defaultRandom(),
+  schoolId: uuid().notNull().references(() => schools.id),
+
+  /** Null for something the system did without a person asking. */
+  actorId: userRef("actor_id").references(() => user.id),
+
+  /*
+   * Written out rather than pointing at a named type.
+   *
+   * `db/enum-checks.test.ts` reads this file's syntax tree and can only see an
+   * inline union — a `$type<AuditAction>()` alias would slip past the guard
+   * that makes sure the database says the same thing the type does. The list
+   * below and the one in `oneOf` are cross-checked by that test, so the
+   * duplication is what keeps them honest rather than an oversight.
+   */
+  action: text().$type<
+    | "assessment.published"
+    | "assessment.unpublished"
+    | "certificate.issued"
+    | "invoice.voided"
+    | "marks.saved"
+    | "mpesa.allocated"
+    | "mpesa.rejected"
+    | "payment.recorded"
+    | "payment.reversed"
+    | "report_card.finalised"
+    | "report_card.released"
+    | "sms.queued"
+  >().notNull(),
+
+  /** What it happened to. Not a foreign key: the log outlives what it names. */
+  entityType: text().notNull(),
+  entityId: uuid(),
+
+  /** One line a human can read without joining anything. */
+  summary: text().notNull(),
+  /** Whatever the action needs recorded — an old mark, a reversal reason. */
+  detail: jsonb(),
+
+  at: timestamp({ withTimezone: true }).defaultNow().notNull(),
+}, t => [
+  index().on(t.schoolId, t.at),
+  index().on(t.schoolId, t.entityType, t.entityId),
+  oneOf("audit_log_action_known", t.action, [
+    "assessment.published",
+    "assessment.unpublished",
+    "certificate.issued",
+    "invoice.voided",
+    "marks.saved",
+    "mpesa.allocated",
+    "mpesa.rejected",
+    "payment.recorded",
+    "payment.reversed",
+    "report_card.finalised",
+    "report_card.released",
+    "sms.queued",
+  ]),
+]);
+
+/** What an audit entry may record — taken from the column, never restated. */
+export type AuditAction = NonNullable<(typeof auditLog.$inferInsert)["action"]>;
+
 export const TENANT_TABLES = [
   "memberships",
   "academic_years",
@@ -1222,6 +1466,9 @@ export const TENANT_TABLES = [
   "score_attachments",
   "term_results",
   "report_cards",
+  "transition_certificates",
+  "sms_messages",
+  "audit_log",
 ] as const;
 
 // ---------------------------------------------------------------------------
