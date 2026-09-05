@@ -352,13 +352,17 @@ export const unpublishAssessment: TenantRouteHandler<UnpublishAssessmentRoute> =
   const { id } = c.req.valid("param");
   const db = c.var.db;
 
-  const [updated] = await db
+  const [withdrawn] = await db
     .update(assessments)
     .set({ publishedAt: null })
     .where(and(eq(assessments.id, id), isNotNull(assessments.publishedAt)))
-    .returning({ id: assessments.id });
+    .returning({
+      id: assessments.id,
+      termId: assessments.termId,
+      learningAreaId: assessments.learningAreaId,
+    });
 
-  if (!updated) {
+  if (!withdrawn) {
     const exists = await db
       .select({ id: assessments.id })
       .from(assessments)
@@ -368,6 +372,28 @@ export const unpublishAssessment: TenantRouteHandler<UnpublishAssessmentRoute> =
       ? c.json({ message: HttpStatusPhrases.NOT_FOUND }, HttpStatusCodes.NOT_FOUND)
       : c.json({ message: "Not published" }, HttpStatusCodes.CONFLICT);
   }
+
+  /*
+   * Clear this area's results for the term, or the withdrawal is cosmetic.
+   *
+   * `term_results` is an aggregate that was computed while this assessment was
+   * published, and nothing recomputes it until somebody asks. Leaving the rows
+   * standing meant `/term-results` — and now the PARENT PORTAL, which reads
+   * them — kept serving a mean derived from marks that had just been pulled
+   * back from view. Withdrawing exists precisely so parents stop seeing them.
+   *
+   * Deleted rather than narrowed to the remaining published assessments. That
+   * under-reports until the next recompute, and under-reporting is the right
+   * direction: absent reads as "not marked yet", stale reads as fact — the
+   * same rule `computeTermResults` already follows when it clears results
+   * nothing stands behind.
+   */
+  await db
+    .delete(termResults)
+    .where(and(
+      eq(termResults.termId, withdrawn.termId),
+      eq(termResults.learningAreaId, withdrawn.learningAreaId),
+    ));
 
   /*
    * Withdrawing is the one worth logging most.

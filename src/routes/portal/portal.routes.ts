@@ -4,7 +4,8 @@ import { jsonContent } from "stoker/openapi/helpers";
 import { createMessageObjectSchema, IdUUIDParamsSchema } from "stoker/openapi/schemas";
 
 import { forbiddenSchema, notFoundSchema, unauthorizedSchema } from "@/lib/constants";
-import { requireMembershipRole } from "@/middlewares/auth";
+import { requireAuth, requireMembershipRole } from "@/middlewares/auth";
+import { withMembership } from "@/middlewares/tenant";
 
 import {
   childFeesSchema,
@@ -32,7 +33,14 @@ import {
  * another's.
  */
 const tags = ["Parent portal"];
-const guardianOnly = requireMembershipRole("guardian");
+/*
+ * Reading a child's records needs the membership; claiming cannot.
+ *
+ * A parent's first request is the claim, before anything has granted them a
+ * role — so that route takes a session and the tenant, and the claim itself
+ * creates the membership when it links something.
+ */
+const guardianOnly = [withMembership, requireMembershipRole("guardian")];
 
 const errorResponses = {
   [HttpStatusCodes.UNAUTHORIZED]: jsonContent(unauthorizedSchema, "Not signed in"),
@@ -54,7 +62,7 @@ export const claim = createRoute({
     + "would let anyone who knows a parent's number read their child's marks. "
     + "A parent whose details differ from the school's records is linked by "
     + "the office instead — see `POST /guardians/{id}/link`.",
-  middleware: [guardianOnly],
+  middleware: [requireAuth],
   responses: {
     [HttpStatusCodes.OK]: jsonContent(claimResultSchema, "What was linked"),
     ...errorResponses,
@@ -66,7 +74,7 @@ export const myChildren = createRoute({
   method: "get",
   path: "/portal/children",
   summary: "My children at this school",
-  middleware: [guardianOnly],
+  middleware: guardianOnly,
   responses: {
     [HttpStatusCodes.OK]: jsonContent(myChildrenSchema, "Children and balances"),
     [HttpStatusCodes.CONFLICT]: jsonContent(
@@ -86,7 +94,7 @@ export const childResults = createRoute({
     "Built only from PUBLISHED assessments, which is what `publishedAt` is "
     + "for: teachers enter marks over days and correct them, and a parent must "
     + "not see a half-entered exam.",
-  middleware: [guardianOnly],
+  middleware: guardianOnly,
   request: { params: IdUUIDParamsSchema },
   responses: {
     [HttpStatusCodes.OK]: jsonContent(z.array(childResultsSchema), "Results"),
@@ -103,7 +111,7 @@ export const childReportCards = createRoute({
     "RELEASED only. A finalised card the head has not released yet is not a "
     + "document the family is meant to have, and the frozen snapshot is what "
     + "is returned — the same page that was printed.",
-  middleware: [guardianOnly],
+  middleware: guardianOnly,
   request: { params: IdUUIDParamsSchema },
   responses: {
     [HttpStatusCodes.OK]: jsonContent(z.array(childReportCardSchema), "Report cards"),
@@ -121,7 +129,7 @@ export const childFees = createRoute({
     + "M-Pesa account reference, so a parent pays from the screen showing the "
     + "balance rather than typing a number from memory — which is most of what "
     + "lands in the reconciliation queue.",
-  middleware: [guardianOnly],
+  middleware: guardianOnly,
   request: { params: IdUUIDParamsSchema },
   responses: {
     [HttpStatusCodes.OK]: jsonContent(childFeesSchema, "Fees and payments"),

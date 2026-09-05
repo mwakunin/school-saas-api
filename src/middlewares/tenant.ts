@@ -163,21 +163,27 @@ export const withMembership = createMiddleware<TenantBindings>(async (c, next) =
       eq(memberships.isActive, true),
     ));
 
-  if (rows.length === 0) {
-    // 404, not 403. A signed-in user with no membership here must not be able
-    // to tell a school that exists from one that does not — otherwise the
-    // subdomain space becomes a directory of our customers.
-    return c.json(
-      { message: "No school found for this address" },
-      HttpStatusCodes.NOT_FOUND,
-    );
-  }
-
-  // One person may hold several roles at one school — CLAUDE.md §5.1 keeps a
-  // teacher who is also a parent on a single login — so this is a set, and
-  // authorization asks whether it intersects what a route allows.
+  /*
+   * Loads the membership; does NOT refuse. `requireMembershipRole` refuses.
+   *
+   * This used to 404 here, which made the two inseparable — and that broke the
+   * parent portal, where the whole point of `POST /portal/claim` is that a
+   * parent arrives with no membership and the claim is what grants them one.
+   * Behind a rejecting `withMembership` the route was unreachable by anybody
+   * who needed it.
+   *
+   * The 404 has moved rather than gone: an empty role set is refused by the
+   * guard with NOT_FOUND, so a signed-in stranger still cannot tell a school
+   * that exists from one that does not. Every tenant route carries a guard, so
+   * nothing becomes reachable that was not before — except the routes that
+   * deliberately ask only for a session.
+   *
+   * One person may hold several roles at one school (§5.1 keeps a teacher who
+   * is also a parent on one login), so this is a set and authorization asks
+   * whether it intersects what a route allows.
+   */
   c.set("membership", {
-    schoolId: rows[0].schoolId,
+    schoolId: c.var.school.id,
     roles: rows.map(r => r.role),
   });
 

@@ -356,6 +356,37 @@ describe("assessment", () => {
       expect(after.results).toBe(1);
     });
 
+    it("stops serving results built from a withdrawn assessment", async () => {
+      const ctx = await withMarks("alpha");
+      await post("/term-results/compute", { termId: ctx.term.id }, jsonHeaders("alpha", ctx.admin));
+
+      const before = await (await app.request(
+        `/term-results?termId=${ctx.term.id}&enrollmentId=${ctx.pupils[0].enrolmentId}`,
+        { headers: tenantHeaders("alpha", ctx.admin) },
+      )).json();
+      expect(Number(before[0].meanScore)).toBe(90);
+
+      await post(`/assessments/${ctx.assessment.id}/unpublish`, {}, jsonHeaders("alpha", ctx.teacher));
+
+      /*
+       * Withdrawing has to actually withdraw.
+       *
+       * `term_results` was computed while the assessment was published and
+       * nothing recomputes it until somebody asks — so the row stood, and
+       * `/term-results` and the parent portal both kept serving a mean built
+       * from marks that had just been pulled back from view. The whole reason
+       * to unpublish is that parents stop seeing them.
+       *
+       * Absent, not corrected: absent reads as "not marked yet", stale reads
+       * as fact. Recomputing restores whatever is still published.
+       */
+      const after = await (await app.request(
+        `/term-results?termId=${ctx.term.id}&enrollmentId=${ctx.pupils[0].enrolmentId}`,
+        { headers: tenantHeaders("alpha", ctx.admin) },
+      )).json();
+      expect(after).toHaveLength(0);
+    });
+
     it("closes a published assessment to edits", async () => {
       const ctx = await seed("alpha");
       const assessment = await makeAssessment(ctx);
@@ -671,18 +702,23 @@ describe("assessment", () => {
 
       // The assessment is withdrawn — a mark was wrong and is being redone.
       await post(`/assessments/${assessment.id}/unpublish`, {}, jsonHeaders("alpha", ctx.teacher));
+
+      /*
+       * `cleared` is 0 now, and that is the improvement rather than a
+       * regression.
+       *
+       * This used to be the only thing that removed the stale figure, which
+       * left it standing from the withdrawal until somebody thought to
+       * recompute — and the parent portal reads these rows. Unpublishing now
+       * clears them itself, so by the time a recompute runs there is nothing
+       * left to find. Recompute keeps the same behaviour as a backstop.
+       */
       const recompute = await (await post(
         "/term-results/compute",
         { termId: ctx.term.id },
         jsonHeaders("alpha", ctx.admin),
       )).json();
-
-      /*
-       * The previous figure used to stand, so `/term-results` and any report
-       * card finalised afterwards reported a mark derived from data no longer
-       * published. Stale reads as fact; absent reads as "not marked yet".
-       */
-      expect(recompute.cleared).toBeGreaterThan(0);
+      expect(recompute.cleared).toBe(0);
 
       const after = await (await app.request(
         `/term-results?termId=${ctx.term.id}&enrollmentId=${ctx.pupils[0].enrolmentId}`,

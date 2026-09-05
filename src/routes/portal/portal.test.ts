@@ -82,6 +82,30 @@ describe("parent portal", () => {
   });
 
   describe("claiming an account", () => {
+    it("works for a parent who has never been granted anything", async () => {
+      const ctx = await seed("alpha");
+      const phone = nextPhone();
+      await ctx.family(phone, ["2026/001"]);
+
+      // A real parent signs up and arrives with NO membership. Claiming is how
+      // they get one, so claiming behind `withMembership` meant they could
+      // never reach it — the portal was open only to people an admin had
+      // already granted the role to by hand, which is nobody.
+      const parent = await signIn(phone);
+      await db.update(user)
+        .set({ phoneNumberVerified: true })
+        .where(eq(user.id, parent.id));
+
+      const claimed = await (await post("/portal/claim", {}, jsonHeaders("alpha", parent))).json();
+      expect(claimed.linked).toBe(1);
+
+      // And the claim granted the role, so the rest of the portal opens.
+      const children = await app.request("/portal/children", {
+        headers: tenantHeaders("alpha", parent),
+      });
+      expect(children.status).toBe(200);
+    });
+
     it("links a guardian by their verified phone number", async () => {
       const ctx = await seed("alpha");
       const phone = nextPhone();
@@ -252,6 +276,26 @@ describe("parent portal", () => {
   });
 
   describe("the office fallback", () => {
+    it("grants the guardian role, or the link achieves nothing", async () => {
+      const ctx = await seed("alpha");
+      const mine = await ctx.family(nextPhone(), ["2026/001"]);
+      // Signed up, never granted anything.
+      const parent = await signUpWithEmail(nextEmail());
+
+      await post(
+        `/guardians/${mine.guardian.id}/link`,
+        { email: parent.email },
+        jsonHeaders("alpha", ctx.office),
+      );
+
+      // Without the membership the office would have done the work and the
+      // family would still get a 404 from every portal route.
+      const res = await app.request("/portal/children", {
+        headers: tenantHeaders("alpha", parent),
+      });
+      expect(res.status).toBe(200);
+    });
+
     it("links a parent whose details do not match the school's", async () => {
       const ctx = await seed("alpha");
       const mine = await ctx.family(nextPhone(), ["2026/001"]);

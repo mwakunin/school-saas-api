@@ -575,6 +575,10 @@ Linking an account to a guardian record happens two ways, and both are needed:
 - **`POST /portal/claim`** — self-service, matching a **verified** phone or email against what the school recorded. Verified is the whole safety of it: an unverified identifier would let anyone who knows a parent's number read a child's marks. A record another account already holds is never taken, because two parents can legitimately share a number and the first to claim it holds it.
 - **`POST /guardians/{id}/link`** — the office, by email. The fallback for the ordinary case self-service cannot cover: a parent who signed up with different details, or who cannot receive SMS. The counter staff confirm identity in person, which is a stronger check than any identifier match, and it is audited.
 
+`withMembership` **loads** the membership; `requireMembershipRole` **refuses**. They used to be one thing, and that made `POST /portal/claim` unreachable by the only people who need it — a parent arrives with no membership and the claim is what grants them one. The 404 moved rather than went: an empty role set is refused with NOT_FOUND, so a signed-in stranger still cannot tell a school that exists from one that does not, while a member holding the wrong role gets an honest 403.
+
+Worth knowing when adding a route: every tenant router mounts at `/` and registers its middleware at `/*`, so a request inherits the middleware of every router mounted **before** it as well as its own. Route protection must therefore never depend on mount order — which is why the fix above was to change the middleware rather than to move the portal up the list.
+
 **Membership management is tenant-side too** (`/memberships`). The superadmin plane still grants the FIRST one, because a school that has just been created has no admin to do it — everything after that is the head's. The last active admin cannot be deactivated: a school that locked itself out would need the platform operator to get back in, which is the dependency these routes exist to remove.
 
 ---

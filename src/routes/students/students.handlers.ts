@@ -9,6 +9,7 @@ import {
   enrollments,
   gradeLevels,
   guardians,
+  memberships,
   streams,
   studentGuardians,
   students,
@@ -888,13 +889,26 @@ export const linkGuardianAccount: TenantRouteHandler<LinkGuardianAccountRoute> =
   }
 
   /*
-   * Never quietly move a record off somebody else's account.
+   * The ownership check goes in the WHERE, not before it.
    *
-   * Re-linking is a real need — a family changes phones, a parent loses an
-   * address — but doing it silently would take one person's view of their
-   * children away with nothing recorded. Unlink first, deliberately.
+   * Never quietly move a record off somebody else's account: re-linking is a
+   * real need — a family changes phones, a parent loses an address — but doing
+   * it silently would take one person's view of their children away with
+   * nothing recorded. Reading the owner and then writing leaves a window where
+   * a concurrent claim slips in between; making the predicate part of the
+   * UPDATE closes it. Re-linking to the SAME account stays a success, because
+   * an office repeating itself is not an error.
    */
-  if (guardian.userId && guardian.userId !== person.id) {
+  const [linked] = await db
+    .update(guardians)
+    .set({ userId: person.id })
+    .where(and(
+      eq(guardians.id, id),
+      or(isNull(guardians.userId), eq(guardians.userId, person.id)),
+    ))
+    .returning();
+
+  if (!linked) {
     return c.json(
       {
         message:
@@ -905,11 +919,21 @@ export const linkGuardianAccount: TenantRouteHandler<LinkGuardianAccountRoute> =
     );
   }
 
-  const [linked] = await db
-    .update(guardians)
-    .set({ userId: person.id })
-    .where(eq(guardians.id, id))
-    .returning();
+  /*
+   * Grant the guardian role too, or the link achieves nothing.
+   *
+   * Every portal read is behind `withMembership`, so a linked parent with no
+   * membership still sees a 404 — the office would have done the work and the
+   * family would still be locked out. Reactivating rather than inserting
+   * blindly restores a parent whose access was revoked earlier.
+   */
+  await db
+    .insert(memberships)
+    .values({ userId: person.id, schoolId: c.var.school.id, role: "guardian" })
+    .onConflictDoUpdate({
+      target: [memberships.userId, memberships.schoolId, memberships.role],
+      set: { isActive: true },
+    });
 
   await recordAudit(db, {
     schoolId: c.var.school.id,

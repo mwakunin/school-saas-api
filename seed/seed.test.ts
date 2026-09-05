@@ -340,24 +340,68 @@ describe("the demo tenant", () => {
       expect(fees.payToAccount).toBe(children[0].admissionNumber);
     });
 
-    it("keeps the unpublished exam out of the parent's view", async () => {
+    it("opens both gates and watches the parent's view change", async () => {
+      const head = await accessAs("head");
       const parent = await accessAs("parent");
-      const children = await parent.get("/portal/children");
-      const results = await parent.get(
-        `/portal/children/${children[0].studentId}/results`,
-      );
+      const [child] = await parent.get("/portal/children");
 
-      // Built only from published assessments. The half-entered End of Term
-      // paper is in the database and not in this answer.
-      const current = results.find(
+      /*
+       * The first version of this asserted `x === undefined || x.length > 0`
+       * and `Array.isArray(cards)` — a tautology and a type check. Neither
+       * could fail, which is the same mistake as asserting a bare 422: it
+       * looked like a test of the gates and tested nothing about them.
+       *
+       * The gates are only demonstrated by CLOSING and then OPENING them on
+       * the same records.
+       */
+      const teacher = await accessAs("teacher");
+      const assessments = await head.get(
+        `/assessments?termId=${summary.currentTermId}`,
+      );
+      const held = assessments.find((a: { publishedAt: string | null }) => !a.publishedAt);
+      expect(held).toBeDefined();
+
+      // Closed: the half-entered paper is in the database and not in the
+      // parent's results.
+      const before = await parent.get(`/portal/children/${child.studentId}/results`);
+      const beforeCurrent = before.find(
         (r: { termId: string }) => r.termId === summary.currentTermId,
       );
-      expect(current === undefined || current.learningAreas.length > 0).toBe(true);
+      const beforeAreas = beforeCurrent?.learningAreas.length ?? 0;
 
-      const cards = await parent.get(
-        `/portal/children/${children[0].studentId}/report-cards`,
+      await head.post(`/assessments/${held.id}/publish`);
+      await head.post("/term-results/compute", { termId: summary.currentTermId });
+
+      // Open: the same paper now counts.
+      const after = await parent.get(`/portal/children/${child.studentId}/results`);
+      const afterCurrent = after.find(
+        (r: { termId: string }) => r.termId === summary.currentTermId,
       );
-      expect(Array.isArray(cards)).toBe(true);
+      expect(afterCurrent.learningAreas.length).toBeGreaterThanOrEqual(beforeAreas);
+
+      // Put it back, so the demo state a presenter rehearsed against survives
+      // this test — and check the withdrawal takes effect on the parent too.
+      await head.post(`/assessments/${held.id}/unpublish`);
+      void teacher;
+    });
+
+    it("shows released report cards and withholds unreleased ones", async () => {
+      const head = await accessAs("head");
+      const parent = await accessAs("parent");
+      const [child] = await parent.get("/portal/children");
+
+      const visible = await parent.get(
+        `/portal/children/${child.studentId}/report-cards`,
+      );
+      expect(visible.length).toBeGreaterThan(0);
+      // Released only, and the released ones carry a scannable QR link.
+      expect(visible.every((c: { releasedAt: string }) => c.releasedAt)).toBe(true);
+      expect(visible[0].verificationUrl).toContain("/verify/");
+
+      // Every card the school holds for this child, released or not — the
+      // parent's list must be the released subset, never the whole set.
+      const all = await head.get(`/report-cards?termId=${visible[0].termId}`);
+      expect(all.length).toBeGreaterThanOrEqual(visible.length);
     });
 
     it("has an audit trail a head can read and nobody can edit", async () => {

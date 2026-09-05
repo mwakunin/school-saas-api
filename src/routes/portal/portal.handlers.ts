@@ -12,6 +12,7 @@ import {
   guardians,
   invoices,
   learningAreas,
+  memberships,
   payments,
   reportCards,
   streams,
@@ -118,36 +119,63 @@ export const claim: TenantRouteHandler<ClaimRoute> = async (c) => {
     .where(or(...matchers));
 
   const alreadyLinked = candidates.filter(g => g.userId === userId).length;
+
   /*
-   * Never take a record that belongs to somebody else's account.
+   * `user_id IS NULL` in the WHERE, not filtered in code.
    *
    * Two parents can legitimately share a phone number, and the first to claim
-   * it holds it. Reassigning would silently move one family's view of their
-   * children onto another person's login.
+   * it holds it — reassigning would silently move one family's view of their
+   * children onto another login. Reading the owner and then writing leaves a
+   * window where both callers see null and the second overwrites the first;
+   * putting the condition in the UPDATE and taking the RETURNING rows as the
+   * answer closes it, because the predicate is re-evaluated at write time.
    */
-  const claimable = candidates.filter(g => g.userId === null);
+  const claimed = candidates.length === 0
+    ? []
+    : await db
+        .update(guardians)
+        .set({ userId })
+        .where(and(
+          inArray(guardians.id, candidates.map(g => g.id)),
+          isNull(guardians.userId),
+        ))
+        .returning({ id: guardians.id });
 
-  if (claimable.length > 0) {
-    await db
-      .update(guardians)
-      .set({ userId })
-      .where(inArray(guardians.id, claimable.map(g => g.id)));
-
+  if (claimed.length > 0) {
     await recordAudit(db, {
       schoolId: c.var.school.id,
       actorId: userId,
       action: "guardian.linked",
       entityType: "guardian",
-      entityId: claimable[0].id,
+      entityId: claimed[0].id,
       summary: `A guardian linked their own account by verified ${matchedOn.join(" and ")}`,
-      detail: { guardianIds: claimable.map(g => g.id), matchedOn },
+      detail: { guardianIds: claimed.map(g => g.id), matchedOn },
     });
+  }
+
+  /*
+   * The membership is part of linking, not a separate act by an admin.
+   *
+   * Without it a parent who claims successfully still cannot read anything:
+   * every other portal route is behind `withMembership`, and nothing else in
+   * the product would ever grant them the role. Reactivating rather than
+   * inserting blindly, so a previously revoked parent who claims again is
+   * restored rather than colliding with their own old row.
+   */
+  if (claimed.length > 0 || alreadyLinked > 0) {
+    await db
+      .insert(memberships)
+      .values({ userId, schoolId: c.var.school.id, role: "guardian" })
+      .onConflictDoUpdate({
+        target: [memberships.userId, memberships.schoolId, memberships.role],
+        set: { isActive: true },
+      });
   }
 
   const children = await childrenOf(db, userId);
 
   return c.json({
-    linked: claimable.length,
+    linked: claimed.length,
     alreadyLinked,
     children: children.length,
     matchedOn,
