@@ -121,7 +121,9 @@ export async function seedDemo(): Promise<SeedSummary> {
     terms: TERM_DATES,
     pupils: register.pupils.length,
     streams: ctx.streams.length,
-    assessments: history.assessments + current.published + 1,
+    // Every one of them, including last year's — a printed figure that is
+    // quietly short is worse than no figure.
+    assessments: history.assessments + current.published + 1 + leavers.assessments,
     reportCards: history.reportCards,
     invoices: fees.invoicesGenerated,
     unmatched: fees.stillUnmatched,

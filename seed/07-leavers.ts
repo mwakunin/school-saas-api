@@ -31,6 +31,8 @@ const GRADE_9_LEAVERS = 16;
 
 export interface Leavers {
   academicYear: number;
+  /** Counted and returned, so the printed total is not short by last year's. */
+  assessments: number;
   certificatesIssued: number;
   graduated: number;
   /** One certificate a presenter can open and scan. */
@@ -48,6 +50,7 @@ export async function seedLeavers(
 
   const prior = ctx.priorYear;
   const examined = curriculum.areas.filter(a => EXAMINED.includes(a.name));
+  let assessments = 0;
 
   /** One end-of-year paper per examined area, marked and published. */
   async function record(streamId: string, enrolmentIds: string[]) {
@@ -73,6 +76,7 @@ export async function seedLeavers(
         })),
       });
       await teacher.post(`/assessments/${assessment.id}/publish`);
+      assessments += 1;
     }
   }
 
@@ -154,6 +158,7 @@ export async function seedLeavers(
 
   return {
     academicYear: prior.year,
+    assessments,
     certificatesIssued,
     graduated,
     sample: sample!,

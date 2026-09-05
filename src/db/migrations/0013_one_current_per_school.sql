@@ -1,0 +1,2 @@
+CREATE UNIQUE INDEX "academic_years_one_current_per_school" ON "academic_years" USING btree ("school_id") WHERE "academic_years"."is_current";--> statement-breakpoint
+CREATE UNIQUE INDEX "terms_one_current_per_school" ON "terms" USING btree ("school_id") WHERE "terms"."is_current";

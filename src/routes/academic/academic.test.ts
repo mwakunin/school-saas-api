@@ -1,12 +1,13 @@
-import { eq } from "drizzle-orm";
+import { and, eq, ne } from "drizzle-orm";
 import { beforeEach, describe, expect, it } from "vitest";
 
 import type { TestUser } from "@/test/helpers";
 
 import app from "@/app";
 import db from "@/db";
-import { terms } from "@/db/schema";
+import { academicYears, terms } from "@/db/schema";
 import { termForDay, termsForYear } from "@/lib/academic-spine";
+import { isUniqueViolation, pgConstraintName } from "@/lib/db-errors";
 import {
   makeSchool,
   resetDb,
@@ -330,6 +331,117 @@ describe("academic spine", () => {
       // defaulting to term 1.
       expect(termForDay(2026, "2026-12-25")).toBeNull();
       expect(termForDay(2026, "2026-04-20")).toBeNull();
+    });
+  });
+
+  /**
+   * One current term per school, and one current year — held by the database.
+   *
+   * The handlers clear the flag and then set it, which is correct on its own
+   * and races against itself: under READ COMMITTED neither request can see the
+   * row the other has not committed, so both clear nothing of each other's and
+   * both write two current rows with no error at all. Everything that then
+   * reads "the current term" picks whichever sorts first, silently, for ever.
+   *
+   * Asserted against the constraint rather than by racing two requests. The
+   * first version of this did fire both through `Promise.all` and check that
+   * only one survived — and it passed with the indexes DROPPED, because the
+   * window never opened. A concurrency test that cannot lose is not a test of
+   * anything; the guarantee is what has to be proved, and it holds whether or
+   * not any particular interleaving happens.
+   */
+  describe("exactly one thing is current", () => {
+    it("refuses a second current term for one school", async () => {
+      const alpha = await makeSchool({ subdomain: "alpha", year: 2026 });
+      const [first] = await db
+        .select()
+        .from(terms)
+        .where(eq(terms.schoolId, alpha.id));
+
+      await db.update(terms).set({ isCurrent: true }).where(eq(terms.id, first.id));
+
+      const second = await db
+        .select()
+        .from(terms)
+        .where(and(eq(terms.schoolId, alpha.id), ne(terms.id, first.id)));
+
+      const err = await db
+        .update(terms)
+        .set({ isCurrent: true })
+        .where(eq(terms.id, second[0].id))
+        .then(() => null, (e: unknown) => e);
+
+      expect(isUniqueViolation(err)).toBe(true);
+      expect(pgConstraintName(err)).toBe("terms_one_current_per_school");
+    });
+
+    it("lets two different schools each have a current term", async () => {
+      const alpha = await makeSchool({ subdomain: "alpha", year: 2026 });
+      const beta = await makeSchool({ subdomain: "beta", year: 2026 });
+
+      for (const school of [alpha, beta]) {
+        const [term] = await db
+          .select()
+          .from(terms)
+          .where(eq(terms.schoolId, school.id));
+
+        await db.update(terms).set({ isCurrent: true }).where(eq(terms.id, term.id));
+      }
+
+      // Partial and per-school: the index must not make one tenant's calendar
+      // depend on another's.
+      const current = await db
+        .select()
+        .from(terms)
+        .where(eq(terms.isCurrent, true));
+
+      expect(current).toHaveLength(2);
+    });
+
+    it("refuses a second current year the same way", async () => {
+      const alpha = await makeSchool({ subdomain: "alpha", year: 2026 });
+      const extra = await db
+        .insert(academicYears)
+        .values({ schoolId: alpha.id, year: 2027, isCurrent: false })
+        .returning();
+
+      // The identical race one function up, and it predates this round — fixed
+      // together because it is the same guarantee.
+      const err = await db
+        .update(academicYears)
+        .set({ isCurrent: true })
+        .where(eq(academicYears.id, extra[0].id))
+        .then(() => null, (e: unknown) => e);
+
+      expect(pgConstraintName(err)).toBe("academic_years_one_current_per_school");
+    });
+
+    it("still lets a school move which term is current", async () => {
+      const alpha = await makeSchool({ subdomain: "alpha", year: 2026 });
+      const admin = await signInAt(alpha.id, "admin");
+      const all = await db
+        .select()
+        .from(terms)
+        .where(eq(terms.schoolId, alpha.id));
+
+      // The ordinary path has to keep working: clear-then-set inside one
+      // transaction never has two set at the same instant.
+      for (const term of all) {
+        const res = await app.request(`/terms/${term.id}`, {
+          method: "PATCH",
+          headers: jsonHeaders("alpha", admin),
+          body: JSON.stringify({ isCurrent: true }),
+        });
+        expect(res.status).toBe(200);
+      }
+
+      const current = await db
+        .select()
+        .from(terms)
+        .where(and(eq(terms.schoolId, alpha.id), eq(terms.isCurrent, true)));
+
+      expect(current).toHaveLength(1);
+      expect(current[0].id).toBe(all[all.length - 1].id);
     });
   });
 });

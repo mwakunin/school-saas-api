@@ -264,6 +264,23 @@ export const academicYears = pgTable("academic_years", {
   year: integer().notNull(),
   isCurrent: boolean().default(false).notNull(),
 }, t => [
+  /*
+   * At most one current year per school, enforced here rather than by the
+   * handlers.
+   *
+   * They clear the flag and then set it, which is correct on its own and races
+   * against itself: under READ COMMITTED a second request's UPDATE cannot see
+   * the row the first has not committed yet, so both clear nothing of each
+   * other's and both insert. The result is two current years and no error —
+   * and everything that reads "the current year" then picks whichever sorts
+   * first, silently, for ever.
+   *
+   * A partial index because `is_current` is false on most rows and they must
+   * not collide with each other.
+   */
+  uniqueIndex("academic_years_one_current_per_school")
+    .on(t.schoolId)
+    .where(sql`${t.isCurrent}`),
   unique().on(t.schoolId, t.year),
   unique("academic_years_school_id_id_key").on(t.schoolId, t.id),
 ]);
@@ -278,6 +295,23 @@ export const terms = pgTable("terms", {
   endsOn: date().notNull(),
   isCurrent: boolean().default(false).notNull(),
 }, t => [
+  /*
+   * At most one current term per school, enforced here rather than by the
+   * handlers.
+   *
+   * They clear the flag and then set it, which is correct on its own and races
+   * against itself: under READ COMMITTED a second request's UPDATE cannot see
+   * the row the first has not committed yet, so both clear nothing of each
+   * other's and both insert. The result is two current terms and no error —
+   * and everything that reads "the current term" then picks whichever sorts
+   * first, silently, for ever.
+   *
+   * A partial index because `is_current` is false on most rows and they must
+   * not collide with each other.
+   */
+  uniqueIndex("terms_one_current_per_school")
+    .on(t.schoolId)
+    .where(sql`${t.isCurrent}`),
   unique().on(t.academicYearId, t.number),
   unique("terms_school_id_id_key").on(t.schoolId, t.id),
   // Tenant-carrying reference: a term cannot belong to another school's year.

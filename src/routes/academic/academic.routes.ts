@@ -159,6 +159,10 @@ export const updateTerm = createRoute({
   },
   responses: {
     [HttpStatusCodes.OK]: jsonContent(selectTermSchema, "The updated term"),
+    [HttpStatusCodes.CONFLICT]: jsonContent(
+      createMessageObjectSchema("Another term was made current a moment ago"),
+      "Two requests raced to make a term current",
+    ),
     [HttpStatusCodes.UNPROCESSABLE_ENTITY]: jsonContent(
       createErrorSchema(updateTermSchema),
       "Validation error, or dates out of order",
