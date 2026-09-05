@@ -2,7 +2,7 @@ import { eq } from "drizzle-orm";
 import { beforeEach, describe, expect, it } from "vitest";
 
 import app from "@/app";
-import db from "@/db";
+import db, { appPool } from "@/db";
 import { academicYears, memberships, schools, terms } from "@/db/schema";
 import {
   addMembership,
@@ -323,6 +323,58 @@ describe("tenant middleware", () => {
         .where(eq(academicYears.schoolId, alpha.id));
 
       expect(year.isCurrent).toBe(true);
+    });
+  });
+
+  /**
+   * One transaction per request, whatever the route.
+   *
+   * Every tenant router mounts at `/` and registers its middleware at `/*`, so
+   * `withTenant` runs once per router mounted at or before the matched route.
+   * Without a re-entry guard each of those opened another top-level
+   * transaction on another pooled connection — nine of them for `/memberships`
+   * — which capped the whole application at about one in-flight request and
+   * surfaced as "timeout exceeded when trying to connect" under any
+   * concurrency at all.
+   */
+  describe("connections per request", () => {
+    async function peakBusyDuring(path: string, headers: Record<string, string>) {
+      let peak = 0;
+      const timer = setInterval(() => {
+        peak = Math.max(peak, appPool.totalCount - appPool.idleCount);
+      }, 2);
+
+      const res = await app.request(path, { headers });
+      clearInterval(timer);
+      return { peak, status: res.status };
+    }
+
+    it("holds one connection however late the router is mounted", async () => {
+      const alpha = await makeSchool({ subdomain: "alpha" });
+      const head = await signInAt(alpha.id, "admin");
+      const headers = tenantHeaders("alpha", head);
+
+      // `/school` is the first tenant router, `/memberships` one of the last.
+      // Before the guard those measured 1 and 9.
+      for (const path of ["/school", "/students", "/memberships"]) {
+        const { peak, status } = await peakBusyDuring(path, headers);
+        expect(status).toBe(200);
+        expect(peak, `${path} held ${peak} connections`).toBe(1);
+      }
+    });
+
+    it("serves more concurrent requests than the pool has room to nest", async () => {
+      const alpha = await makeSchool({ subdomain: "alpha" });
+      const head = await signInAt(alpha.id, "admin");
+      const headers = tenantHeaders("alpha", head);
+
+      // Five at once against a late-mounted route. Before the guard this
+      // needed forty-five connections and the pool holds ten.
+      const results = await Promise.all(
+        Array.from({ length: 5 }, () => app.request("/memberships", { headers })),
+      );
+
+      expect(results.map(r => r.status)).toEqual([200, 200, 200, 200, 200]);
     });
   });
 });

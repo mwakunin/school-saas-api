@@ -1,6 +1,7 @@
 import type { SchoolContext } from "./01-school";
 import type { PersonName } from "./lib/names";
 
+import { LOGINS } from "./01-school";
 import { day, intakeYear, TERM_OFFSETS } from "./lib/calendar";
 import { childName, COMMUNITIES, guardianName } from "./lib/names";
 import { Rng } from "./lib/random";
@@ -274,6 +275,19 @@ export async function seedStudents(ctx: SchoolContext): Promise<Register> {
    * rather than papered over here.
    */
   const parentsChild = siblingGroups[0].pupils[0];
+
+  /*
+   * Link the demo parent login to that family, through the office route.
+   *
+   * Not self-service, and the reason is worth stating: claiming requires a
+   * VERIFIED phone or email, and a demo machine has neither an SMS provider
+   * nor a mail sender — so the honest path here is the same one a school uses
+   * for a parent whose details do not match their records. It is the fallback
+   * that has to exist anyway, and the demo exercises it.
+   */
+  await office.post(`/guardians/${siblingGroups[0].guardianId}/link`, {
+    email: LOGINS.parent.email,
+  });
 
   /*
    * One child who transferred out mid-term.

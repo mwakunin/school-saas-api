@@ -268,10 +268,25 @@ export async function computeTermResults(
   termId: string,
   reduction: LevelReduction = "mode_ties_low",
 ): Promise<{ enrolments: number; results: number; cleared: number }> {
+  /*
+   * The term row is this computation's lock, and `unpublishAssessment` takes
+   * the same one.
+   *
+   * A recompute reads every published assessment and then writes results over
+   * many seconds. A withdrawal landing inside that window clears the stale
+   * rows and then has them written straight back, from marks read while the
+   * assessment was still published — so the withdrawal appears to succeed and
+   * parents keep seeing the marks. The window is the length of a recompute,
+   * which for a three-hundred-pupil school is not a moment.
+   *
+   * Held for the whole transaction, so two recomputes of one term also
+   * serialise rather than racing each other's upserts.
+   */
   const [term] = await db
     .select({ startsOn: terms.startsOn, endsOn: terms.endsOn })
     .from(terms)
-    .where(eq(terms.id, termId));
+    .where(eq(terms.id, termId))
+    .for("update");
 
   if (!term)
     return { enrolments: 0, results: 0, cleared: 0 };

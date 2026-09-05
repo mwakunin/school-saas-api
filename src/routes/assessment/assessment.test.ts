@@ -17,6 +17,7 @@ import {
 import { todayInBusinessZone } from "@/lib/dates";
 import { isCheckViolation, pgConstraintName } from "@/lib/db-errors";
 import {
+  backendPid,
   dayFromNow,
   makeSchool,
   makeStream,
@@ -24,6 +25,7 @@ import {
   resetDb,
   signInAt,
   tenantHeaders,
+  waitForBlockedBackend,
 } from "@/test/helpers";
 
 /**
@@ -356,6 +358,93 @@ describe("assessment", () => {
       expect(after.results).toBe(1);
     });
 
+    it("stops serving results built from a withdrawn assessment", async () => {
+      const ctx = await withMarks("alpha");
+      await post("/term-results/compute", { termId: ctx.term.id }, jsonHeaders("alpha", ctx.admin));
+
+      const before = await (await app.request(
+        `/term-results?termId=${ctx.term.id}&enrollmentId=${ctx.pupils[0].enrolmentId}`,
+        { headers: tenantHeaders("alpha", ctx.admin) },
+      )).json();
+      expect(Number(before[0].meanScore)).toBe(90);
+
+      await post(`/assessments/${ctx.assessment.id}/unpublish`, {}, jsonHeaders("alpha", ctx.teacher));
+
+      /*
+       * Withdrawing has to actually withdraw.
+       *
+       * `term_results` was computed while the assessment was published and
+       * nothing recomputes it until somebody asks — so the row stood, and
+       * `/term-results` and the parent portal both kept serving a mean built
+       * from marks that had just been pulled back from view. The whole reason
+       * to unpublish is that parents stop seeing them.
+       *
+       * Absent, not corrected: absent reads as "not marked yet", stale reads
+       * as fact. Recomputing restores whatever is still published.
+       */
+      const after = await (await app.request(
+        `/term-results?termId=${ctx.term.id}&enrollmentId=${ctx.pupils[0].enrolmentId}`,
+        { headers: tenantHeaders("alpha", ctx.admin) },
+      )).json();
+      expect(after).toHaveLength(0);
+    });
+
+    it("waits for a recompute rather than being overwritten by it", async () => {
+      const ctx = await withMarks("alpha");
+      await post("/term-results/compute", { termId: ctx.term.id }, jsonHeaders("alpha", ctx.admin));
+
+      /*
+       * A recompute reads every published assessment and then writes results
+       * over many seconds. A withdrawal landing inside that window clears the
+       * stale rows and has them written straight back — from marks read while
+       * the assessment was still published — so it returns 200 and changes
+       * nothing a parent can see.
+       *
+       * `computeTermResults` takes the term row; this holds the same lock and
+       * checks the withdrawal waits for it. FOR NO KEY UPDATE rather than FOR
+       * UPDATE, because assessments and results reference the term and their
+       * foreign keys take FOR KEY SHARE on it — holding the stronger lock
+       * would make the request block whether or not the handler took one.
+       */
+      const holderPid = Promise.withResolvers<number>();
+      const release = Promise.withResolvers<void>();
+
+      const holder = db.transaction(async (tx) => {
+        const pid = await backendPid(tx);
+        await tx.execute(
+          sql`SELECT 1 FROM terms WHERE id = ${ctx.term.id} FOR NO KEY UPDATE`,
+        );
+        holderPid.resolve(pid);
+        await release.promise;
+      });
+
+      const pid = await holderPid.promise;
+
+      /*
+       * Everything after this runs in a `finally`.
+       *
+       * The first version released the holder only on the happy path, so one
+       * failed assertion left an open transaction holding a row lock and a
+       * pooled connection — and every test after it timed out in its hook.
+       * A flaky assertion should fail one test, not the rest of the file.
+       */
+      let pending: Promise<Response> | null = null;
+      try {
+        pending = Promise.resolve(
+          post(`/assessments/${ctx.assessment.id}/unpublish`, {}, jsonHeaders("alpha", ctx.teacher)),
+        );
+
+        // A generous window, because the whole suite is running around this.
+        expect(await waitForBlockedBackend(pid, 15_000)).toBe(true);
+      }
+      finally {
+        release.resolve();
+        await holder;
+      }
+
+      expect((await pending!).status).toBe(200);
+    }, 30_000);
+
     it("closes a published assessment to edits", async () => {
       const ctx = await seed("alpha");
       const assessment = await makeAssessment(ctx);
@@ -671,18 +760,23 @@ describe("assessment", () => {
 
       // The assessment is withdrawn — a mark was wrong and is being redone.
       await post(`/assessments/${assessment.id}/unpublish`, {}, jsonHeaders("alpha", ctx.teacher));
+
+      /*
+       * `cleared` is 0 now, and that is the improvement rather than a
+       * regression.
+       *
+       * This used to be the only thing that removed the stale figure, which
+       * left it standing from the withdrawal until somebody thought to
+       * recompute — and the parent portal reads these rows. Unpublishing now
+       * clears them itself, so by the time a recompute runs there is nothing
+       * left to find. Recompute keeps the same behaviour as a backstop.
+       */
       const recompute = await (await post(
         "/term-results/compute",
         { termId: ctx.term.id },
         jsonHeaders("alpha", ctx.admin),
       )).json();
-
-      /*
-       * The previous figure used to stand, so `/term-results` and any report
-       * card finalised afterwards reported a mark derived from data no longer
-       * published. Stale reads as fact; absent reads as "not marked yet".
-       */
-      expect(recompute.cleared).toBeGreaterThan(0);
+      expect(recompute.cleared).toBe(0);
 
       const after = await (await app.request(
         `/term-results?termId=${ctx.term.id}&enrollmentId=${ctx.pupils[0].enrolmentId}`,

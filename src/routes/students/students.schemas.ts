@@ -315,3 +315,18 @@ export const guardianDetailSchema = toZodV4SchemaTyped(
     })),
   }),
 );
+
+/**
+ * The office linking a guardian record to a login.
+ *
+ * The fallback for the ordinary case that self-service cannot cover: a parent
+ * who signed up with a different number from the one the school holds, or who
+ * cannot receive SMS at all. The office confirms who they are in person — which
+ * is a stronger check than any identifier match — and says so here.
+ *
+ * By email, because that is what the office has in front of them, and audited,
+ * because it grants sight of a child's records.
+ */
+export const linkGuardianAccountSchema = toZodV4SchemaTyped(
+  z.object({ email: z.email() }),
+);

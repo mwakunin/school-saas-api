@@ -11,6 +11,23 @@ export default defineConfig({
     // Every test file shares one Postgres database and truncates between
     // tests — running files in parallel would let them clobber each other.
     fileParallelism: false,
+
+    /*
+     * 5 seconds is a unit-test budget, and nothing here is a unit test.
+     *
+     * Every file talks to a real Postgres, and one of them seeds a school of
+     * three hundred children. On an idle machine that fits easily; on a busy
+     * one it does not, and the failures moved between three different tests on
+     * three consecutive runs — each a plain timeout, with no leaked
+     * transactions and nothing wrong with the code under test.
+     *
+     * Raising it per test as each one appeared would have been treating the
+     * symptom, and eventually hidden a real hang behind a wall of local
+     * overrides. Twenty seconds is still far short of anything that has
+     * genuinely deadlocked; the few tests that legitimately take longer say so
+     * themselves.
+     */
+    testTimeout: 20_000,
     globalSetup: ["./src/test/global-setup.ts"],
     env: {
       NODE_ENV: "test",

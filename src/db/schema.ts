@@ -1434,8 +1434,11 @@ export const auditLog = pgTable("audit_log", {
     | "assessment.published"
     | "assessment.unpublished"
     | "certificate.issued"
+    | "guardian.linked"
     | "invoice.voided"
     | "marks.saved"
+    | "membership.granted"
+    | "membership.revoked"
     | "mpesa.allocated"
     | "mpesa.rejected"
     | "payment.recorded"
@@ -1462,8 +1465,11 @@ export const auditLog = pgTable("audit_log", {
     "assessment.published",
     "assessment.unpublished",
     "certificate.issued",
+    "guardian.linked",
     "invoice.voided",
     "marks.saved",
+    "membership.granted",
+    "membership.revoked",
     "mpesa.allocated",
     "mpesa.rejected",
     "payment.recorded",

@@ -16,6 +16,7 @@ router
   .openapi(routes.listGuardians, handlers.listGuardians)
   .openapi(routes.createGuardian, handlers.createGuardian)
   .openapi(routes.getGuardian, handlers.getGuardian)
+  .openapi(routes.linkGuardianAccount, handlers.linkGuardianAccount)
   .openapi(routes.getOne, handlers.getOne)
   .openapi(routes.update, handlers.update)
   .openapi(routes.exitStudent, handlers.exitStudent)

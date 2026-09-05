@@ -10,7 +10,9 @@ import fees from "@/routes/fees/fees.index";
 import health from "@/routes/health.route";
 import index from "@/routes/index.route";
 import messaging from "@/routes/messaging/messaging.index";
+import portal from "@/routes/portal/portal.index";
 import reconciliation from "@/routes/reconciliation/reconciliation.index";
+import staff from "@/routes/staff/staff.index";
 import students from "@/routes/students/students.index";
 import superadmin from "@/routes/superadmin/superadmin.index";
 import verify from "@/routes/verify/verify.index";
@@ -65,6 +67,8 @@ const tenantRoutes = [
   assessment,
   messaging,
   audit,
+  staff,
+  portal,
 ] as unknown as readonly AppOpenAPI[];
 
 [...unscopedRoutes, ...tenantRoutes].forEach((route) => {

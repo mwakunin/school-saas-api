@@ -93,6 +93,25 @@ export const withTenant = createMiddleware<TenantBindings>(async (c, next) => {
     );
   }
 
+  /*
+   * One transaction per request, however many routers register this.
+   *
+   * Every tenant router mounts at `/` and registers its middleware at `/*`, so
+   * this runs once for each router mounted at or before the matched route —
+   * and without this guard each of those opened ANOTHER top-level transaction
+   * on another pooled connection. Measured: a request to `/memberships`, the
+   * ninth router, held nine connections; `/school`, the first, held one. With
+   * a default pool of ten, two concurrent requests to a late route exhausted
+   * it and returned "timeout exceeded when trying to connect".
+   *
+   * That is a load-bearing bug rather than an inefficiency: it caps the whole
+   * application at roughly one in-flight request. Returning early keeps the
+   * first transaction — the one whose `tx` every handler already reads from
+   * `c.var.db` — and makes the rest no-ops.
+   */
+  if (c.var.db)
+    return next();
+
   return appDb.transaction(async (tx) => {
     // Parameterised, not interpolated. `set_config` takes the value as an
     // argument, so a subdomain cannot escape into the statement — and the
@@ -142,6 +161,11 @@ class RollbackOnErrorStatus extends Error {
  * Requires `withTenant` and `withSession` to have run.
  */
 export const withMembership = createMiddleware<TenantBindings>(async (c, next) => {
+  // Same reasoning as `withTenant`: this is registered at `/*` by several
+  // routers, and re-running it would re-query the same memberships.
+  if (c.var.membership)
+    return next();
+
   const user = c.var.user;
 
   if (!user) {
@@ -163,21 +187,27 @@ export const withMembership = createMiddleware<TenantBindings>(async (c, next) =
       eq(memberships.isActive, true),
     ));
 
-  if (rows.length === 0) {
-    // 404, not 403. A signed-in user with no membership here must not be able
-    // to tell a school that exists from one that does not — otherwise the
-    // subdomain space becomes a directory of our customers.
-    return c.json(
-      { message: "No school found for this address" },
-      HttpStatusCodes.NOT_FOUND,
-    );
-  }
-
-  // One person may hold several roles at one school — CLAUDE.md §5.1 keeps a
-  // teacher who is also a parent on a single login — so this is a set, and
-  // authorization asks whether it intersects what a route allows.
+  /*
+   * Loads the membership; does NOT refuse. `requireMembershipRole` refuses.
+   *
+   * This used to 404 here, which made the two inseparable — and that broke the
+   * parent portal, where the whole point of `POST /portal/claim` is that a
+   * parent arrives with no membership and the claim is what grants them one.
+   * Behind a rejecting `withMembership` the route was unreachable by anybody
+   * who needed it.
+   *
+   * The 404 has moved rather than gone: an empty role set is refused by the
+   * guard with NOT_FOUND, so a signed-in stranger still cannot tell a school
+   * that exists from one that does not. Every tenant route carries a guard, so
+   * nothing becomes reachable that was not before — except the routes that
+   * deliberately ask only for a session.
+   *
+   * One person may hold several roles at one school (§5.1 keeps a teacher who
+   * is also a parent on one login), so this is a set and authorization asks
+   * whether it intersects what a route allows.
+   */
   c.set("membership", {
-    schoolId: rows[0].schoolId,
+    schoolId: c.var.school.id,
     roles: rows.map(r => r.role),
   });
 

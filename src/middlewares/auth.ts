@@ -88,6 +88,22 @@ export function requireMembershipRole(...allowed: MembershipRole[]) {
   return createMiddleware<TenantBindings>(async (c, next) => {
     const roles = c.var.membership?.roles ?? [];
 
+    /*
+     * No membership at all is 404, not 403.
+     *
+     * A signed-in stranger must not be able to tell a school that exists from
+     * one that does not, or the subdomain space becomes a directory of our
+     * customers. Someone who IS a member and merely holds the wrong role
+     * already knows the school exists, so they get an honest 403 — the
+     * distinction the two answers carry is worth keeping.
+     */
+    if (roles.length === 0) {
+      return c.json(
+        { message: "No school found for this address" },
+        HttpStatusCodes.NOT_FOUND,
+      );
+    }
+
     if (!roles.some(role => allowed.includes(role))) {
       return c.json(
         { message: HttpStatusPhrases.FORBIDDEN },
