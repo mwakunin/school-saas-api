@@ -1,16 +1,21 @@
+import { and, eq, sql } from "drizzle-orm";
 import { beforeEach, describe, expect, it } from "vitest";
 
 import type { TestUser } from "@/test/helpers";
 
 import app from "@/app";
+import db from "@/db";
+import { memberships } from "@/db/schema";
 import {
   addMembership,
+  backendPid,
   makeSchool,
   nextEmail,
   resetDb,
   signInAt,
   signUpWithEmail,
   tenantHeaders,
+  waitForBlockedBackend,
 } from "@/test/helpers";
 
 /**
@@ -187,6 +192,95 @@ describe("staff", () => {
       // Handing over is a real thing a head does; only the LAST one is blocked.
       expect(res.status).toBe(200);
     });
+  });
+
+  describe("two requests at once", () => {
+    it("serialises the last-admin check on the school row", async () => {
+      const ctx = await seed("alpha");
+      const deputy = await signInAt(ctx.school.id, "admin");
+
+      const admins = await (await app.request("/memberships?role=admin", {
+        headers: tenantHeaders("alpha", ctx.head),
+      })).json();
+      expect(admins).toHaveLength(2);
+
+      /*
+       * Racing two requests and hoping to land in the window does not work.
+       *
+       * Written that way first, this passed with the lock REMOVED — the two
+       * requests never interleaved, so it proved nothing. What has to be shown
+       * is that the check takes the lock at all; holding that lock and
+       * watching the request wait is the deterministic version.
+       *
+       * The lock matters because both requests otherwise read a count that
+       * includes the other admin and both conclude it is safe to go, leaving
+       * the school with nobody who can let anyone back in.
+       */
+      const holderPid = Promise.withResolvers<number>();
+      const release = Promise.withResolvers<void>();
+
+      const holder = db.transaction(async (tx) => {
+        const pid = await backendPid(tx);
+        /*
+         * FOR NO KEY UPDATE, not FOR UPDATE, and the difference is the test.
+         *
+         * Updating a membership and writing an audit row both take FOR KEY
+         * SHARE on this school through their foreign keys. FOR UPDATE
+         * conflicts with that, so holding one made the request block whether
+         * or not the handler took a lock of its own — and the test passed with
+         * the fix removed. FOR NO KEY UPDATE conflicts with the handler's FOR
+         * UPDATE and not with an FK check, so only the real thing blocks.
+         */
+        await tx.execute(
+          sql`SELECT 1 FROM schools WHERE id = ${ctx.school.id} FOR NO KEY UPDATE`,
+        );
+        holderPid.resolve(pid);
+        await release.promise;
+      });
+
+      const pid = await holderPid.promise;
+
+      /*
+       * Everything after this runs in a `finally`.
+       *
+       * The first version released the holder only on the happy path, so one
+       * failed assertion left an open transaction holding a row lock and a
+       * pooled connection — and every test after it timed out in its hook.
+       * A flaky assertion should fail one test, not the rest of the file.
+       */
+      let pending: Promise<Response> | null = null;
+      try {
+        pending = Promise.resolve(patch(
+          `/memberships/${admins[0].id}`,
+          { isActive: false },
+          jsonHeaders("alpha", ctx.head),
+        ));
+
+        // Asked of Postgres rather than guessed with a sleep: a generous timer
+        // always passes whether or not anything blocked. The window is wide
+        // because the whole suite is running — 2.5s was not always enough for
+        // the request to reach the lock, and the flake looked like a bug.
+        expect(await waitForBlockedBackend(pid, 15_000)).toBe(true);
+      }
+      finally {
+        release.resolve();
+        await holder;
+        await pending;
+      }
+
+      const left = await db
+        .select()
+        .from(memberships)
+        .where(and(
+          eq(memberships.schoolId, ctx.school.id),
+          eq(memberships.role, "admin"),
+          eq(memberships.isActive, true),
+        ));
+
+      // Whatever happened, somebody can still let people back in.
+      expect(left.length).toBeGreaterThanOrEqual(1);
+      void deputy;
+    }, 30_000);
   });
 
   describe("who may use it", () => {

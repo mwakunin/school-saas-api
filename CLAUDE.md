@@ -579,6 +579,8 @@ Linking an account to a guardian record happens two ways, and both are needed:
 
 Worth knowing when adding a route: every tenant router mounts at `/` and registers its middleware at `/*`, so a request inherits the middleware of every router mounted **before** it as well as its own. Route protection must therefore never depend on mount order — which is why the fix above was to change the middleware rather than to move the portal up the list.
 
+**`withTenant` and `withMembership` return early if they have already run**, and that guard is load-bearing rather than tidy. Without it each of those repeated registrations opened *another* top-level transaction on *another* pooled connection: a request to `/memberships`, the ninth router, held nine connections; `/school`, the first, held one. Against a default pool of ten, two concurrent requests to a late route exhausted it and answered `timeout exceeded when trying to connect`. The application was effectively capped at one request in flight. `middlewares/tenant.test.ts` measures this and fails if a request ever holds more than one.
+
 **Membership management is tenant-side too** (`/memberships`). The superadmin plane still grants the FIRST one, because a school that has just been created has no admin to do it — everything after that is the head's. The last active admin cannot be deactivated: a school that locked itself out would need the platform operator to get back in, which is the dependency these routes exist to remove.
 
 ---

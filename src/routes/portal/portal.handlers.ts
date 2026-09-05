@@ -108,7 +108,7 @@ export const claim: TenantRouteHandler<ClaimRoute> = async (c) => {
 
   if (matchers.length === 0) {
     return c.json(
-      { linked: 0, alreadyLinked: 0, children: 0, matchedOn: [] },
+      { linked: 0, alreadyLinked: 0, children: 0, matchedOn: [], ambiguous: false },
       HttpStatusCodes.OK,
     );
   }
@@ -119,6 +119,22 @@ export const claim: TenantRouteHandler<ClaimRoute> = async (c) => {
     .where(or(...matchers));
 
   const alreadyLinked = candidates.filter(g => g.userId === userId).length;
+  const unclaimed = candidates.filter(g => g.userId === null);
+
+  /*
+   * One unclaimed match, or none at all.
+   *
+   * Two guardian records at one school sharing a phone number are as likely to
+   * be two people as one: shared household phones are ordinary here, and a
+   * clerk entering the same number twice is ordinary too. Linking both would
+   * hand one of them the other family's children — every mark, every balance.
+   *
+   * The cost of being wrong runs one way only. Refusing sends a parent to the
+   * office, which is the fallback that exists for exactly this; linking wrongly
+   * shows a stranger a child's records and nothing would ever flag it. So an
+   * ambiguous contact claims nothing and says so.
+   */
+  const ambiguous = unclaimed.length > 1;
 
   /*
    * `user_id IS NULL` in the WHERE, not filtered in code.
@@ -130,13 +146,13 @@ export const claim: TenantRouteHandler<ClaimRoute> = async (c) => {
    * putting the condition in the UPDATE and taking the RETURNING rows as the
    * answer closes it, because the predicate is re-evaluated at write time.
    */
-  const claimed = candidates.length === 0
+  const claimed = unclaimed.length !== 1
     ? []
     : await db
         .update(guardians)
         .set({ userId })
         .where(and(
-          inArray(guardians.id, candidates.map(g => g.id)),
+          eq(guardians.id, unclaimed[0].id),
           isNull(guardians.userId),
         ))
         .returning({ id: guardians.id });
@@ -179,6 +195,7 @@ export const claim: TenantRouteHandler<ClaimRoute> = async (c) => {
     alreadyLinked,
     children: children.length,
     matchedOn,
+    ambiguous,
   }, HttpStatusCodes.OK);
 };
 

@@ -4,7 +4,7 @@ import * as HttpStatusPhrases from "stoker/http-status-phrases";
 
 import type { TenantRouteHandler } from "@/lib/types";
 
-import { memberships, user } from "@/db/schema";
+import { memberships, schools, user } from "@/db/schema";
 import { recordAudit } from "@/lib/audit";
 
 import type { GrantStaffRoute, ListStaffRoute, UpdateStaffRoute } from "./staff.routes";
@@ -148,11 +148,24 @@ export const updateStaff: TenantRouteHandler<UpdateStaffRoute> = async (c) => {
    *
    * Removing the last admin would leave nobody who can grant one back, and the
    * only remedy would be the platform operator — the exact dependency these
-   * routes exist to remove. Counted inside the request transaction, so a
-   * concurrent revocation of the other admin cannot slip past between the
-   * check and the write.
+   * routes exist to remove.
+   *
+   * Serialised on the SCHOOL row, not on the admin rows.
+   *
+   * Locking the other admins was the obvious thing and the wrong one: with two
+   * admins being removed at once, each request locks the row the other is
+   * about to update, and they deadlock — Postgres aborts one, so the invariant
+   * survives but as a 500 rather than the honest 409. Both requests taking one
+   * common lock first means the second reads a count that already includes the
+   * first's change and refuses properly.
    */
   if (!isActive && existing.role === "admin") {
+    await db
+      .select({ id: schools.id })
+      .from(schools)
+      .where(eq(schools.id, c.var.school.id))
+      .for("update");
+
     const others = await db
       .select({ id: memberships.id })
       .from(memberships)
@@ -160,8 +173,7 @@ export const updateStaff: TenantRouteHandler<UpdateStaffRoute> = async (c) => {
         eq(memberships.role, "admin"),
         eq(memberships.isActive, true),
         ne(memberships.id, id),
-      ))
-      .for("update");
+      ));
 
     if (others.length === 0) {
       return c.json(

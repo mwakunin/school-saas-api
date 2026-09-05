@@ -352,6 +352,28 @@ export const unpublishAssessment: TenantRouteHandler<UnpublishAssessmentRoute> =
   const { id } = c.req.valid("param");
   const db = c.var.db;
 
+  /*
+   * Take the term's lock before anything else, the way `computeTermResults`
+   * does — and in the same order, so the two can never deadlock.
+   *
+   * Without it a recompute already in flight rewrites the results this is
+   * about to clear, using marks it read while the assessment was still
+   * published. The withdrawal returns 200 and changes nothing a parent can
+   * see, which is the only thing withdrawing is for.
+   */
+  const [scope] = await db
+    .select({ termId: assessments.termId })
+    .from(assessments)
+    .where(eq(assessments.id, id));
+
+  if (scope) {
+    await db
+      .select({ id: terms.id })
+      .from(terms)
+      .where(eq(terms.id, scope.termId))
+      .for("update");
+  }
+
   const [withdrawn] = await db
     .update(assessments)
     .set({ publishedAt: null })

@@ -17,6 +17,7 @@ import {
 import { todayInBusinessZone } from "@/lib/dates";
 import { isCheckViolation, pgConstraintName } from "@/lib/db-errors";
 import {
+  backendPid,
   dayFromNow,
   makeSchool,
   makeStream,
@@ -24,6 +25,7 @@ import {
   resetDb,
   signInAt,
   tenantHeaders,
+  waitForBlockedBackend,
 } from "@/test/helpers";
 
 /**
@@ -386,6 +388,62 @@ describe("assessment", () => {
       )).json();
       expect(after).toHaveLength(0);
     });
+
+    it("waits for a recompute rather than being overwritten by it", async () => {
+      const ctx = await withMarks("alpha");
+      await post("/term-results/compute", { termId: ctx.term.id }, jsonHeaders("alpha", ctx.admin));
+
+      /*
+       * A recompute reads every published assessment and then writes results
+       * over many seconds. A withdrawal landing inside that window clears the
+       * stale rows and has them written straight back — from marks read while
+       * the assessment was still published — so it returns 200 and changes
+       * nothing a parent can see.
+       *
+       * `computeTermResults` takes the term row; this holds the same lock and
+       * checks the withdrawal waits for it. FOR NO KEY UPDATE rather than FOR
+       * UPDATE, because assessments and results reference the term and their
+       * foreign keys take FOR KEY SHARE on it — holding the stronger lock
+       * would make the request block whether or not the handler took one.
+       */
+      const holderPid = Promise.withResolvers<number>();
+      const release = Promise.withResolvers<void>();
+
+      const holder = db.transaction(async (tx) => {
+        const pid = await backendPid(tx);
+        await tx.execute(
+          sql`SELECT 1 FROM terms WHERE id = ${ctx.term.id} FOR NO KEY UPDATE`,
+        );
+        holderPid.resolve(pid);
+        await release.promise;
+      });
+
+      const pid = await holderPid.promise;
+
+      /*
+       * Everything after this runs in a `finally`.
+       *
+       * The first version released the holder only on the happy path, so one
+       * failed assertion left an open transaction holding a row lock and a
+       * pooled connection — and every test after it timed out in its hook.
+       * A flaky assertion should fail one test, not the rest of the file.
+       */
+      let pending: Promise<Response> | null = null;
+      try {
+        pending = Promise.resolve(
+          post(`/assessments/${ctx.assessment.id}/unpublish`, {}, jsonHeaders("alpha", ctx.teacher)),
+        );
+
+        // A generous window, because the whole suite is running around this.
+        expect(await waitForBlockedBackend(pid, 15_000)).toBe(true);
+      }
+      finally {
+        release.resolve();
+        await holder;
+      }
+
+      expect((await pending!).status).toBe(200);
+    }, 30_000);
 
     it("closes a published assessment to edits", async () => {
       const ctx = await seed("alpha");

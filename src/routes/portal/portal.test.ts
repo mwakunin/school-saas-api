@@ -166,6 +166,36 @@ describe("parent portal", () => {
       expect(claimed.linked).toBe(0);
     });
 
+    it("claims nothing when one number matches two families", async () => {
+      const ctx = await seed("alpha");
+      const shared = nextPhone();
+      // A household phone, or a clerk entering the same number twice. Two
+      // guardian records, two unrelated families.
+      const first = await ctx.family(shared, ["2026/001"]);
+      const second = await ctx.family(shared, ["2026/002"]);
+      const caller = await guardianLogin(ctx.school.id, shared);
+
+      const claimed = await (await post("/portal/claim", {}, jsonHeaders("alpha", caller))).json();
+
+      /*
+       * The cost of being wrong runs one way only.
+       *
+       * Linking both would hand whoever claimed first the other family's
+       * children — every mark, every balance — and nothing would ever flag it.
+       * Refusing sends them to the office, which is the fallback that exists
+       * for exactly this.
+       */
+      expect(claimed.linked).toBe(0);
+      expect(claimed.ambiguous).toBe(true);
+
+      const children = await app.request("/portal/children", {
+        headers: tenantHeaders("alpha", caller),
+      });
+      expect(children.status).toBe(409);
+      void first;
+      void second;
+    });
+
     it("is safe to run twice", async () => {
       const ctx = await seed("alpha");
       const phone = nextPhone();

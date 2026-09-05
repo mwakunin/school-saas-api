@@ -93,6 +93,25 @@ export const withTenant = createMiddleware<TenantBindings>(async (c, next) => {
     );
   }
 
+  /*
+   * One transaction per request, however many routers register this.
+   *
+   * Every tenant router mounts at `/` and registers its middleware at `/*`, so
+   * this runs once for each router mounted at or before the matched route —
+   * and without this guard each of those opened ANOTHER top-level transaction
+   * on another pooled connection. Measured: a request to `/memberships`, the
+   * ninth router, held nine connections; `/school`, the first, held one. With
+   * a default pool of ten, two concurrent requests to a late route exhausted
+   * it and returned "timeout exceeded when trying to connect".
+   *
+   * That is a load-bearing bug rather than an inefficiency: it caps the whole
+   * application at roughly one in-flight request. Returning early keeps the
+   * first transaction — the one whose `tx` every handler already reads from
+   * `c.var.db` — and makes the rest no-ops.
+   */
+  if (c.var.db)
+    return next();
+
   return appDb.transaction(async (tx) => {
     // Parameterised, not interpolated. `set_config` takes the value as an
     // argument, so a subdomain cannot escape into the statement — and the
@@ -142,6 +161,11 @@ class RollbackOnErrorStatus extends Error {
  * Requires `withTenant` and `withSession` to have run.
  */
 export const withMembership = createMiddleware<TenantBindings>(async (c, next) => {
+  // Same reasoning as `withTenant`: this is registered at `/*` by several
+  // routers, and re-running it would re-query the same memberships.
+  if (c.var.membership)
+    return next();
+
   const user = c.var.user;
 
   if (!user) {

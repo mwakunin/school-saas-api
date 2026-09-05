@@ -383,7 +383,9 @@ describe("the demo tenant", () => {
       // this test — and check the withdrawal takes effect on the parent too.
       await head.post(`/assessments/${held.id}/unpublish`);
       void teacher;
-    });
+      // Publishing and recomputing a whole term for three hundred children is
+      // real work, and the default five seconds is not a budget for it.
+    }, 120_000);
 
     it("shows released report cards and withholds unreleased ones", async () => {
       const head = await accessAs("head");

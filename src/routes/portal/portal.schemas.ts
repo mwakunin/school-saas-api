@@ -26,6 +26,14 @@ export const claimResultSchema = toZodV4SchemaTyped(
      * them to the office with nothing useful to say.
      */
     matchedOn: z.array(z.enum(["phone", "email"])),
+    /**
+     * More than one unclaimed guardian record matched, so none was taken.
+     *
+     * Two records sharing a contact are as likely to be two people as one, and
+     * linking both would hand one family the other's children. The office
+     * settles it — that is what `POST /guardians/{id}/link` is for.
+     */
+    ambiguous: z.boolean(),
   }),
 );
 
