@@ -160,7 +160,7 @@ describe("document verification", () => {
         body: JSON.stringify({ termId: ctx.term.id }),
       });
 
-      return (await app.request("/report-cards/finalise", {
+      const card = await (await app.request("/report-cards/finalise", {
         method: "POST",
         headers: jsonHeaders("alpha", ctx.admin),
         body: JSON.stringify({
@@ -169,35 +169,89 @@ describe("document verification", () => {
           headComment: "A good term.",
         }),
       })).json();
+
+      return { card, assessment, enrollmentId: detail.currentEnrollment.id };
     }
 
     it("shows what was printed, not what the marks say now", async () => {
       const ctx = await seed("alpha");
-      const card = await finalisedCard(ctx);
+      const { card, assessment, enrollmentId } = await finalisedCard(ctx);
 
       const before = await (await app.request(`/verify/${card.verificationCode}`)).json();
       expect(before.documentType).toBe("report_card");
       expect(before.summary.learningAreas[0].meanScore).toBe(82);
 
       /*
-       * The property rule 7 exists for, checked from the outside.
+       * The property rule 7 exists for, checked from the outside — by actually
+       * moving the mark.
        *
-       * Rewrite the snapshot's source data and the verifier must still report
-       * the printed figures — otherwise a genuine document held by a parent
-       * would start failing verification the moment a mark was corrected.
+       * The first version of this test rewrote `classTeacherComment`, which is
+       * a column on the row and not part of the snapshot at all: the mean could
+       * not have changed, so it asserted nothing. Correcting a published mark
+       * and recomputing is the real thing, and it is the case that matters —
+       * a parent's genuine document must not start failing verification the
+       * moment a teacher fixes a number behind it.
        */
-      await db
-        .update(reportCards)
-        .set({ classTeacherComment: "changed afterwards" })
-        .where(eq(reportCards.id, card.id));
+      await app.request(`/assessments/${assessment.id}/unpublish`, {
+        method: "POST",
+        headers: jsonHeaders("alpha", ctx.teacher),
+      });
+      await app.request(`/assessments/${assessment.id}/scores`, {
+        method: "PUT",
+        headers: jsonHeaders("alpha", ctx.teacher),
+        body: JSON.stringify({ scores: [{ enrollmentId, rawScore: 41 }] }),
+      });
+      await app.request(`/assessments/${assessment.id}/publish`, {
+        method: "POST",
+        headers: jsonHeaders("alpha", ctx.teacher),
+      });
+      await app.request("/term-results/compute", {
+        method: "POST",
+        headers: jsonHeaders("alpha", ctx.admin),
+        body: JSON.stringify({ termId: ctx.term.id }),
+      });
+
+      // The live result really did move; the frozen document did not.
+      const live = await (await app.request(
+        `/term-results?termId=${ctx.term.id}&enrollmentId=${enrollmentId}`,
+        { headers: tenantHeaders("alpha", ctx.admin) },
+      )).json();
+      expect(Number(live[0].meanScore)).toBe(41);
 
       const after = await (await app.request(`/verify/${card.verificationCode}`)).json();
       expect(after.summary.learningAreas[0].meanScore).toBe(82);
     });
 
+    it("verifies a child who has since moved class", async () => {
+      const ctx = await seed("alpha");
+      const { card } = await finalisedCard(ctx);
+
+      const green = await makeStream(ctx.school, 4, "Green");
+      await app.request(`/students/${ctx.student.id}/enrollments`, {
+        method: "POST",
+        headers: jsonHeaders("alpha", ctx.admin),
+        body: JSON.stringify({
+          streamId: green.id,
+          boardingStatus: "day",
+          startedOn: new Date().toISOString().slice(0, 10),
+        }),
+      });
+
+      /*
+       * The document says the class the child was in when it was printed.
+       *
+       * Reading this from the live enrolment — which is what the first version
+       * did — meant a pupil who changed stream had their genuine report card
+       * verified against a class it does not name, and the person checking
+       * would reasonably conclude it was forged.
+       */
+      const verified = await (await app.request(`/verify/${card.verificationCode}`)).json();
+      expect(verified.className).toBe("Grade 4 Blue");
+    });
+
     it("carries a QR and an address a person could type", async () => {
       const ctx = await seed("alpha");
-      const card = await finalisedCard(ctx);
+      const { card } = await finalisedCard(ctx);
 
       const printable = await (await app.request(`/report-cards/${card.id}`, {
         headers: tenantHeaders("alpha", ctx.admin),

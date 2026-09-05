@@ -1,4 +1,4 @@
-import { and, count, desc, eq, isNull, sql } from "drizzle-orm";
+import { and, asc, count, desc, eq, inArray, isNull, sql } from "drizzle-orm";
 import * as HttpStatusCodes from "stoker/http-status-codes";
 
 import type { AppDb } from "@/db";
@@ -69,9 +69,10 @@ async function primaryGuardians(
     })
     .from(studentGuardians)
     .innerJoin(guardians, eq(studentGuardians.guardianId, guardians.id))
-    .where(sql`${studentGuardians.studentId} = ANY(${sql.raw(
-      `ARRAY[${studentIds.map(id => `'${id}'`).join(",")}]::uuid[]`,
-    )})`);
+    // `inArray`, not a hand-built array literal. The ids come from our own
+    // uuid columns so nothing was reachable, but concatenating values into SQL
+    // is a habit worth not having — and the helper is shorter besides.
+    .where(inArray(studentGuardians.studentId, studentIds));
 
   const chosen = new Map<string, { guardianId: string; phone: string; isPrimary: boolean }>();
   for (const row of rows) {
@@ -108,15 +109,37 @@ async function cohort(
     .innerJoin(students, eq(enrollments.studentId, students.id))
     .innerJoin(streams, eq(enrollments.streamId, streams.id))
     .innerJoin(gradeLevels, eq(streams.gradeLevelId, gradeLevels.id))
-    .where(and(...filters));
+    .where(and(...filters))
+    /*
+     * Class-list order, and ordered at all.
+     *
+     * Unordered, the preview's sample changed between two identical calls, so
+     * a bursar checking the wording saw a different family each time and could
+     * not tell whether anything had changed. It also decides the order a batch
+     * goes out in, which is what makes "who had we reached before it failed" a
+     * question with an answer.
+     */
+    .orderBy(asc(students.familyName), asc(students.givenName), asc(students.admissionNumber));
 }
 
-/** `{name}` and `{school}` only. Anything else is left alone, not blanked. */
+/**
+ * `{name}` and `{school}` always; `{amount}` only where there is one.
+ *
+ * Anything else is left alone rather than blanked — and `{amount}` used to
+ * contradict that, substituting an empty string on a results notice where no
+ * amount exists. A head whose custom wording mentioned an amount would have
+ * sent parents a sentence with a hole in it, and nothing would have said so.
+ * Leaving the placeholder visible is ugly on purpose: it is a mistake somebody
+ * can see in the dry run.
+ */
 function fill(template: string, values: { name: string; school: string; amount?: string }) {
-  return template
+  const filled = template
     .replaceAll("{name}", values.name)
-    .replaceAll("{school}", values.school)
-    .replaceAll("{amount}", values.amount ?? "");
+    .replaceAll("{school}", values.school);
+
+  return values.amount === undefined
+    ? filled
+    : filled.replaceAll("{amount}", values.amount);
 }
 
 /**

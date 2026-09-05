@@ -193,7 +193,21 @@ export const meritListQuerySchema = z.object({
   /** Rank within one class, or across the whole grade. One or the other. */
   streamId: z.uuid().optional(),
   gradeLevelId: z.uuid().optional(),
-});
+}).refine(
+  v => Boolean(v.streamId) !== Boolean(v.gradeLevelId),
+  {
+    /*
+     * Exactly one, and neither is a default.
+     *
+     * With neither, the query ranked the whole school — a list putting a Grade
+     * 1 above a Grade 9 on marks out of different papers, which is not a
+     * meaningless answer so much as a misleading one. With both, the second
+     * silently did nothing. A merit list is always OF something.
+     */
+    message: "Rank one class or one grade — give exactly one of streamId or gradeLevelId",
+    path: ["streamId"],
+  },
+);
 
 export const issueCertificateSchema = toZodV4SchemaTyped(
   z.object({

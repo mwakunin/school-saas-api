@@ -1224,6 +1224,14 @@ export const reportCards = pgTable("report_cards", {
     "report_cards_released_after_finalised",
     sql`${t.releasedAt} IS NULL OR ${t.finalisedAt} IS NOT NULL`,
   ),
+  // And a code implies something to verify. The code is minted with the
+  // snapshot at finalisation; one on an unfrozen row would resolve publicly to
+  // a document whose contents could still change — which is the opposite of
+  // what it is for.
+  check(
+    "report_cards_verified_after_finalised",
+    sql`${t.verificationCode} IS NULL OR ${t.finalisedAt} IS NOT NULL`,
+  ),
 ]);
 
 /**

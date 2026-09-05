@@ -6,6 +6,7 @@ import { Buffer } from "node:buffer";
 import type { AppDb } from "@/db";
 
 import { mpesaTransactions, payments, students } from "@/db/schema";
+import { mintVerificationCode } from "@/lib/verification";
 
 /**
  * Turning "what the parent typed" into "which child this is for".
@@ -149,6 +150,10 @@ export async function allocateTransaction(
       // The Safaricom receipt, so a bursar holding the parent's SMS can find
       // this row by the number the parent reads out.
       reference: input.transaction.transactionId,
+      // Same as a hand-recorded payment: the receipt has to be checkable, and
+      // an M-Pesa receipt is the one a family is most likely to bring back —
+      // usually because it was reversed.
+      verificationCode: mintVerificationCode(),
       recordedBy: input.recordedBy ?? null,
       receivedAt: input.transaction.transactedAt,
     });

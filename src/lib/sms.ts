@@ -16,6 +16,9 @@ import env from "@/env";
 
 export const smsEnabled = Boolean(env.AT_USERNAME && env.AT_API_KEY);
 
+/** Long enough for the API, short enough that a batch cannot hang on one call. */
+const SEND_TIMEOUT_MS = 15_000;
+
 /**
  * Test seam, mirroring `sentEmails`.
  *
@@ -138,6 +141,14 @@ export async function sendSms(input: {
 
   let payload: any;
   try {
+    /*
+     * Bounded, because a batch is a loop.
+     *
+     * `fetch` has no default timeout: one stalled connection would hold the
+     * whole send open, and the four hundredth family would be waiting on the
+     * first. Fifteen seconds is far longer than the API needs and far shorter
+     * than a request that is never coming back.
+     */
     const response = await fetch(`${baseUrl()}/version1/messaging`, {
       method: "POST",
       headers: {
@@ -146,12 +157,26 @@ export async function sendSms(input: {
         "Content-Type": "application/x-www-form-urlencoded",
       },
       body: form,
+      signal: AbortSignal.timeout(SEND_TIMEOUT_MS),
     });
 
-    payload = await response.json();
+    /*
+     * Status checked BEFORE parsing.
+     *
+     * A gateway 502 comes back as HTML, so parsing first made `.json()` throw
+     * and the catch below relabel a plain provider error as "could not reach
+     * Africa's Talking" — pointing at the network when the provider had
+     * answered perfectly clearly. The body is read as text so whatever it
+     * actually said survives into the message.
+     */
+    if (!response.ok) {
+      throw new SmsError(
+        `Africa's Talking returned ${response.status}`,
+        await response.text().catch(() => null),
+      );
+    }
 
-    if (!response.ok)
-      throw new SmsError(`Africa's Talking returned ${response.status}`, payload);
+    payload = await response.json();
   }
   catch (err) {
     if (err instanceof SmsError)
@@ -178,9 +203,17 @@ export async function sendSms(input: {
     };
   }
 
-  // 100 and 101 are queued/sent. Everything else is a refusal with a reason.
+  /*
+   * 100 Processed, 101 Sent, 102 Queued — all three mean accepted.
+   *
+   * 102 was missing, and it is the one that shows up under load: a queued
+   * message is one Africa's Talking has taken and will deliver, so recording
+   * it as rejected would have a school chasing failures that were not
+   * failures, and paying for messages it believed had not gone. Everything
+   * else in the 4xx/5xx range is a refusal with a reason.
+   */
   const statusCode = Number(recipient.statusCode);
-  const accepted = statusCode === 100 || statusCode === 101;
+  const accepted = statusCode === 100 || statusCode === 101 || statusCode === 102;
 
   return {
     to: input.to,

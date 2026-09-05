@@ -1,11 +1,18 @@
 import { eq } from "drizzle-orm";
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { TestUser } from "@/test/helpers";
 
 import app from "@/app";
 import db from "@/db";
-import { guardians, smsMessages, studentGuardians } from "@/db/schema";
+import {
+  enrollments,
+  guardians,
+  reportCards,
+  smsMessages,
+  studentGuardians,
+} from "@/db/schema";
+import * as smsModule from "@/lib/sms";
 import { sentSms } from "@/lib/sms";
 import {
   makeInvoice,
@@ -43,6 +50,7 @@ async function seed(subdomain: string) {
   const pupils: Array<{
     student: Awaited<ReturnType<typeof makeStudent>>;
     guardian: { id: string; phone: string };
+    enrollmentId: string;
   }> = [];
   for (const [n, name] of [["2026/001", "Wanjiku"], ["2026/002", "Otieno"]] as const) {
     const student = await makeStudent(school, n, { givenName: name, streamId: blue.id });
@@ -60,7 +68,12 @@ async function seed(subdomain: string) {
       guardianId: guardian.id,
       isPrimary: true,
     });
-    pupils.push({ student, guardian });
+    const [enrolment] = await db
+      .select({ id: enrollments.id })
+      .from(enrollments)
+      .where(eq(enrollments.studentId, student.id));
+
+    pupils.push({ student, guardian, enrollmentId: enrolment.id });
   }
 
   return { school, blue, admin, bursar, term, pupils, subdomain };
@@ -77,7 +90,6 @@ describe("messaging", () => {
       const ctx = await seed("alpha");
 
       const preview = await (await post("/sms/fee-reminders", {
-        termId: ctx.term.id,
         minBalanceCents: 0,
       }, jsonHeaders("alpha", ctx.bursar))).json();
 
@@ -95,7 +107,12 @@ describe("messaging", () => {
 
       expect(preview.recipients).toBe(2);
       expect(preview.estimatedCostCents).toBeGreaterThan(0);
-      expect(preview.sample[0].body).toContain("Wanjiku");
+
+      // Class-list order, so the same call previews the same family twice
+      // running — both children share a family name, so the given name decides.
+      expect(preview.sample.map((m: { body: string }) => m.body).join(" "))
+        .toContain("Otieno");
+      expect(preview.sample[0].body).toContain("Otieno");
     });
 
     it("names the families it would skip rather than passing over them", async () => {
@@ -108,7 +125,6 @@ describe("messaging", () => {
       });
 
       const preview = await (await post("/sms/fee-reminders", {
-        termId: ctx.term.id,
         minBalanceCents: 0,
       }, jsonHeaders("alpha", ctx.bursar))).json();
 
@@ -124,7 +140,6 @@ describe("messaging", () => {
       const ctx = await seed("alpha");
 
       const result = await (await post("/sms/fee-reminders", {
-        termId: ctx.term.id,
         minBalanceCents: 0,
         dryRun: false,
       }, jsonHeaders("alpha", ctx.bursar))).json();
@@ -147,7 +162,6 @@ describe("messaging", () => {
       await makeInvoice(ctx.school, ctx.pupils[0].student, { totalCents: 1_500_000 });
 
       await post("/sms/fee-reminders", {
-        termId: ctx.term.id,
         dryRun: false,
       }, jsonHeaders("alpha", ctx.bursar));
 
@@ -180,7 +194,6 @@ describe("messaging", () => {
       });
 
       await post("/sms/fee-reminders", {
-        termId: ctx.term.id,
         minBalanceCents: 0,
         dryRun: false,
       }, jsonHeaders("alpha", ctx.bursar));
@@ -197,7 +210,6 @@ describe("messaging", () => {
       await makeInvoice(ctx.school, ctx.pupils[0].student, { totalCents: 1_500_000 });
 
       const result = await (await post("/sms/fee-reminders", {
-        termId: ctx.term.id,
         dryRun: false,
       }, jsonHeaders("alpha", ctx.bursar))).json();
 
@@ -229,6 +241,31 @@ describe("messaging", () => {
         .toBe(true);
     });
 
+    it("reaches a family once the report card is released", async () => {
+      const ctx = await seed("alpha");
+      await db.insert(reportCards).values({
+        schoolId: ctx.school.id,
+        enrollmentId: ctx.pupils[0].enrollmentId,
+        termId: ctx.term.id,
+        snapshot: { learningAreas: [] },
+        finalisedAt: new Date(),
+        releasedAt: new Date(),
+      });
+
+      const result = await (await post("/sms/results-notice", {
+        termId: ctx.term.id,
+        dryRun: false,
+      }, jsonHeaders("alpha", ctx.admin))).json();
+
+      // The other child has no released card and is skipped with a reason, so
+      // the two halves of the gate are visible in one answer.
+      expect(result.sent).toBe(1);
+      expect(sentSms[0].body).toContain("Wanjiku");
+      expect(result.skipped).toEqual([
+        { admissionNumber: "2026/002", reason: "no_report_card" },
+      ]);
+    });
+
     it("is the head's send, not the bursar's", async () => {
       const ctx = await seed("alpha");
 
@@ -240,11 +277,44 @@ describe("messaging", () => {
     });
   });
 
+  describe("when the provider fails", () => {
+    it("records the failure and carries on to the next family", async () => {
+      const ctx = await seed("alpha");
+
+      /*
+       * One bad number must not abandon the rest of the batch.
+       *
+       * Letting the send throw would leave the remaining families unmessaged
+       * with no record of who was reached — and a bursar with no way to tell
+       * which half to retry. The row is written before the provider is called
+       * precisely so the failure survives as evidence.
+       */
+      const spy = vi.spyOn(smsModule, "sendSms").mockImplementationOnce(() => {
+        throw new Error("Africa's Talking is unreachable");
+      });
+
+      const result = await (await post("/sms/fee-reminders", {
+        minBalanceCents: 0,
+        dryRun: false,
+      }, jsonHeaders("alpha", ctx.bursar))).json();
+
+      expect(result.failed).toBe(1);
+      expect(result.sent).toBe(1);
+
+      const rows = await db.select().from(smsMessages);
+      expect(rows).toHaveLength(2);
+      const failure = rows.find(r => r.status === "failed");
+      expect(failure?.statusReason).toContain("unreachable");
+      expect(failure?.costCents).toBeNull();
+
+      spy.mockRestore();
+    });
+  });
+
   describe("what it cost", () => {
     it("totals the spend for a selection", async () => {
       const ctx = await seed("alpha");
       await post("/sms/fee-reminders", {
-        termId: ctx.term.id,
         minBalanceCents: 0,
         dryRun: false,
       }, jsonHeaders("alpha", ctx.bursar));
@@ -278,7 +348,6 @@ describe("messaging", () => {
       const beta = await seed("beta");
 
       await post("/sms/fee-reminders", {
-        termId: beta.term.id,
         minBalanceCents: 0,
         dryRun: false,
       }, jsonHeaders("beta", beta.bursar));

@@ -52,7 +52,16 @@ export const listAudit: TenantRouteHandler<ListAuditRoute> = async (c) => {
     .from(auditLog)
     .leftJoin(user, eq(auditLog.actorId, user.id))
     .where(where)
-    .orderBy(desc(auditLog.at))
+    /*
+     * The id breaks the tie, and it is needed more often than it looks.
+     *
+     * `at` defaults to `now()`, which inside a transaction is the transaction's
+     * start time — so every entry written by one request shares a timestamp
+     * exactly. Ordering on `at` alone leaves those rows in whatever order the
+     * plan happens to produce, and a reader paging through would see some
+     * twice and miss others.
+     */
+    .orderBy(desc(auditLog.at), desc(auditLog.id))
     .limit(query.limit)
     .offset(query.offset);
 

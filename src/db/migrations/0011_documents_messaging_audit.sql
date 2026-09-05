@@ -100,7 +100,15 @@ CREATE POLICY "tenant_isolation" ON "audit_log"
   WITH CHECK ("school_id" = app_current_school());
 --> statement-breakpoint
 
-GRANT SELECT, INSERT, UPDATE ON "transition_certificates", "sms_messages" TO school_app;--> statement-breakpoint
+-- No UPDATE on transition_certificates, and that is the point of them.
+--
+-- A certificate is frozen at issue (rule 7) and there is no operation that
+-- edits one — a reissue is a reprint of the same document. Granting UPDATE
+-- would leave the freeze resting on nothing but nobody having written the
+-- handler yet. `sms_messages` keeps UPDATE because a delivery report arrives
+-- after the row does and has to land somewhere.
+GRANT SELECT, INSERT ON "transition_certificates" TO school_app;--> statement-breakpoint
+GRANT SELECT, INSERT, UPDATE ON "sms_messages" TO school_app;--> statement-breakpoint
 
 -- The audit log gets INSERT and SELECT, and deliberately NOT UPDATE or DELETE.
 --

@@ -64,8 +64,10 @@ export const feeReminders = createRoute({
   description:
     "One message per family with a balance over the threshold, carrying the "
     + "amount and the child's admission number — which is also the M-Pesa "
-    + "account reference, so a parent can pay straight from the text. Dry run "
-    + "by default.",
+    + "account reference, so a parent can pay straight from the text. The "
+    + "balance is the whole account across every term, not this term alone: a "
+    + "family two terms behind should not be chased for the newest slice of "
+    + "it. Dry run by default.",
   middleware: [money],
   request: { body: jsonContentRequired(feeReminderSchema, "Who, and what to say") },
   responses: {

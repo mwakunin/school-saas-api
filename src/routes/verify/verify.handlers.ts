@@ -6,13 +6,10 @@ import type { AppRouteHandler } from "@/lib/types";
 import db from "@/db";
 import {
   academicYears,
-  enrollments,
-  gradeLevels,
   invoices,
   payments,
   reportCards,
   schools,
-  streams,
   students,
   terms,
   transitionCertificates,
@@ -33,31 +30,60 @@ import type { VerifyDocumentRoute } from "./verify.routes";
  * anything except the one document they already have.
  */
 
-/** What every document type answers with about the school and the child. */
-async function contextFor(schoolId: string, enrollmentId: string) {
+/**
+ * The school a document was issued by.
+ *
+ * The only piece not held in a snapshot, and the only live read left here. A
+ * school renaming itself is both rare and unlike the other changes: the
+ * institution is the same one, and telling a verifier its current name is more
+ * useful than its old one. Everything ABOUT the child comes from the frozen
+ * document.
+ */
+async function schoolFor(schoolId: string) {
   const [row] = await db
-    .select({
-      schoolName: schools.name,
-      county: schools.county,
-      givenName: students.givenName,
-      familyName: students.familyName,
-      admissionNumber: students.admissionNumber,
-      streamName: streams.name,
-      gradeName: gradeLevels.name,
-    })
-    .from(enrollments)
-    .innerJoin(students, eq(enrollments.studentId, students.id))
-    .innerJoin(streams, eq(enrollments.streamId, streams.id))
-    .innerJoin(gradeLevels, eq(streams.gradeLevelId, gradeLevels.id))
-    .innerJoin(schools, eq(enrollments.schoolId, schools.id))
-    .where(eq(enrollments.id, enrollmentId))
+    .select({ name: schools.name, county: schools.county })
+    .from(schools)
+    .where(eq(schools.id, schoolId))
     .limit(1);
 
-  if (!row || row.schoolName === undefined)
+  return row ?? null;
+}
+
+/**
+ * The student and class as the document RECORDED them, not as they are now.
+ *
+ * This used to join through to the live student and stream rows, which quietly
+ * broke the promise the endpoint makes. A child who transferred to another
+ * class, whose name was corrected, or whose stream was renamed between the
+ * document being printed and somebody checking it would have been verified
+ * against details that no longer matched the paper in their hand — the exact
+ * failure a snapshot exists to prevent (rule 7), reintroduced by the verifier.
+ */
+interface IssuedContext {
+  studentName: string;
+  admissionNumber: string;
+  className: string | null;
+}
+
+function contextFromSnapshot(snapshot: Record<string, unknown>): IssuedContext | null {
+  const student = snapshot.student as
+    | { name?: string; admissionNumber?: string }
+    | undefined;
+
+  if (!student?.name || !student.admissionNumber)
     return null;
 
-  void schoolId;
-  return row;
+  const held = (snapshot.class ?? snapshot.completed) as
+    | { gradeLevelName?: string; streamName?: string }
+    | undefined;
+
+  return {
+    studentName: student.name,
+    admissionNumber: student.admissionNumber,
+    className: held?.gradeLevelName
+      ? `${held.gradeLevelName} ${held.streamName ?? ""}`.trim()
+      : null,
+  };
 }
 
 async function termFor(termId: string) {
@@ -91,12 +117,14 @@ export const verifyDocument: AppRouteHandler<VerifyDocumentRoute> = async (c) =>
     .limit(1);
 
   if (card) {
-    const context = await contextFor(card.schoolId, card.enrollmentId);
-    if (!context)
+    const snapshot = card.snapshot as Record<string, unknown>;
+    const context = contextFromSnapshot(snapshot);
+    const school = await schoolFor(card.schoolId);
+
+    if (!context || !school)
       return notFound();
 
     const term = await termFor(card.termId);
-    const snapshot = card.snapshot as Record<string, unknown>;
 
     /*
      * Straight from the snapshot, never recomputed.
@@ -108,13 +136,13 @@ export const verifyDocument: AppRouteHandler<VerifyDocumentRoute> = async (c) =>
      */
     return c.json({
       documentType: "report_card" as const,
-      school: { name: context.schoolName, county: context.county },
+      school,
       student: {
-        name: `${context.givenName} ${context.familyName}`,
+        name: context.studentName,
         admissionNumber: context.admissionNumber,
       },
       term: term ? { number: term.number, year: term.year } : null,
-      className: `${context.gradeName} ${context.streamName}`,
+      className: context.className,
       issuedAt: card.finalisedAt?.toISOString() ?? null,
       summary: {
         learningAreas: snapshot.learningAreas ?? [],
@@ -149,6 +177,15 @@ export const verifyDocument: AppRouteHandler<VerifyDocumentRoute> = async (c) =>
     .limit(1);
 
   if (receipt) {
+    /*
+     * A receipt has no snapshot, and does not need one.
+     *
+     * What it asserts — an amount, a method, a date — lives on the payment row
+     * itself and never changes; the row is reversed, never edited. The child's
+     * name is read live for the same reason a school's is: a corrected
+     * spelling should show as corrected, and the admission number on the paper
+     * is what actually identifies the account.
+     */
     const term = receipt.termId ? await termFor(receipt.termId) : null;
     const reversed = receipt.payment.reversedAt !== null;
 
@@ -189,22 +226,24 @@ export const verifyDocument: AppRouteHandler<VerifyDocumentRoute> = async (c) =>
     .limit(1);
 
   if (certificate) {
-    const context = await contextFor(certificate.schoolId, certificate.enrollmentId);
-    if (!context)
+    const snapshot = certificate.snapshot as Record<string, unknown>;
+    const context = contextFromSnapshot(snapshot);
+    const school = await schoolFor(certificate.schoolId);
+
+    if (!context || !school)
       return notFound();
 
     const term = await termFor(certificate.termId);
-    const snapshot = certificate.snapshot as Record<string, unknown>;
 
     return c.json({
       documentType: "transition_certificate" as const,
-      school: { name: context.schoolName, county: context.county },
+      school,
       student: {
-        name: `${context.givenName} ${context.familyName}`,
+        name: context.studentName,
         admissionNumber: context.admissionNumber,
       },
       term: term ? { number: term.number, year: term.year } : null,
-      className: `${context.gradeName} ${context.streamName}`,
+      className: context.className,
       issuedAt: certificate.issuedAt.toISOString(),
       summary: snapshot,
       status: "valid" as const,

@@ -44,9 +44,20 @@ export const resultsNoticeSchema = toZodV4SchemaTyped(
   }),
 );
 
+/**
+ * No `termId`, deliberately — and it used to be here and do nothing.
+ *
+ * A balance is the whole account: `sum(invoices) - sum(payments)` across every
+ * term (rule 4). That is the right figure to chase, because a family two terms
+ * behind should not be reminded about this term alone. Taking a term id and
+ * ignoring it implied a scoping that did not exist, and a bursar reading the
+ * parameter list would reasonably have believed the reminder said something it
+ * did not.
+ */
 export const feeReminderSchema = toZodV4SchemaTyped(
   z.object({
-    ...audience,
+    gradeLevelId: z.uuid().optional(),
+    streamId: z.uuid().optional(),
     message: z.string().min(10).max(400).optional(),
     /** Skip trivial arrears; chasing KES 50 costs more than it collects. */
     minBalanceCents: z.number().int().min(0).default(100_00),

@@ -824,18 +824,43 @@ export const meritList: TenantRouteHandler<MeritListRoute> = async (c) => {
     .having(sql`count(${termResults.meanScore}) > 0`)
     .orderBy(sql`avg(${termResults.meanScore}) DESC`, asc(students.familyName));
 
+  /*
+   * Ties share a position, the way `rank()` does everywhere else.
+   *
+   * `index + 1` numbered two children on identical means 3rd and 4th, decided
+   * by surname — and position is the most contested number on a Kenyan report
+   * card, so a rank that depends on the alphabet is one a parent is right to
+   * dispute. `computePositions` already uses SQL `rank()` for the per-subject
+   * positions; this makes the merit list agree with the report cards built
+   * from the same data.
+   *
+   * Ranked on the DISPLAYED figure. Two means that print as 71.43 must share a
+   * place even if they differ in the seventh decimal, or the sheet shows
+   * identical marks with different positions beside them.
+   */
+  let position = 0;
+  let previousMean: number | null = null;
+
   return c.json(
-    rows.map((row, index) => ({
-      position: index + 1,
-      enrollmentId: row.enrollmentId,
-      studentId: row.studentId,
-      admissionNumber: row.admissionNumber,
-      name: `${row.givenName} ${row.familyName}`,
-      streamName: row.streamName,
-      gradeLevelName: row.gradeLevelName,
-      overallMean: Math.round(Number(row.overallMean) * 100) / 100,
-      learningAreas: row.learningAreas,
-    })),
+    rows.map((row, index) => {
+      const overallMean = Math.round(Number(row.overallMean) * 100) / 100;
+      if (overallMean !== previousMean) {
+        position = index + 1;
+        previousMean = overallMean;
+      }
+
+      return {
+        position,
+        enrollmentId: row.enrollmentId,
+        studentId: row.studentId,
+        admissionNumber: row.admissionNumber,
+        name: `${row.givenName} ${row.familyName}`,
+        streamName: row.streamName,
+        gradeLevelName: row.gradeLevelName,
+        overallMean,
+        learningAreas: row.learningAreas,
+      };
+    }),
     HttpStatusCodes.OK,
   );
 };

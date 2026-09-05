@@ -1028,6 +1028,56 @@ describe("assessment", () => {
       expect(list[0].overallMean).toBeGreaterThan(list[2].overallMean);
     });
 
+    it("gives two children on the same mean the same position", async () => {
+      const ctx = await seed("alpha");
+      const assessment = await makeAssessment(ctx);
+      await put(`/assessments/${assessment.id}/scores`, {
+        scores: [
+          { enrollmentId: ctx.pupils[0].enrolmentId, rawScore: 90 },
+          { enrollmentId: ctx.pupils[1].enrolmentId, rawScore: 70 },
+          { enrollmentId: ctx.pupils[2].enrolmentId, rawScore: 70 },
+        ],
+      }, jsonHeaders("alpha", ctx.teacher));
+      await post(`/assessments/${assessment.id}/publish`, {}, jsonHeaders("alpha", ctx.teacher));
+      await post("/term-results/compute", { termId: ctx.term.id }, jsonHeaders("alpha", ctx.admin));
+
+      const list = await (await app.request(
+        `/merit-list?termId=${ctx.term.id}&streamId=${ctx.blue.id}`,
+        { headers: tenantHeaders("alpha", ctx.admin) },
+      )).json();
+
+      /*
+       * 1, 2, 2 — the way SQL `rank()` does it everywhere else in the product.
+       *
+       * Numbering them 1, 2, 3 put two identical marks in different places and
+       * let the alphabet decide which child came second. Position is the most
+       * contested number on a Kenyan report card; a rank a parent can disprove
+       * by reading the two marks beside it is worse than no rank at all.
+       */
+      expect(list.map((r: { position: number }) => r.position)).toEqual([1, 2, 2]);
+      expect(list[1].overallMean).toBe(list[2].overallMean);
+    });
+
+    it("insists on ranking one class or one grade, never neither", async () => {
+      const ctx = await withMarks("alpha");
+      await post("/term-results/compute", { termId: ctx.term.id }, jsonHeaders("alpha", ctx.admin));
+
+      // With neither, this ranked the whole school — a list putting a Grade 1
+      // above a Grade 9 on marks out of different papers.
+      const unscoped = await app.request(`/merit-list?termId=${ctx.term.id}`, {
+        headers: tenantHeaders("alpha", ctx.admin),
+      });
+      expect(unscoped.status).toBe(422);
+
+      // With both, the second silently did nothing.
+      const both = await app.request(
+        `/merit-list?termId=${ctx.term.id}&streamId=${ctx.blue.id}`
+        + `&gradeLevelId=${ctx.school.gradeLevels[3].id}`,
+        { headers: tenantHeaders("alpha", ctx.admin) },
+      );
+      expect(both.status).toBe(422);
+    });
+
     it("refuses at a school that has stopped ranking children", async () => {
       const ctx = await withMarks("alpha");
       await post("/term-results/compute", { termId: ctx.term.id }, jsonHeaders("alpha", ctx.admin));
