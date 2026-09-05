@@ -1,7 +1,7 @@
 import { createRoute, z } from "@hono/zod-openapi";
 import * as HttpStatusCodes from "stoker/http-status-codes";
 import { jsonContent, jsonContentRequired } from "stoker/openapi/helpers";
-import { createErrorSchema, IdUUIDParamsSchema } from "stoker/openapi/schemas";
+import { createErrorSchema, createMessageObjectSchema, IdUUIDParamsSchema } from "stoker/openapi/schemas";
 
 import {
   forbiddenSchema,
@@ -17,11 +17,18 @@ import {
   computeResultsSchema,
   createAssessmentSchema,
   finaliseReportCardSchema,
+  issueCertificateSchema,
   listAssessmentsQuerySchema,
+  listCertificatesQuerySchema,
+  meritListEntrySchema,
+  meritListQuerySchema,
+  printableReportCardSchema,
   reportCardSchema,
   saveScoresResultSchema,
   saveScoresSchema,
   termResultSchema,
+  transitionCertificateDetailSchema,
+  transitionCertificateSchema,
 } from "./assessment.schemas";
 
 const tags = ["Assessment"];
@@ -245,7 +252,7 @@ export const getReportCard = createRoute({
   middleware: [anyStaff],
   request: { params: IdUUIDParamsSchema },
   responses: {
-    [HttpStatusCodes.OK]: jsonContent(reportCardSchema, "The report card"),
+    [HttpStatusCodes.OK]: jsonContent(printableReportCardSchema, "The report card"),
     ...errorResponses,
   },
 });
@@ -268,7 +275,104 @@ export const listReportCards = createRoute({
   },
 });
 
+export const meritList = createRoute({
+  tags,
+  method: "get",
+  path: "/merit-list",
+  summary: "Rank a class or a grade",
+  description:
+    "The cohort ordered on the mean of their learning-area means. Refused at "
+    + "a school whose `showsPositions` is off — some schools have moved away "
+    + "from ranking children under CBE, and producing the list anyway would "
+    + "leave it one query away from a screen that decided to show it.",
+  middleware: [anyStaff],
+  request: { query: meritListQuerySchema },
+  responses: {
+    [HttpStatusCodes.OK]: jsonContent(
+      z.array(meritListEntrySchema),
+      "Ranked, best first",
+    ),
+    [HttpStatusCodes.CONFLICT]: jsonContent(
+      createMessageObjectSchema("This school does not publish positions"),
+      "The school does not rank children",
+    ),
+    [HttpStatusCodes.UNPROCESSABLE_ENTITY]: jsonContent(
+      createErrorSchema(meritListQuerySchema),
+      "Validation error",
+    ),
+    ...errorResponses,
+  },
+});
+
+export const issueCertificate = createRoute({
+  tags,
+  method: "post",
+  path: "/transition-certificates",
+  summary: "Issue a transition certificate",
+  description:
+    "For the two points a CBE learner moves on: Grade 6 to junior school and "
+    + "Grade 9 to senior school. The milestone is derived from the grade's "
+    + "sequence, never passed in. Frozen at issue like a report card — a "
+    + "certificate reprinted years later for a child applying somewhere has to "
+    + "say what it said when it was issued.",
+  middleware: [adminOnly],
+  request: {
+    body: jsonContentRequired(issueCertificateSchema, "Who, and for which term"),
+  },
+  responses: {
+    [HttpStatusCodes.CREATED]: jsonContent(
+      transitionCertificateDetailSchema,
+      "The certificate, with its QR",
+    ),
+    [HttpStatusCodes.CONFLICT]: jsonContent(
+      createMessageObjectSchema("Already issued"),
+      "This child already has one for this milestone",
+    ),
+    [HttpStatusCodes.UNPROCESSABLE_ENTITY]: jsonContent(
+      createErrorSchema(issueCertificateSchema),
+      "Not a transition year, or nothing computed to certify",
+    ),
+    ...errorResponses,
+  },
+});
+
+export const listCertificates = createRoute({
+  tags,
+  method: "get",
+  path: "/transition-certificates",
+  summary: "Certificates issued",
+  middleware: [anyStaff],
+  request: { query: listCertificatesQuerySchema },
+  responses: {
+    [HttpStatusCodes.OK]: jsonContent(
+      z.array(transitionCertificateSchema),
+      "Certificates, newest first",
+    ),
+    ...errorResponses,
+  },
+});
+
+export const getCertificate = createRoute({
+  tags,
+  method: "get",
+  path: "/transition-certificates/{id}",
+  summary: "One certificate, ready to print",
+  middleware: [anyStaff],
+  request: { params: IdUUIDParamsSchema },
+  responses: {
+    [HttpStatusCodes.OK]: jsonContent(
+      transitionCertificateDetailSchema,
+      "The frozen certificate and its QR",
+    ),
+    ...errorResponses,
+  },
+});
+
 export type ListAssessmentsRoute = typeof listAssessments;
+export type MeritListRoute = typeof meritList;
+export type IssueCertificateRoute = typeof issueCertificate;
+export type ListCertificatesRoute = typeof listCertificates;
+export type GetCertificateRoute = typeof getCertificate;
 export type CreateAssessmentRoute = typeof createAssessment;
 export type GetAssessmentRoute = typeof getAssessment;
 export type SaveScoresRoute = typeof saveScores;

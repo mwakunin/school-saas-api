@@ -1,4 +1,4 @@
-import { and, asc, eq, inArray, isNotNull, isNull, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNotNull, isNull, sql } from "drizzle-orm";
 import * as HttpStatusCodes from "stoker/http-status-codes";
 import * as HttpStatusPhrases from "stoker/http-status-phrases";
 
@@ -19,19 +19,26 @@ import {
   students,
   termResults,
   terms,
+  transitionCertificates,
 } from "@/db/schema";
 import { computePositions, computeTermResults } from "@/lib/assessment";
+import { recordAudit } from "@/lib/audit";
 import { isForeignKeyViolation, isUniqueViolation } from "@/lib/db-errors";
+import { mintVerificationCode, qrSvgFor, verificationUrlFor } from "@/lib/verification";
 
 import type {
   ComputeResultsRoute,
   CreateAssessmentRoute,
   FinaliseReportCardRoute,
   GetAssessmentRoute,
+  GetCertificateRoute,
   GetReportCardRoute,
+  IssueCertificateRoute,
   ListAssessmentsRoute,
+  ListCertificatesRoute,
   ListReportCardsRoute,
   ListTermResultsRoute,
+  MeritListRoute,
   PublishAssessmentRoute,
   ReleaseReportCardRoute,
   SaveScoresRoute,
@@ -294,6 +301,16 @@ export const saveScores: TenantRouteHandler<SaveScoresRoute> = async (c) => {
     throw err;
   }
 
+  await recordAudit(db, {
+    schoolId: c.var.school.id,
+    actorId: c.var.user!.id,
+    action: "marks.saved",
+    entityType: "assessment",
+    entityId: id,
+    summary: `Entered ${rows.length} marks, ${updated} of them corrections`,
+    detail: { submitted: scores.length, deduped: rows.length, updated },
+  });
+
   return c.json({ saved: scores.length, updated }, HttpStatusCodes.OK);
 };
 
@@ -305,7 +322,7 @@ export const publishAssessment: TenantRouteHandler<PublishAssessmentRoute> = asy
     .update(assessments)
     .set({ publishedAt: new Date() })
     .where(and(eq(assessments.id, id), isNull(assessments.publishedAt)))
-    .returning({ id: assessments.id });
+    .returning({ id: assessments.id, title: assessments.title });
 
   if (!updated) {
     const exists = await db
@@ -317,6 +334,15 @@ export const publishAssessment: TenantRouteHandler<PublishAssessmentRoute> = asy
       ? c.json({ message: HttpStatusPhrases.NOT_FOUND }, HttpStatusCodes.NOT_FOUND)
       : c.json({ message: "Already published" }, HttpStatusCodes.CONFLICT);
   }
+
+  await recordAudit(db, {
+    schoolId: c.var.school.id,
+    actorId: c.var.user!.id,
+    action: "assessment.published",
+    entityType: "assessment",
+    entityId: id,
+    summary: `Published "${updated.title}" — marks are now visible to guardians`,
+  });
 
   return c.json((await assessmentDetail(db, id))!, HttpStatusCodes.OK);
 };
@@ -341,6 +367,23 @@ export const unpublishAssessment: TenantRouteHandler<UnpublishAssessmentRoute> =
       ? c.json({ message: HttpStatusPhrases.NOT_FOUND }, HttpStatusCodes.NOT_FOUND)
       : c.json({ message: "Not published" }, HttpStatusCodes.CONFLICT);
   }
+
+  /*
+   * Withdrawing is the one worth logging most.
+   *
+   * Marks that parents have already seen are about to become editable again,
+   * and the reason `saveScores` refuses a published assessment is precisely
+   * that a mark changing underneath a parent is the complaint to avoid. This
+   * is the record that the change was deliberate and whose it was.
+   */
+  await recordAudit(db, {
+    schoolId: c.var.school.id,
+    actorId: c.var.user!.id,
+    action: "assessment.unpublished",
+    entityType: "assessment",
+    entityId: id,
+    summary: "Withdrew a published assessment, reopening it for edits",
+  });
 
   return c.json((await assessmentDetail(db, id))!, HttpStatusCodes.OK);
 };
@@ -579,8 +622,21 @@ export const finaliseReportCard: TenantRouteHandler<FinaliseReportCardRoute> = a
         attendanceTotal: body.attendanceTotal,
         finalisedBy: c.var.user!.id,
         finalisedAt: new Date(),
+        // Minted here, with the snapshot it stands behind. Before finalisation
+        // there is nothing frozen for a code to verify.
+        verificationCode: mintVerificationCode(),
       })
       .returning();
+
+    await recordAudit(db, {
+      schoolId: c.var.school.id,
+      actorId: c.var.user!.id,
+      action: "report_card.finalised",
+      entityType: "report_card",
+      entityId: created.id,
+      summary: `Finalised a report card for term ${term.number}`,
+      detail: { enrollmentId: body.enrollmentId, termId: body.termId },
+    });
 
     return c.json(created, HttpStatusCodes.CREATED);
   }
@@ -630,6 +686,15 @@ export const releaseReportCard: TenantRouteHandler<ReleaseReportCardRoute> = asy
     );
   }
 
+  await recordAudit(db, {
+    schoolId: c.var.school.id,
+    actorId: c.var.user!.id,
+    action: "report_card.released",
+    entityType: "report_card",
+    entityId: updated.id,
+    summary: "Released a report card to guardians",
+  });
+
   return c.json(updated, HttpStatusCodes.OK);
 };
 
@@ -648,7 +713,23 @@ export const getReportCard: TenantRouteHandler<GetReportCardRoute> = async (c) =
     );
   }
 
-  return c.json(row, HttpStatusCodes.OK);
+  /*
+   * The QR goes out with the document, not as a separate call.
+   *
+   * Whatever renders the page — a PDF pipeline, the Next app — needs the SVG
+   * in hand at render time; making it fetch a second endpoint is how a report
+   * card ends up printed without one. Built from the stored code rather than
+   * minted here, so reprinting the same card always carries the same QR.
+   */
+  return c.json({
+    ...row,
+    verificationUrl: row.verificationCode
+      ? verificationUrlFor(row.verificationCode)
+      : null,
+    verificationQrSvg: row.verificationCode
+      ? await qrSvgFor(row.verificationCode)
+      : null,
+  }, HttpStatusCodes.OK);
 };
 
 export const listReportCards: TenantRouteHandler<ListReportCardsRoute> = async (c) => {
@@ -664,4 +745,337 @@ export const listReportCards: TenantRouteHandler<ListReportCardsRoute> = async (
     .where(and(...filters));
 
   return c.json(rows, HttpStatusCodes.OK);
+};
+
+// ---------------------------------------------------------------------------
+// Merit lists and transition certificates
+// ---------------------------------------------------------------------------
+
+export const meritList: TenantRouteHandler<MeritListRoute> = async (c) => {
+  const query = c.req.valid("query");
+  const db = c.var.db;
+
+  /*
+   * Refused outright when the school does not rank children.
+   *
+   * CLAUDE.md §5.6 keeps positions out of a report card snapshot entirely at
+   * such a school rather than nulling them at render time, and the same
+   * reasoning applies harder here: a merit list IS the ranking. Returning it
+   * unranked would be a different document nobody asked for; returning it
+   * ranked would hand a head the thing they decided not to publish.
+   */
+  const [school] = await db
+    .select({ showsPositions: schools.showsPositions })
+    .from(schools)
+    .limit(1);
+
+  if (!(school?.showsPositions ?? true)) {
+    return c.json(
+      { message: "This school does not publish positions" },
+      HttpStatusCodes.CONFLICT,
+    );
+  }
+
+  const filters = [eq(termResults.termId, query.termId)];
+  if (query.streamId)
+    filters.push(eq(streams.id, query.streamId));
+  if (query.gradeLevelId)
+    filters.push(eq(gradeLevels.id, query.gradeLevelId));
+
+  /*
+   * The mean of the learning-area means, not a mean of raw marks.
+   *
+   * Each area is already weighted internally by its assessments; averaging the
+   * area means again gives every subject equal say, which is what a Kenyan
+   * merit list has always meant. Averaging raw marks instead would silently
+   * weight whichever subject set the most papers.
+   *
+   * Areas with no mean are skipped rather than counted as zero — the same rule
+   * as an absence, and `learningAreas` is returned so a reader can see when
+   * two children were ranked over different numbers of subjects.
+   */
+  const rows = await db
+    .select({
+      enrollmentId: termResults.enrollmentId,
+      studentId: students.id,
+      admissionNumber: students.admissionNumber,
+      givenName: students.givenName,
+      familyName: students.familyName,
+      streamName: streams.name,
+      gradeLevelName: gradeLevels.name,
+      overallMean: sql<string>`avg(${termResults.meanScore})`,
+      learningAreas: sql<number>`count(${termResults.meanScore})::int`,
+    })
+    .from(termResults)
+    .innerJoin(enrollments, eq(termResults.enrollmentId, enrollments.id))
+    .innerJoin(students, eq(enrollments.studentId, students.id))
+    .innerJoin(streams, eq(enrollments.streamId, streams.id))
+    .innerJoin(gradeLevels, eq(streams.gradeLevelId, gradeLevels.id))
+    .where(and(...filters))
+    .groupBy(
+      termResults.enrollmentId,
+      students.id,
+      students.admissionNumber,
+      students.givenName,
+      students.familyName,
+      streams.name,
+      gradeLevels.name,
+    )
+    .having(sql`count(${termResults.meanScore}) > 0`)
+    .orderBy(sql`avg(${termResults.meanScore}) DESC`, asc(students.familyName));
+
+  return c.json(
+    rows.map((row, index) => ({
+      position: index + 1,
+      enrollmentId: row.enrollmentId,
+      studentId: row.studentId,
+      admissionNumber: row.admissionNumber,
+      name: `${row.givenName} ${row.familyName}`,
+      streamName: row.streamName,
+      gradeLevelName: row.gradeLevelName,
+      overallMean: Math.round(Number(row.overallMean) * 100) / 100,
+      learningAreas: row.learningAreas,
+    })),
+    HttpStatusCodes.OK,
+  );
+};
+
+/** The milestone a grade sequence marks, or null if it marks none. */
+function milestoneFor(sequence: number): "grade_6" | "grade_9" | null {
+  // Derived, never stored (CLAUDE.md §5.2). Grade 6 and Grade 9 are the
+  // candidate years, and the two points a family needs paperwork for.
+  if (sequence === 6)
+    return "grade_6";
+  if (sequence === 9)
+    return "grade_9";
+  return null;
+}
+
+export const issueCertificate: TenantRouteHandler<IssueCertificateRoute> = async (c) => {
+  const body = c.req.valid("json");
+  const db = c.var.db;
+
+  const [context] = await db
+    .select({
+      studentId: students.id,
+      admissionNumber: students.admissionNumber,
+      givenName: students.givenName,
+      middleNames: students.middleNames,
+      familyName: students.familyName,
+      dateOfBirth: students.dateOfBirth,
+      upiNumber: students.upiNumber,
+      streamName: streams.name,
+      gradeLevelName: gradeLevels.name,
+      sequence: gradeLevels.sequence,
+    })
+    .from(enrollments)
+    .innerJoin(students, eq(enrollments.studentId, students.id))
+    .innerJoin(streams, eq(enrollments.streamId, streams.id))
+    .innerJoin(gradeLevels, eq(streams.gradeLevelId, gradeLevels.id))
+    .where(eq(enrollments.id, body.enrollmentId));
+
+  if (!context) {
+    return c.json(
+      fieldError(["enrollmentId"], "No such enrolment at this school"),
+      HttpStatusCodes.UNPROCESSABLE_ENTITY,
+    );
+  }
+
+  const milestone = milestoneFor(context.sequence);
+  if (!milestone) {
+    return c.json(
+      fieldError(
+        ["enrollmentId"],
+        `${context.gradeLevelName} is not a transition year — certificates are `
+        + "issued at Grade 6 and Grade 9",
+      ),
+      HttpStatusCodes.UNPROCESSABLE_ENTITY,
+    );
+  }
+
+  const [term] = await db
+    .select({ id: terms.id, number: terms.number })
+    .from(terms)
+    .where(eq(terms.id, body.termId));
+
+  if (!term) {
+    return c.json(
+      fieldError(["termId"], "No such term at this school"),
+      HttpStatusCodes.UNPROCESSABLE_ENTITY,
+    );
+  }
+
+  const results = await db
+    .select({
+      learningAreaName: learningAreas.name,
+      sequence: learningAreas.sequence,
+      meanScore: termResults.meanScore,
+      overallLevel: termResults.overallLevel,
+      levelReduction: termResults.levelReduction,
+    })
+    .from(termResults)
+    .innerJoin(learningAreas, eq(termResults.learningAreaId, learningAreas.id))
+    .where(and(
+      eq(termResults.enrollmentId, body.enrollmentId),
+      eq(termResults.termId, body.termId),
+    ))
+    .orderBy(asc(learningAreas.sequence));
+
+  if (results.length === 0) {
+    return c.json(
+      fieldError(
+        ["termId"],
+        "Nothing has been computed for this child in this term, so there is "
+        + "nothing to certify",
+      ),
+      HttpStatusCodes.UNPROCESSABLE_ENTITY,
+    );
+  }
+
+  /*
+   * Frozen at issue, like a report card and for the same reason (rule 7).
+   *
+   * A transition certificate is the document a family carries to the next
+   * school. Reprinting it in three years — for an admission, a bursary
+   * application, a lost original — has to produce the same page, whatever has
+   * happened to the marks behind it since.
+   */
+  const snapshot = {
+    milestone,
+    student: {
+      name: [context.givenName, context.middleNames, context.familyName]
+        .filter(Boolean)
+        .join(" "),
+      admissionNumber: context.admissionNumber,
+      upiNumber: context.upiNumber,
+      dateOfBirth: context.dateOfBirth,
+    },
+    completed: {
+      gradeLevelName: context.gradeLevelName,
+      streamName: context.streamName,
+      termNumber: term.number,
+    },
+    levelReduction: results[0].levelReduction,
+    learningAreas: results.map(r => ({
+      name: r.learningAreaName,
+      sequence: r.sequence,
+      meanScore: r.meanScore === null ? null : Number(r.meanScore),
+      overallLevel: r.overallLevel,
+    })),
+    headComment: body.headComment ?? null,
+    issuedAt: new Date().toISOString(),
+  };
+
+  const code = mintVerificationCode();
+
+  let created;
+  try {
+    [created] = await db
+      .insert(transitionCertificates)
+      .values({
+        schoolId: c.var.school.id,
+        enrollmentId: body.enrollmentId,
+        termId: body.termId,
+        milestone,
+        snapshot,
+        verificationCode: code,
+        issuedBy: c.var.user!.id,
+      })
+      .returning();
+  }
+  catch (err) {
+    if (isUniqueViolation(err)) {
+      return c.json(
+        {
+          message:
+            "This child already has a certificate for this milestone. Reprint "
+            + "the one that was issued rather than making a second.",
+        },
+        HttpStatusCodes.CONFLICT,
+      );
+    }
+    throw err;
+  }
+
+  await recordAudit(db, {
+    schoolId: c.var.school.id,
+    actorId: c.var.user!.id,
+    action: "certificate.issued",
+    entityType: "transition_certificate",
+    entityId: created.id,
+    summary: `Issued a ${milestone.replace("_", " ")} transition certificate`,
+    detail: { enrollmentId: body.enrollmentId, admissionNumber: context.admissionNumber },
+  });
+
+  return c.json({
+    id: created.id,
+    enrollmentId: created.enrollmentId,
+    termId: created.termId,
+    milestone,
+    snapshot,
+    issuedAt: created.issuedAt.toISOString(),
+    verificationCode: code,
+    verificationUrl: verificationUrlFor(code),
+    verificationQrSvg: await qrSvgFor(code),
+  }, HttpStatusCodes.CREATED);
+};
+
+export const listCertificates: TenantRouteHandler<ListCertificatesRoute> = async (c) => {
+  const query = c.req.valid("query");
+  const db = c.var.db;
+
+  const filters = [];
+  if (query.termId)
+    filters.push(eq(transitionCertificates.termId, query.termId));
+  if (query.milestone)
+    filters.push(eq(transitionCertificates.milestone, query.milestone));
+
+  const rows = await db
+    .select()
+    .from(transitionCertificates)
+    .where(filters.length > 0 ? and(...filters) : undefined)
+    .orderBy(desc(transitionCertificates.issuedAt));
+
+  return c.json(
+    rows.map(row => ({
+      id: row.id,
+      enrollmentId: row.enrollmentId,
+      termId: row.termId,
+      milestone: row.milestone,
+      snapshot: row.snapshot as Record<string, unknown>,
+      issuedAt: row.issuedAt.toISOString(),
+      verificationCode: row.verificationCode,
+      verificationUrl: verificationUrlFor(row.verificationCode),
+    })),
+    HttpStatusCodes.OK,
+  );
+};
+
+export const getCertificate: TenantRouteHandler<GetCertificateRoute> = async (c) => {
+  const { id } = c.req.valid("param");
+
+  const [row] = await c.var.db
+    .select()
+    .from(transitionCertificates)
+    .where(eq(transitionCertificates.id, id));
+
+  if (!row) {
+    return c.json(
+      { message: HttpStatusPhrases.NOT_FOUND },
+      HttpStatusCodes.NOT_FOUND,
+    );
+  }
+
+  return c.json({
+    id: row.id,
+    enrollmentId: row.enrollmentId,
+    termId: row.termId,
+    milestone: row.milestone,
+    // Straight from the snapshot, never recomputed.
+    snapshot: row.snapshot as Record<string, unknown>,
+    issuedAt: row.issuedAt.toISOString(),
+    verificationCode: row.verificationCode,
+    verificationUrl: verificationUrlFor(row.verificationCode),
+    verificationQrSvg: await qrSvgFor(row.verificationCode),
+  }, HttpStatusCodes.OK);
 };

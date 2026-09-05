@@ -22,6 +22,12 @@ router
   .openapi(routes.finaliseReportCard, handlers.finaliseReportCard)
   .openapi(routes.listReportCards, handlers.listReportCards)
   .openapi(routes.getReportCard, handlers.getReportCard)
-  .openapi(routes.releaseReportCard, handlers.releaseReportCard);
+  .openapi(routes.releaseReportCard, handlers.releaseReportCard)
+  .openapi(routes.meritList, handlers.meritList)
+  // Before /transition-certificates/{id}, same reason as the report cards
+  // above: a literal path segment must not be parsed as an id.
+  .openapi(routes.issueCertificate, handlers.issueCertificate)
+  .openapi(routes.listCertificates, handlers.listCertificates)
+  .openapi(routes.getCertificate, handlers.getCertificate);
 
 export default router;

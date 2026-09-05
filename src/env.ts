@@ -100,6 +100,22 @@ const EnvSchema = z.object({
    */
   DEMO_PASSWORD: z.string().min(8).default("demo-password-2026"),
 
+  // --- SMS (Africa's Talking) ---
+  //
+  // Picks the host: api.sandbox.africastalking.com vs api.africastalking.com.
+  // Sandbox only ever delivers to the simulator, so a school configured
+  // against it silently sends nothing real — which is why it is explicit.
+  AT_ENV: z.enum(["sandbox", "production"]).default("sandbox"),
+  AT_USERNAME: z.string().optional(),
+  AT_API_KEY: z.string().optional(),
+  /**
+   * The alphanumeric sender a parent sees instead of a shortcode.
+   *
+   * Optional because it has to be registered with Safaricom first, which takes
+   * weeks; without one, Africa's Talking sends from a shared shortcode.
+   */
+  AT_SENDER_ID: z.string().optional(),
+
   // --- M-Pesa ---
   // Picks the Daraja host: sandbox.safaricom.co.ke vs api.safaricom.co.ke.
   MPESA_ENV: z.enum(["sandbox", "production"]).default("sandbox"),
