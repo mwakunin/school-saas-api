@@ -1,7 +1,7 @@
 import { createRoute, z } from "@hono/zod-openapi";
 import * as HttpStatusCodes from "stoker/http-status-codes";
 import { jsonContent, jsonContentRequired } from "stoker/openapi/helpers";
-import { createErrorSchema, IdUUIDParamsSchema } from "stoker/openapi/schemas";
+import { createErrorSchema, createMessageObjectSchema, IdUUIDParamsSchema } from "stoker/openapi/schemas";
 
 import {
   forbiddenSchema,
@@ -13,6 +13,7 @@ import { requireMembershipRole } from "@/middlewares/auth";
 import {
   createAcademicYearSchema,
   createStreamSchema,
+  createTermSchema,
   selectAcademicYearSchema,
   selectGradeLevelSchema,
   selectSchoolSchema,
@@ -102,9 +103,42 @@ export const listTerms = createRoute({
   method: "get",
   path: "/terms",
   summary: "Terms",
+  description:
+    "Every term the school has, oldest first. Narrow with `academicYearId` — "
+    + "once a school has more than one year on file, 'term 3' no longer names "
+    + "one term, and a caller matching on the number alone will pick whichever "
+    + "year sorts first.",
   middleware: [anyMember],
+  request: {
+    query: z.object({ academicYearId: z.uuid().optional() }),
+  },
   responses: {
     [HttpStatusCodes.OK]: jsonContent(z.array(selectTermSchema), "Terms in order"),
+    ...errorResponses,
+  },
+});
+
+export const createTerm = createRoute({
+  tags,
+  method: "post",
+  path: "/terms",
+  summary: "Add a term to a year",
+  description:
+    "Onboarding seeds three terms for a school's first year and none after it, "
+    + "so this is how the second year onwards gets a calendar. Marking a term "
+    + "current clears the flag on the others, exactly as PATCH does.",
+  middleware: [adminOnly],
+  request: { body: jsonContentRequired(createTermSchema, "The term") },
+  responses: {
+    [HttpStatusCodes.CREATED]: jsonContent(selectTermSchema, "The new term"),
+    [HttpStatusCodes.CONFLICT]: jsonContent(
+      createMessageObjectSchema("That term already exists"),
+      "The year already has a term with this number",
+    ),
+    [HttpStatusCodes.UNPROCESSABLE_ENTITY]: jsonContent(
+      createErrorSchema(createTermSchema),
+      "Validation error, or no such academic year",
+    ),
     ...errorResponses,
   },
 });
@@ -190,6 +224,7 @@ export type GetSchoolRoute = typeof getSchool;
 export type ListAcademicYearsRoute = typeof listAcademicYears;
 export type CreateAcademicYearRoute = typeof createAcademicYear;
 export type ListTermsRoute = typeof listTerms;
+export type CreateTermRoute = typeof createTerm;
 export type UpdateTermRoute = typeof updateTerm;
 export type ListGradeLevelsRoute = typeof listGradeLevels;
 export type ListStreamsRoute = typeof listStreams;

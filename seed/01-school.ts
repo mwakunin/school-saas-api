@@ -1,6 +1,6 @@
 import type { Api, Session } from "./lib/client";
 
-import { ACADEMIC_YEAR, TERM_DATES } from "./lib/calendar";
+import { ACADEMIC_YEAR, shiftYear, TERM_DATES } from "./lib/calendar";
 import { makeSuperadmin, platformApi, schoolApi, signUp, signUpOperator } from "./lib/client";
 
 /**
@@ -56,6 +56,24 @@ export interface SchoolContext {
   gradeLevels: Array<{ id: string; name: string; sequence: number; phase: string }>;
   streams: Array<{ id: string; name: string; gradeLevelId: string; sequence: number }>;
   sessions: Record<keyof typeof LOGINS, Session>;
+  /**
+   * Last year, so the school has a past a certificate can be issued against.
+   *
+   * A transition certificate requires a FINISHED term 3, and the current year's
+   * is deliberately in progress (§8). Without a previous year the feature could
+   * not appear in the demo at all.
+   */
+  priorYear: {
+    academicYearId: string;
+    year: number;
+    finalTermId: string;
+    /** Grade 6 last year — this year's Grade 7 children came up from it. */
+    gradeSixStreamId: string;
+    /** Grade 9 last year — those children have since left. */
+    gradeNineStreamId: string;
+    startsOn: string;
+    endsOn: string;
+  };
   /** The unguessable segment of this school's C2B confirmation URL. */
   callbackToken: string;
   api: (as: keyof typeof LOGINS) => Api;
@@ -140,6 +158,44 @@ export async function seedSchool(): Promise<SchoolContext> {
   }
 
   /*
+   * The year before this one, built the way a school builds its own.
+   *
+   * Onboarding seeds terms for the FIRST year only, so `POST /terms` is what
+   * makes a second year possible — an endpoint this seed needed and found
+   * missing. Everything here is a year in the past and therefore finished,
+   * which is what lets 07-leavers issue certificates against it.
+   */
+  const priorYearNumber = ACADEMIC_YEAR - 1;
+  const priorYear = await head.post("/academic-years", {
+    year: priorYearNumber,
+    isCurrent: false,
+  });
+
+  let finalTermId = "";
+  for (const wanted of TERM_DATES) {
+    const term = await head.post("/terms", {
+      academicYearId: priorYear.id,
+      number: wanted.number,
+      startsOn: shiftYear(wanted.startsOn),
+      endsOn: shiftYear(wanted.endsOn),
+      isCurrent: false,
+    });
+    if (wanted.number === 3)
+      finalTermId = term.id;
+  }
+
+  const priorStreams: Record<number, string> = {};
+  for (const sequence of [6, 9]) {
+    const grade = gradeLevels.find((g: { sequence: number }) => g.sequence === sequence);
+    const created = await head.post("/streams", {
+      gradeLevelId: grade.id,
+      academicYearId: priorYear.id,
+      name: sequence === 6 ? "Blue" : "East",
+    });
+    priorStreams[sequence] = created.id;
+  }
+
+  /*
    * M-Pesa, configured but never registered.
    *
    * `registerUrls` stays false: registration talks to Daraja, and a seed that
@@ -170,6 +226,15 @@ export async function seedSchool(): Promise<SchoolContext> {
     gradeLevels,
     streams,
     sessions,
+    priorYear: {
+      academicYearId: priorYear.id,
+      year: priorYearNumber,
+      finalTermId,
+      gradeSixStreamId: priorStreams[6],
+      gradeNineStreamId: priorStreams[9],
+      startsOn: shiftYear(TERM_DATES[0].startsOn),
+      endsOn: shiftYear(TERM_DATES[2].endsOn),
+    },
     callbackToken,
     api,
   };

@@ -14,6 +14,7 @@ import {
 import type {
   CreateAcademicYearRoute,
   CreateStreamRoute,
+  CreateTermRoute,
   GetSchoolRoute,
   ListAcademicYearsRoute,
   ListGradeLevelsRoute,
@@ -100,12 +101,83 @@ export const createAcademicYear: TenantRouteHandler<CreateAcademicYearRoute> = a
 };
 
 export const listTerms: TenantRouteHandler<ListTermsRoute> = async (c) => {
+  const { academicYearId } = c.req.valid("query");
+
   const rows = await c.var.db
     .select()
     .from(terms)
+    .where(academicYearId ? eq(terms.academicYearId, academicYearId) : undefined)
+    // By date rather than by number, so two years' worth still read in the
+    // order they happened rather than 1,1,2,2,3,3.
     .orderBy(asc(terms.startsOn));
 
   return c.json(rows, HttpStatusCodes.OK);
+};
+
+export const createTerm: TenantRouteHandler<CreateTermRoute> = async (c) => {
+  const body = c.req.valid("json");
+  const db = c.var.db;
+
+  // Invisible under RLS if it belongs to another school, so this doubles as
+  // the tenant check.
+  const [year] = await db
+    .select({ id: academicYears.id })
+    .from(academicYears)
+    .where(eq(academicYears.id, body.academicYearId));
+
+  if (!year) {
+    return c.json(
+      {
+        success: false as const,
+        error: {
+          issues: [{
+            code: "custom" as const,
+            path: ["academicYearId"],
+            message: "No such academic year at this school",
+          }],
+          name: "ZodError",
+        },
+      },
+      HttpStatusCodes.UNPROCESSABLE_ENTITY,
+    );
+  }
+
+  try {
+    const created = await db.transaction(async (tx) => {
+      if (body.isCurrent) {
+        // Exactly one term is current, the same way exactly one year is.
+        await tx
+          .update(terms)
+          .set({ isCurrent: false })
+          .where(eq(terms.isCurrent, true));
+      }
+
+      const [row] = await tx
+        .insert(terms)
+        .values({
+          schoolId: c.var.school.id,
+          academicYearId: body.academicYearId,
+          number: body.number,
+          startsOn: body.startsOn,
+          endsOn: body.endsOn,
+          isCurrent: body.isCurrent,
+        })
+        .returning();
+
+      return row;
+    });
+
+    return c.json(created, HttpStatusCodes.CREATED);
+  }
+  catch (err) {
+    if (isUniqueViolation(err)) {
+      return c.json(
+        { message: `That year already has a term ${body.number}` },
+        HttpStatusCodes.CONFLICT,
+      );
+    }
+    throw err;
+  }
 };
 
 export const updateTerm: TenantRouteHandler<UpdateTermRoute> = async (c) => {

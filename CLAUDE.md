@@ -624,7 +624,15 @@ seed/
   04-history.ts       past two terms: assessments, scores, term results
   05-fees.ts          structures, invoices, payments, unmatched queue
   06-current.ts       in-progress term state
+  07-leavers.ts       last year, its results, and transition certificates
+  08-messaging.ts     one fee-reminder batch
 ```
+
+**The demo needs a previous year, and the reason is a real constraint.** A transition certificate cannot be issued before its term 3 has ended, and this demo's term 3 is deliberately in progress — so nothing in the current year can ever be certified. `01-school.ts` therefore builds last year too: Grade 7's children are enrolled in last year's Grade 6 and walked up through it (forwards, because `POST /enrollments` closes the old placement and opens a new one — history cannot be back-dated), and last year's Grade 9 cohort are certified and then `graduated`.
+
+Two endpoints were missing and were found by building this: **`POST /terms`**, without which a school reaching its second year had no way to make a calendar at all, and an **`academicYearId` filter on `GET /terms`** — with more than one year on file, "term 3" no longer names one term, and anything matching on the number picks whichever sorts first.
+
+**The seed never sends real SMS.** Guardian numbers are fabricated, and a fabricated Kenyan number is not necessarily an unassigned one. The fee-reminder batch is scoped to one class and stays a dry run unless a provider is configured; a deployment that wants a populated ledger configures Africa's Talking **against the sandbox**, which delivers to a simulator and nowhere else.
 
 Run the seed in CI against Docker Postgres — if it breaks, a migration broke something real.
 
