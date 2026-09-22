@@ -126,10 +126,12 @@ export interface AllocationResult {
  * transaction marked `allocated` with no money behind it, are both states
  * nobody could untangle later.
  *
- * The payment carries no `invoiceId`: it lands as a credit on the student's
- * account. Which term a payment settles is a bursar's decision, and guessing
- * "the oldest unpaid invoice" produces a plausible allocation that is wrong
- * whenever a parent is paying next term in advance.
+ * The payment lands as a credit on the student's account — allocating it to
+ * particular invoices is a separate act afterwards, through
+ * `recordAllocations` (lib/allocations.ts). Which term a payment settles is a
+ * bursar's decision, and guessing "the oldest unpaid invoice" produces a
+ * plausible allocation that is wrong whenever a parent is paying next term in
+ * advance.
  */
 export async function allocateTransaction(
   db: AppDb,

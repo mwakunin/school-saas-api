@@ -787,8 +787,6 @@ export const payments = pgTable("payments", {
   id: uuid().primaryKey().defaultRandom(),
   schoolId: uuid().notNull().references(() => schools.id),
   studentId: uuid().notNull(),
-  /** Null = a credit on account, not yet applied to a particular term. */
-  invoiceId: uuid(),
   method: text().$type<"mpesa" | "bank" | "cash" | "cheque">().notNull(),
   /** The raw confirmation this came from, for an `mpesa` payment. */
   mpesaTransactionId: uuid(),
@@ -816,28 +814,21 @@ export const payments = pgTable("payments", {
     name: "payments_school_student_fk",
   }),
   /*
-   * The invoice reference carries the student, not just the school.
+   * Lets `allocations` reference (school_id, payment_id, student_id).
    *
-   * A two-column (school_id, invoice_id) key would let a payment name child A
-   * and settle child B's invoice — each key true on its own, the pair wrong.
-   * Including student_id makes that unrepresentable.
-   *
-   * `invoice_id` is nullable for a credit on account. Under the default MATCH
-   * SIMPLE, a NULL in any referencing column switches the constraint off for
-   * that row, which is exactly the behaviour a credit needs.
+   * An allocation that did not carry the student could take a payment made
+   * for child A and settle child B's invoice with it — each two-column key
+   * individually true, the pair wrong. Including student_id here is what lets
+   * both allocation foreign keys carry it, so the money and the bill cannot
+   * come apart at the reference level.
    */
-  foreignKey({
-    columns: [t.schoolId, t.invoiceId, t.studentId],
-    foreignColumns: [invoices.schoolId, invoices.id, invoices.studentId],
-    name: "payments_school_invoice_student_fk",
-  }),
+  unique("payments_school_id_id_student_id_key").on(t.schoolId, t.id, t.studentId),
   foreignKey({
     columns: [t.schoolId, t.mpesaTransactionId],
     foreignColumns: [mpesaTransactions.schoolId, mpesaTransactions.id],
     name: "payments_school_mpesa_transaction_fk",
   }),
   index().on(t.schoolId, t.studentId),
-  index().on(t.schoolId, t.invoiceId),
   /*
    * At most one LIVE payment per confirmation.
    *
@@ -867,6 +858,82 @@ export const payments = pgTable("payments", {
   check(
     "payments_mpesa_has_transaction",
     sql`(${t.method} = 'mpesa') = (${t.mpesaTransactionId} IS NOT NULL)`,
+  ),
+]);
+
+/**
+ * Which invoice a payment settled, and how much of it went there.
+ *
+ * The many-to-many between what is owed and what was paid. A payment used to
+ * carry a single nullable `invoiceId`, which made "a parent pays this term's
+ * arrears AND next term in advance" unrepresentable — one receipt, two terms,
+ * and the money had to sit as an undifferentiated credit. Allocations split
+ * that receipt across as many invoices as it actually settles.
+ *
+ * Allocation is a separate act from matching, deliberately. The M-Pesa matcher
+ * still lands money as a credit on the student's account — it must not guess
+ * which term a parent was paying for. Naming the term is what this table
+ * records, afterwards, by a person.
+ *
+ * An allocation's amount is the part of the payment it consumes, so a payment
+ * of 20,000 can allocate 8,000 to one invoice and 12,000 to another. What it
+ * can never do is exceed either side: the sum of an invoice's live allocations
+ * may not pass the invoice total, and the sum of a payment's live allocations
+ * may not pass the payment amount. Neither rule fits in a CHECK constraint —
+ * each spans rows — so both are enforced in lib/allocations.ts inside the
+ * transaction, which is the weakest link in this layer and the most tested.
+ *
+ * "Live" means the allocation is not reversed AND its payment is not reversed.
+ * Only the allocation carries a reversal of its own: reversing a payment is
+ * the bigger act, and `reversed_at IS NULL` on the payment is already part of
+ * every balance query, so the liveness rule reads both rather than copying one
+ * onto the other. Two copies that drift is exactly what rule 4 exists to
+ * prevent.
+ */
+export const allocations = pgTable("allocations", {
+  id: uuid().primaryKey().defaultRandom(),
+  schoolId: uuid().notNull().references(() => schools.id),
+  /**
+   * The student the money is for — carried so both references can include it.
+   *
+   * Redundant against `payments.student_id` and `invoices.student_id`, and
+   * that redundancy is the point: with it, a payment made for child A cannot
+   * be allocated to child B's invoice, because each foreign key would have to
+   * agree on whose money it is. Without it the pair could disagree silently —
+   * the same defect the old `payments_school_invoice_student_fk` existed to
+   * close.
+   */
+  studentId: uuid().notNull(),
+  paymentId: uuid().notNull(),
+  invoiceId: uuid().notNull(),
+  amountCents: integer().notNull(),
+  allocatedBy: userRef("allocated_by").references(() => user.id),
+  allocatedAt: timestamp({ withTimezone: true }).defaultNow().notNull(),
+  /** Un-allocating is a reversal, never a DELETE (rule 5) — as with payments. */
+  reversedAt: timestamp({ withTimezone: true }),
+  reversalReason: text(),
+}, t => [
+  unique("allocations_school_id_id_key").on(t.schoolId, t.id),
+  // Both references carry the student, so a payment made for one child cannot
+  // settle another child's bill — see the column comment above.
+  foreignKey({
+    columns: [t.schoolId, t.paymentId, t.studentId],
+    foreignColumns: [payments.schoolId, payments.id, payments.studentId],
+    name: "allocations_school_payment_student_fk",
+  }),
+  foreignKey({
+    columns: [t.schoolId, t.invoiceId, t.studentId],
+    foreignColumns: [invoices.schoolId, invoices.id, invoices.studentId],
+    name: "allocations_school_invoice_student_fk",
+  }),
+  // "Where did this payment go" and "what settled this invoice" are the two
+  // questions this table exists to answer.
+  index().on(t.schoolId, t.paymentId),
+  index().on(t.schoolId, t.invoiceId),
+  wholeShillingsPositive("allocations_amount_whole", t.amountCents),
+  check(
+    "allocations_reversal_has_reason",
+    sql`(${t.reversedAt} IS NULL) = (${t.reversalReason} IS NULL)`,
   ),
 ]);
 
@@ -1431,6 +1498,8 @@ export const auditLog = pgTable("audit_log", {
    * duplication is what keeps them honest rather than an oversight.
    */
   action: text().$type<
+    | "allocation.recorded"
+    | "allocation.reversed"
     | "assessment.published"
     | "assessment.unpublished"
     | "certificate.issued"
@@ -1462,6 +1531,8 @@ export const auditLog = pgTable("audit_log", {
   index().on(t.schoolId, t.at),
   index().on(t.schoolId, t.entityType, t.entityId),
   oneOf("audit_log_action_known", t.action, [
+    "allocation.recorded",
+    "allocation.reversed",
     "assessment.published",
     "assessment.unpublished",
     "certificate.issued",
@@ -1498,6 +1569,7 @@ export const TENANT_TABLES = [
   "invoices",
   "invoice_lines",
   "payments",
+  "allocations",
   "mpesa_transactions",
   "learning_areas",
   "competencies",
@@ -1609,7 +1681,7 @@ export const invoicesRelations = relations(invoices, ({ one, many }) => ({
   student: one(students, { fields: [invoices.studentId], references: [students.id] }),
   term: one(terms, { fields: [invoices.termId], references: [terms.id] }),
   lines: many(invoiceLines),
-  payments: many(payments),
+  allocations: many(allocations),
 }));
 
 export const invoiceLinesRelations = relations(invoiceLines, ({ one }) => ({
@@ -1619,15 +1691,22 @@ export const invoiceLinesRelations = relations(invoiceLines, ({ one }) => ({
   }),
 }));
 
-export const paymentsRelations = relations(payments, ({ one }) => ({
+export const paymentsRelations = relations(payments, ({ one, many }) => ({
   school: one(schools, { fields: [payments.schoolId], references: [schools.id] }),
   student: one(students, { fields: [payments.studentId], references: [students.id] }),
-  invoice: one(invoices, { fields: [payments.invoiceId], references: [invoices.id] }),
+  allocations: many(allocations),
   recordedByUser: one(user, { fields: [payments.recordedBy], references: [user.id] }),
   mpesaTransaction: one(mpesaTransactions, {
     fields: [payments.mpesaTransactionId],
     references: [mpesaTransactions.id],
   }),
+}));
+
+export const allocationsRelations = relations(allocations, ({ one }) => ({
+  school: one(schools, { fields: [allocations.schoolId], references: [schools.id] }),
+  payment: one(payments, { fields: [allocations.paymentId], references: [payments.id] }),
+  invoice: one(invoices, { fields: [allocations.invoiceId], references: [invoices.id] }),
+  allocatedByUser: one(user, { fields: [allocations.allocatedBy], references: [user.id] }),
 }));
 
 export const learningAreasRelations = relations(learningAreas, ({ one, many }) => ({

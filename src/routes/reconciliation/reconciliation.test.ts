@@ -5,9 +5,11 @@ import type { TestUser } from "@/test/helpers";
 
 import app from "@/app";
 import db from "@/db";
-import { mpesaTransactions, payments, schools } from "@/db/schema";
+import { allocations, mpesaTransactions, payments, schools } from "@/db/schema";
 import { generateCallbackToken } from "@/lib/crypto";
 import {
+  makeInvoice,
+  makePayment,
   makeSchool,
   makeStream,
   makeStudent,
@@ -414,10 +416,15 @@ describe("reconciliation", () => {
         jsonHeaders("alpha", bursar),
       );
 
-      // Which term a payment settles is a bursar's decision. Guessing "the
-      // oldest unpaid invoice" is wrong every time a parent pays in advance.
+      // Which term a payment settles is a bursar's decision, recorded later as
+      // an allocation. Guessing "the oldest unpaid invoice" is wrong every
+      // time a parent pays in advance.
       const [payment] = await db.select().from(payments);
-      expect(payment.invoiceId).toBeNull();
+      expect(await db
+        .select()
+        .from(allocations)
+        .where(eq(allocations.paymentId, payment.id)),
+      ).toEqual([]);
     });
 
     it("409s a second allocation of the same money", async () => {
@@ -452,6 +459,210 @@ describe("reconciliation", () => {
       );
 
       expect(res.status).toBe(422);
+    });
+  });
+
+  describe("applying a payment to invoices", () => {
+    /** A school with a bursar, one child billed, and a receipt in hand. */
+    async function billedSeed(subdomain: string) {
+      const school = await makeSchool({ subdomain });
+      const blue = await makeStream(school, 4, "Blue");
+      const bursar = await signInAt(school.id, "bursar");
+      const kid = await makeStudent(school, "2026/118", {
+        givenName: "Wanjiku",
+        streamId: blue.id,
+      });
+      const invoice = await makeInvoice(school, kid, { totalCents: 1_800_000 });
+
+      return { school, bursar, kid, invoice };
+    }
+
+    it("applies part of a payment and leaves the rest as credit", async () => {
+      const { school, bursar, kid, invoice } = await billedSeed("alpha");
+      const payment = await makePayment(school, kid, { amountCents: 2_000_000 });
+
+      const res = await post(
+        `/payments/${payment.id}/allocations`,
+        { allocations: [{ invoiceId: invoice.id, amountCents: 1_800_000 }] },
+        jsonHeaders("alpha", bursar),
+      );
+
+      expect(res.status).toBe(201);
+      const body = await res.json();
+      expect(body.allocations).toHaveLength(1);
+      expect(body.allocations[0]).toMatchObject({
+        paymentId: payment.id,
+        invoiceId: invoice.id,
+        studentId: kid.id,
+        amountCents: 1_800_000,
+        reversedAt: null,
+      });
+    });
+
+    it("splits one receipt across several invoices in one request", async () => {
+      // billedSeed already issued this child's Term 1 invoice; Term 2's is new.
+      const { school, bursar, kid, invoice: termOne } = await billedSeed("alpha");
+      const payment = await makePayment(school, kid, { amountCents: 3_000_000 });
+      const termTwo = await makeInvoice(school, kid, { totalCents: 1_800_000, termIndex: 1 });
+
+      const res = await post(
+        `/payments/${payment.id}/allocations`,
+        {
+          allocations: [
+            { invoiceId: termOne.id, amountCents: 1_800_000 },
+            { invoiceId: termTwo.id, amountCents: 1_200_000 },
+          ],
+        },
+        jsonHeaders("alpha", bursar),
+      );
+
+      // The whole point of the many-to-many: one receipt, two terms.
+      expect(res.status).toBe(201);
+      expect((await res.json()).allocations).toHaveLength(2);
+    });
+
+    it("refuses to spend more than the payment holds", async () => {
+      const { school, bursar, kid, invoice } = await billedSeed("alpha");
+      const payment = await makePayment(school, kid, { amountCents: 1_000_000 });
+
+      const res = await post(
+        `/payments/${payment.id}/allocations`,
+        { allocations: [{ invoiceId: invoice.id, amountCents: 1_800_000 }] },
+        jsonHeaders("alpha", bursar),
+      );
+
+      expect(res.status).toBe(422);
+    });
+
+    it("refuses to settle an invoice beyond its total", async () => {
+      const { school, bursar, kid, invoice } = await billedSeed("alpha");
+      const first = await makePayment(school, kid, { amountCents: 1_500_000 });
+      const second = await makePayment(school, kid, { amountCents: 1_500_000 });
+
+      await post(
+        `/payments/${first.id}/allocations`,
+        { allocations: [{ invoiceId: invoice.id, amountCents: 1_500_000 }] },
+        jsonHeaders("alpha", bursar),
+      );
+
+      // The invoice holds 1,800,000 and 1,500,000 is already applied; another
+      // 500,000 would overpay THIS invoice. (Overpaying the account is fine —
+      // that is a credit — but an allocation names one invoice.)
+      const res = await post(
+        `/payments/${second.id}/allocations`,
+        { allocations: [{ invoiceId: invoice.id, amountCents: 500_000 }] },
+        jsonHeaders("alpha", bursar),
+      );
+
+      expect(res.status).toBe(422);
+    });
+
+    it("refuses a voided invoice", async () => {
+      const { school, bursar, kid, invoice } = await billedSeed("alpha");
+      await post(`/invoices/${invoice.id}/void`, { reason: "duplicate" }, jsonHeaders("alpha", bursar));
+      const payment = await makePayment(school, kid, { amountCents: 1_800_000 });
+
+      const res = await post(
+        `/payments/${payment.id}/allocations`,
+        { allocations: [{ invoiceId: invoice.id, amountCents: 1_800_000 }] },
+        jsonHeaders("alpha", bursar),
+      );
+
+      expect(res.status).toBe(422);
+    });
+
+    it("refuses another child's invoice", async () => {
+      const { school, bursar, kid } = await billedSeed("alpha");
+      const sibling = await makeStudent(school, "2026/205", {
+        givenName: "Otieno",
+        streamId: (await makeStream(school, 4, "Green")).id,
+      });
+      const siblingInvoice = await makeInvoice(school, sibling, { totalCents: 1_800_000 });
+      const payment = await makePayment(school, kid, { amountCents: 1_800_000 });
+
+      const res = await post(
+        `/payments/${payment.id}/allocations`,
+        { allocations: [{ invoiceId: siblingInvoice.id, amountCents: 1_800_000 }] },
+        jsonHeaders("alpha", bursar),
+      );
+
+      // The service refuses with a readable 422; the three-column foreign keys
+      // are what make it unrepresentable even if the service ever misses.
+      expect(res.status).toBe(422);
+      expect(await db.select().from(allocations)).toEqual([]);
+    });
+
+    it("refuses a reversed payment and 404s an unknown one", async () => {
+      const { school, bursar, kid, invoice } = await billedSeed("alpha");
+      const reversed = await makePayment(school, kid, { amountCents: 1_800_000 });
+      await post(`/payments/${reversed.id}/reverse`, { reason: "wrong child" }, jsonHeaders("alpha", bursar));
+
+      const refused = await post(
+        `/payments/${reversed.id}/allocations`,
+        { allocations: [{ invoiceId: invoice.id, amountCents: 1_800_000 }] },
+        jsonHeaders("alpha", bursar),
+      );
+      expect(refused.status).toBe(409);
+
+      const missing = await post(
+        "/payments/00000000-0000-4000-8000-000000000000/allocations",
+        { allocations: [{ invoiceId: invoice.id, amountCents: 1_800_000 }] },
+        jsonHeaders("alpha", bursar),
+      );
+      expect(missing.status).toBe(404);
+    });
+
+    it("reverses an allocation and the money can go elsewhere", async () => {
+      const { school, bursar, kid, invoice } = await billedSeed("alpha");
+      const payment = await makePayment(school, kid, { amountCents: 1_800_000 });
+      const [created] = (await (await post(
+        `/payments/${payment.id}/allocations`,
+        { allocations: [{ invoiceId: invoice.id, amountCents: 1_800_000 }] },
+        jsonHeaders("alpha", bursar),
+      )).json()).allocations;
+
+      const res = await post(
+        `/allocations/${created.id}/reverse`,
+        { reason: "Settled the wrong term" },
+        jsonHeaders("alpha", bursar),
+      );
+
+      expect(res.status).toBe(200);
+      expect((await res.json()).reversalReason).toBe("Settled the wrong term");
+
+      // The money is back in the payment's unallocated pool: allocating it to
+      // a DIFFERENT invoice now succeeds.
+      const termTwo = await makeInvoice(school, kid, { totalCents: 1_800_000, termIndex: 1 });
+      const moved = await post(
+        `/payments/${payment.id}/allocations`,
+        { allocations: [{ invoiceId: termTwo.id, amountCents: 1_800_000 }] },
+        jsonHeaders("alpha", bursar),
+      );
+      expect(moved.status).toBe(201);
+    });
+
+    it("409s a second reversal of the same allocation", async () => {
+      const { school, bursar, kid, invoice } = await billedSeed("alpha");
+      const payment = await makePayment(school, kid, { amountCents: 1_800_000 });
+      const [created] = (await (await post(
+        `/payments/${payment.id}/allocations`,
+        { allocations: [{ invoiceId: invoice.id, amountCents: 1_800_000 }] },
+        jsonHeaders("alpha", bursar),
+      )).json()).allocations;
+
+      await post(
+        `/allocations/${created.id}/reverse`,
+        { reason: "first" },
+        jsonHeaders("alpha", bursar),
+      );
+      const again = await post(
+        `/allocations/${created.id}/reverse`,
+        { reason: "second" },
+        jsonHeaders("alpha", bursar),
+      );
+
+      // The first reason wins; a double-click must not rewrite it.
+      expect(again.status).toBe(409);
     });
   });
 

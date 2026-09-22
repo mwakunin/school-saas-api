@@ -11,6 +11,11 @@ import {
 import { requireMembershipRole } from "@/middlewares/auth";
 
 import {
+  allocationSchema,
+  recordAllocationsSchema,
+  reverseAllocationSchema,
+} from "../fees/fees.schemas";
+import {
   allocateSchema,
   configureMpesaSchema,
   listTransactionsQuerySchema,
@@ -26,6 +31,8 @@ const tags = ["Reconciliation"];
 
 /** Money, so the same audience as fees: bursar and admin, never a teacher. */
 const money = requireMembershipRole("admin", "bursar");
+/** Corrections of record — reversing an allocation — sit with fees' own. */
+const seniorMoney = requireMembershipRole("admin", "bursar");
 /** Handling a school's Safaricom credentials is an administrative act. */
 const adminOnly = requireMembershipRole("admin");
 
@@ -102,6 +109,67 @@ export const allocate = createRoute({
     [HttpStatusCodes.UNPROCESSABLE_ENTITY]: jsonContent(
       createErrorSchema(allocateSchema),
       "Validation error, or the student belongs to another school",
+    ),
+    ...errorResponses,
+  },
+});
+
+export const recordAllocations = createRoute({
+  tags,
+  method: "post",
+  path: "/payments/{id}/allocations",
+  summary: "Apply a payment to one or more invoices",
+  description:
+    "The second act after recording: naming which term(s) the money settles. "
+    + "A payment may be split across several invoices, but it can never "
+    + "over-spend itself, and an invoice cannot be settled beyond its total — "
+    + "both enforced inside the caller's transaction, so the request applies "
+    + "whole or not at all. What remains unallocated stays a credit on the "
+    + "student's account.",
+  middleware: [money],
+  request: {
+    params: IdUUIDParamsSchema,
+    body: jsonContentRequired(recordAllocationsSchema, "The invoices and amounts"),
+  },
+  responses: {
+    [HttpStatusCodes.CREATED]: jsonContent(
+      z.object({ allocations: z.array(allocationSchema) }),
+      "What was allocated, in the order requested",
+    ),
+    [HttpStatusCodes.CONFLICT]: jsonContent(
+      notFoundSchema,
+      "The payment was reversed, or vanished, before the money could be applied",
+    ),
+    [HttpStatusCodes.UNPROCESSABLE_ENTITY]: jsonContent(
+      createErrorSchema(recordAllocationsSchema),
+      "The allocation exceeds the payment or an invoice, or names another "
+      + "child's invoice, or a voided one",
+    ),
+    ...errorResponses,
+  },
+});
+
+export const reverseAllocation = createRoute({
+  tags,
+  method: "post",
+  path: "/allocations/{id}/reverse",
+  summary: "Un-apply one allocation",
+  description:
+    "The money returns to the payment's unallocated balance, ready to be "
+    + "allocated elsewhere — the payment itself is untouched. Nothing is "
+    + "deleted: the reversal carries its reason, so the correction is on the "
+    + "record too.",
+  middleware: [seniorMoney],
+  request: {
+    params: IdUUIDParamsSchema,
+    body: jsonContentRequired(reverseAllocationSchema, "Why"),
+  },
+  responses: {
+    [HttpStatusCodes.OK]: jsonContent(allocationSchema, "The reversed allocation"),
+    [HttpStatusCodes.CONFLICT]: jsonContent(notFoundSchema, "Already reversed"),
+    [HttpStatusCodes.UNPROCESSABLE_ENTITY]: jsonContent(
+      createErrorSchema(reverseAllocationSchema),
+      "Validation error",
     ),
     ...errorResponses,
   },
@@ -223,6 +291,8 @@ export const configureMpesa = createRoute({
 export type ListTransactionsRoute = typeof listTransactions;
 export type GetTransactionRoute = typeof getTransaction;
 export type AllocateRoute = typeof allocate;
+export type RecordAllocationsRoute = typeof recordAllocations;
+export type ReverseAllocationRoute = typeof reverseAllocation;
 export type RejectRoute = typeof reject;
 export type RequeueRoute = typeof requeue;
 export type RunMatcherRoute = typeof runMatcher;

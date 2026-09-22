@@ -19,6 +19,7 @@ router
   .openapi(routes.generate, handlers.generate)
   .openapi(routes.listInvoices, handlers.listInvoices)
   .openapi(routes.getInvoice, handlers.getInvoice)
+  .openapi(routes.listInvoiceAllocations, handlers.listInvoiceAllocations)
   .openapi(routes.addLine, handlers.addLine)
   .openapi(routes.voidInvoice, handlers.voidInvoice)
   .openapi(routes.recordPayment, handlers.recordPayment)

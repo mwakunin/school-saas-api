@@ -2,6 +2,7 @@ import { z } from "@hono/zod-openapi";
 import { createSelectSchema } from "drizzle-zod";
 
 import {
+  allocations,
   feeItems,
   feeStructures,
   invoiceLines,
@@ -15,6 +16,7 @@ const rawFeeItem = createSelectSchema(feeItems);
 const rawInvoice = createSelectSchema(invoices);
 const rawInvoiceLine = createSelectSchema(invoiceLines);
 const rawPayment = createSelectSchema(payments);
+const rawAllocation = createSelectSchema(allocations);
 
 /**
  * Money crosses this boundary as integer cents, in whole shillings.
@@ -158,8 +160,9 @@ export const paymentSchema = toZodV4SchemaTyped(rawPayment);
 export const recordPaymentSchema = toZodV4SchemaTyped(
   z.object({
     studentId: z.uuid(),
-    /** Omit to leave the money as a credit on the student's account. */
-    invoiceId: z.uuid().optional(),
+    // Deliberately no invoiceId: recording banks the money, allocating names
+    // the term — the second act lives on POST /payments/{id}/allocations, so
+    // one receipt can settle several invoices (see lib/allocations.ts).
     // M-Pesa is deliberately absent: those arrive through reconciliation in
     // step 5, never by hand, so that the raw Daraja row is always the source.
     method: z.enum(["cash", "bank", "cheque"]),
@@ -182,6 +185,40 @@ export const listPaymentsQuerySchema = z.object({
   limit: z.coerce.number().int().min(1).max(200).default(50),
   offset: z.coerce.number().int().min(0).default(0),
 });
+
+// --- Allocations ---
+
+export const allocationSchema = toZodV4SchemaTyped(rawAllocation);
+
+export const recordAllocationsSchema = toZodV4SchemaTyped(
+  z.object({
+    allocations: z.array(z.object({
+      invoiceId: z.uuid(),
+      amountCents: wholeShillings(z.number()).positive(),
+    })).min(1),
+  }),
+);
+
+export const reverseAllocationSchema = toZodV4SchemaTyped(
+  z.object({
+    reason: z.string().min(1).max(500),
+  }),
+);
+
+/**
+ * One line of an invoice's settlement history: the allocation itself plus the
+ * payment it came from, so a reader can see WHAT settled the bill and HOW the
+ * money arrived without a second request.
+ */
+export const invoiceSettlementSchema = toZodV4SchemaTyped(
+  rawAllocation.extend({
+    method: rawPayment.shape.method,
+    reference: rawPayment.shape.reference,
+    receivedAt: rawPayment.shape.receivedAt,
+    /** The payment's own reversal — an allocation from it settles nothing. */
+    paymentReversedAt: rawPayment.shape.reversedAt,
+  }),
+);
 
 // --- Balances ---
 
