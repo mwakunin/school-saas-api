@@ -239,12 +239,12 @@ export async function recordAllocations(
 
   return db
     .insert(allocations)
-    .values(input.entries.map(entry => ({
+    .values(Array.from(requestedByInvoice.entries()).map(([invoiceId, amountCents]) => ({
       schoolId: input.schoolId,
       studentId: payment.studentId,
       paymentId: input.paymentId,
-      invoiceId: entry.invoiceId,
-      amountCents: entry.amountCents,
+      invoiceId,
+      amountCents,
       allocatedBy: input.allocatedBy,
     })))
     .returning();

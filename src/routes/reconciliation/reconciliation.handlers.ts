@@ -393,29 +393,38 @@ export const reverseAllocation: TenantRouteHandler<ReverseAllocationRoute> = asy
     );
   }
 
-  const updated = await db.transaction(async (tx) => {
-    const row = await unallocatePayment(tx, { allocationId: id, reason });
+  let updated;
+  try {
+    updated = await db.transaction(async (tx) => {
+      const row = await unallocatePayment(tx, { allocationId: id, reason });
 
-    if (!row)
-      return null;
+      if (!row)
+        return null;
 
-    await recordAudit(tx, {
-      schoolId: c.var.school.id,
-      actorId: c.var.user!.id,
-      action: "allocation.reversed",
-      entityType: "allocation",
-      entityId: row.id,
-      summary: `Un-allocated ${row.amountCents} cents from an invoice: ${reason}`,
-      detail: {
-        paymentId: row.paymentId,
-        invoiceId: row.invoiceId,
-        studentId: row.studentId,
-        reason,
-      },
+      await recordAudit(tx, {
+        schoolId: c.var.school.id,
+        actorId: c.var.user!.id,
+        action: "allocation.reversed",
+        entityType: "allocation",
+        entityId: row.id,
+        summary: `Un-allocated ${row.amountCents} cents from an invoice: ${reason}`,
+        detail: {
+          paymentId: row.paymentId,
+          invoiceId: row.invoiceId,
+          studentId: row.studentId,
+          reason,
+        },
+      });
+
+      return row;
     });
-
-    return row;
-  });
+  }
+  catch (err) {
+    if (err instanceof AllocationRefusal && err.conflict) {
+      return c.json({ message: err.message }, HttpStatusCodes.CONFLICT);
+    }
+    throw err;
+  }
 
   if (!updated) {
     return c.json(

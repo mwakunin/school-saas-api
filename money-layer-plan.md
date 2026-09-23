@@ -1,6 +1,6 @@
 # Money layer — plan
 
-Status: **proposal, nothing built.** Written 2026-09-10.
+Status: **Phase 1 allocations built, Phases 2 and 3 proposal.** Written 2026-09-10.
 
 Companion to `CLAUDE.md`, which stays the source of truth for conventions. Every
 rule referenced by number below is from its §3.

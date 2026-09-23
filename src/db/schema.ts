@@ -926,8 +926,10 @@ export const allocations = pgTable("allocations", {
     foreignColumns: [invoices.schoolId, invoices.id, invoices.studentId],
     name: "allocations_school_invoice_student_fk",
   }),
-  // Prevent duplicate allocation records for the same payment/invoice combination
-  unique("allocations_payment_invoice_key").on(t.paymentId, t.invoiceId),
+  // Prevent duplicate live allocation records for the same payment/invoice combination
+  uniqueIndex("allocations_live_payment_invoice_key")
+    .on(t.paymentId, t.invoiceId)
+    .where(sql`${t.reversedAt} IS NULL`),
   // "Where did this payment go" and "what settled this invoice" are the two
   // questions this table exists to answer.
   index().on(t.schoolId, t.paymentId),
