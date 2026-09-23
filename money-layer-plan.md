@@ -9,12 +9,11 @@ rule referenced by number below is from its §3.
 
 ## 1. What this is
 
-school-saas can answer _"what does this family owe?"_ It cannot answer
-_"what does this school owe?"_, and it cannot answer _"which term did this
-payment settle?"_
+school-saas can answer _"what does this family owe?"_ and _"which term did this
+payment settle?"_ (via allocations). It cannot yet answer _"what does this school owe?"_
 
-This document is the plan for closing both, in the order that a bursar would
-feel them.
+This document is the plan for closing that, and the history of how the receivables
+side was closed.
 
 It is written against `tourops`, where the same layer already exists in
 production shape — but **the goal is the functionality, not the structure.**
@@ -37,7 +36,9 @@ fee_structures ──► fee_items          templates
                   invoices ──► invoice_lines    the printed document
                      │
 mpesa_transactions ──┼──► payments              the ledger entry
-   (raw, append-only)│
+   (raw, append-only)│         │
+                     │         ▼
+                     │      allocations ───────► invoices
                      ▼
                  lib/balances.ts       sum(invoices) - sum(payments)
 ```
@@ -63,9 +64,11 @@ None of that needs revisiting. What follows builds on it.
 
 ## 3. The three gaps
 
-### Gap 1 — a payment cannot say which invoice it settled
+### Gap 1 — a payment cannot say which invoice it settled (Pre-Phase-1 History)
 
-`payments.invoiceId` is a single nullable uuid, and:
+*(Note: This gap is now closed by the `allocations` table built in Phase 1.)*
+
+`payments.invoiceId` was a single nullable uuid, and:
 
 ```ts
 uniqueIndex("payments_one_live_per_mpesa_transaction")
@@ -76,21 +79,21 @@ uniqueIndex("payments_one_live_per_mpesa_transaction")
 One live payment per M-Pesa confirmation, and one invoice per payment. So a
 confirmation can settle **at most one** invoice.
 
-The code already knows. From `reconciliation.schemas.ts`:
+The code already knew. From `reconciliation.schemas.ts`:
 
 > _Deliberately no `invoiceId`. […] The money lands as a credit on the
 > student's account, which is what a parent paying "school fees" has actually
 > done. Naming a term is a separate act, and guessing the oldest unpaid invoice
 > is wrong every time someone pays next term in advance._
 
-That decision is right, and this gap is the "separate act" it defers. **Phase 1
-is building it, not correcting it.**
+That decision was right, and this gap was the "separate act" it deferred. **Phase 1
+was building it, not correcting it.**
 
-**What is not broken:** the family's total balance. A credit-on-account payment
-has no `invoiceId`, and `lib/balances.ts` sums invoices and payments per
-student, so the arithmetic is correct.
+**What was not broken:** the family's total balance. A credit-on-account payment
+had no `invoiceId`, and `lib/balances.ts` sums invoices and payments per
+student, so the arithmetic was correct.
 
-**What is missing** is everything per-invoice:
+**What was missing** is everything per-invoice:
 
 - _Is Term 2 cleared?_ — unanswerable
 - _How old is this arrear?_ — unanswerable, so no ageing and no dunning by age
@@ -193,11 +196,8 @@ export const allocations = pgTable("allocations", {
 - **Nor its invoice.** Sum of live allocations for an invoice ≤
   `invoices.totalCents`. Over-allocating an invoice is how a school ends up
   reporting a term as over-collected while a family is still in arrears.
-- **`payments.invoiceId` stays, and stays authoritative for nothing.** It
-  becomes legacy. Either backfill it into `allocations` and drop it, or leave
-  it and have exactly one reader — but not both, because two answers to "which
-  invoice did this settle" is the drift `lib/balances.ts` exists to prevent.
-  **Backfilling and dropping is the right call**; a column that means something
+- **`payments.invoiceId` became legacy.** We backfilled it into `allocations` and dropped it.
+  **Backfilling and dropping was the right call**; a column that means something
   historical and nothing current is a trap for the next reader.
 - **Allocation is a separate act from matching**, exactly as
   `reconciliation.schemas.ts` argues. The matcher still lands money as credit.
@@ -395,9 +395,9 @@ already the thing they will pay for. A cost side they did not ask for, arriving
 before they have used the first, is how a product gets described as
 complicated.
 
-**`payments.invoiceId` will get left behind.** Backfilling and dropping it is a
-migration nobody enjoys, and skipping it leaves two sources of truth. Do it in
-the same phase or it will not happen.
+**`payments.invoiceId` getting left behind.** Backfilling and dropping it is a
+migration nobody enjoys, and skipping it leaves two sources of truth. We did it in
+Phase 1 so it didn't happen.
 
 ---
 

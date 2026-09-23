@@ -432,4 +432,26 @@ describe("reverseAllocation", () => {
       .where(eq(allocations.id, allocation.id));
     expect(row.reversalReason).toBe("first");
   });
+
+  it("allows re-allocating a payment to the same invoice after reversal", async () => {
+    const school = await makeSchool({ subdomain: "alpha" });
+    const student = await makeStudent(school, "2026/001");
+    const invoice = await makeInvoice(school, student, { totalCents: 2_000_000 });
+    const payment = await makePayment(school, student, { amountCents: 2_000_000 });
+    const allocation = await makeAllocation(school, payment, invoice, { amountCents: 1_000_000 });
+
+    await inTenant(school.id, tx =>
+      reverseAllocation(tx, { allocationId: allocation.id, reason: "mistake" }));
+
+    const again = await inTenant(school.id, tx =>
+      recordAllocations(tx, {
+        schoolId: school.id,
+        paymentId: payment.id,
+        allocatedBy: null,
+        entries: [{ invoiceId: invoice.id, amountCents: 2_000_000 }],
+      }));
+
+    expect(again).toHaveLength(1);
+    expect(again[0].invoiceId).toBe(invoice.id);
+  });
 });

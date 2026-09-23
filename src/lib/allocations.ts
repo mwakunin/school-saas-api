@@ -157,6 +157,22 @@ export async function recordAllocations(
     );
   }
 
+  const existingAllocations = await db
+    .select({ invoiceId: allocations.invoiceId })
+    .from(allocations)
+    .where(and(
+      eq(allocations.paymentId, input.paymentId),
+      inArray(allocations.invoiceId, invoiceIds),
+      isNull(allocations.reversedAt),
+    ));
+
+  if (existingAllocations.length > 0) {
+    throw new AllocationRefusal(
+      "An allocation for one of these invoices already exists on this payment. Reverse it to record the combined amount.",
+      "invoiceId",
+    );
+  }
+
   /*
    * Id order is lock order. Two bursars allocating different payments to the
    * same two invoices would otherwise lock them in opposite orders and each
