@@ -1,0 +1,1 @@
+ALTER TABLE "allocations" ADD CONSTRAINT "allocations_payment_invoice_key" UNIQUE("payment_id","invoice_id");
