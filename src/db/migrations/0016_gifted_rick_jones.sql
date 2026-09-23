@@ -1,0 +1,1 @@
+CREATE UNIQUE INDEX "allocations_live_payment_invoice_key" ON "allocations" USING btree ("payment_id","invoice_id") WHERE "reversed_at" IS NULL;

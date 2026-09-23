@@ -1,8 +1,8 @@
-import { and, inArray, isNull, sql } from "drizzle-orm";
+import { and, eq, inArray, isNull, sql } from "drizzle-orm";
 
 import type { AppDb } from "@/db";
 
-import { invoices, payments } from "@/db/schema";
+import { allocations, invoices, payments } from "@/db/schema";
 
 /**
  * What a family owes. The single definition of it.
@@ -134,7 +134,7 @@ export async function balanceFor(
 export interface InvoiceBalance {
   invoiceId: string;
   totalCents: number;
-  /** Only payments allocated to this invoice; a credit on account is excluded. */
+  /** Only live allocations to this invoice; a credit on account is excluded. */
   paidCents: number;
   outstandingCents: number;
 }
@@ -142,10 +142,12 @@ export interface InvoiceBalance {
 /**
  * Per-invoice settlement, which is a different question from what a family owes.
  *
- * A payment with a null `invoiceId` is a credit on account: real money, but not
- * yet attributed to a term. It counts towards the student's balance and NOT
+ * An unallocated payment is a credit on account: real money, but not yet
+ * attributed to a term. It counts towards the student's balance and NOT
  * towards any individual invoice — so these two figures can legitimately
- * disagree, and a screen showing both should say which is which.
+ * disagree, and a screen showing both should say which is which. An
+ * allocation is what turns credit into settlement, and reversing it turns it
+ * back.
  */
 export async function invoiceBalancesFor(
   db: AppDb,
@@ -165,18 +167,24 @@ export async function invoiceBalancesFor(
 
   const allocated = await db
     .select({
-      invoiceId: payments.invoiceId,
-      total: sql<string>`coalesce(sum(${payments.amountCents}), 0)`,
+      invoiceId: allocations.invoiceId,
+      total: sql<string>`coalesce(sum(${allocations.amountCents}), 0)`,
     })
-    .from(payments)
+    .from(allocations)
+    .innerJoin(payments, and(
+      eq(allocations.paymentId, payments.id),
+      eq(allocations.schoolId, payments.schoolId),
+    ))
     .where(and(
-      inArray(payments.invoiceId, invoiceIds),
+      inArray(allocations.invoiceId, invoiceIds),
+      // An allocation is live only while BOTH it and its payment stand.
+      isNull(allocations.reversedAt),
       isNull(payments.reversedAt),
     ))
-    .groupBy(payments.invoiceId);
+    .groupBy(allocations.invoiceId);
 
   const paidByInvoice = new Map(
-    allocated.map(r => [r.invoiceId!, Number(r.total)]),
+    allocated.map(r => [r.invoiceId, Number(r.total)]),
   );
 
   return new Map(rows.map((row) => {

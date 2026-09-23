@@ -19,6 +19,7 @@ import {
   generateInvoicesResultSchema,
   generateInvoicesSchema,
   invoiceSchema,
+  invoiceSettlementSchema,
   listFeeStructuresQuerySchema,
   listInvoicesQuerySchema,
   listPaymentsQuerySchema,
@@ -206,6 +207,27 @@ export const getInvoice = createRoute({
   request: { params: IdUUIDParamsSchema },
   responses: {
     [HttpStatusCodes.OK]: jsonContent(invoiceSchema, "The invoice and its lines"),
+    ...errorResponses,
+  },
+});
+
+export const listInvoiceAllocations = createRoute({
+  tags,
+  method: "get",
+  path: "/invoices/{id}/allocations",
+  summary: "How an invoice was settled",
+  description:
+    "The payments applied to this invoice, oldest first — the audit trail of "
+    + "who paid what towards it, including allocations that were later "
+    + "reversed. An allocation from a reversed payment still appears, with "
+    + "`paymentReversedAt` set: it settled nothing, and the history says so.",
+  middleware: [money],
+  request: { params: IdUUIDParamsSchema },
+  responses: {
+    [HttpStatusCodes.OK]: jsonContent(
+      z.object({ allocations: z.array(invoiceSettlementSchema) }),
+      "Settlements, oldest first",
+    ),
     ...errorResponses,
   },
 });
@@ -400,6 +422,7 @@ export type RemoveItemRoute = typeof removeItem;
 export type GenerateRoute = typeof generate;
 export type ListInvoicesRoute = typeof listInvoices;
 export type GetInvoiceRoute = typeof getInvoice;
+export type ListInvoiceAllocationsRoute = typeof listInvoiceAllocations;
 export type AddLineRoute = typeof addLine;
 export type VoidInvoiceRoute = typeof voidInvoice;
 export type RecordPaymentRoute = typeof recordPayment;

@@ -2,9 +2,10 @@ import { eq, sql } from "drizzle-orm";
 import { beforeEach, describe, expect, it } from "vitest";
 
 import db, { appDb } from "@/db";
-import { invoices, payments } from "@/db/schema";
+import { allocations, invoices, payments } from "@/db/schema";
 import { balanceFor, invoiceBalancesFor, isInCredit } from "@/lib/balances";
 import {
+  makeAllocation,
   makeInvoice,
   makePayment,
   makeSchool,
@@ -166,15 +167,13 @@ describe("balances", () => {
   });
 
   describe("per invoice", () => {
-    it("counts only payments allocated to that invoice", async () => {
+    it("counts only allocations made to that invoice", async () => {
       const school = await makeSchool({ subdomain: "alpha" });
       const student = await makeStudent(school, "2026/001");
       const invoice = await makeInvoice(school, student, { totalCents: 2_500_000 });
 
-      await makePayment(school, student, {
-        amountCents: 1_000_000,
-        invoiceId: invoice.id,
-      });
+      const payment = await makePayment(school, student, { amountCents: 1_000_000 });
+      await makeAllocation(school, payment, invoice, { amountCents: 1_000_000 });
       // A credit on account: real money, not attributed to a term.
       await makePayment(school, student, { amountCents: 400_000 });
 
@@ -195,14 +194,61 @@ describe("balances", () => {
       expect(studentBalance.balanceCents).toBe(1_100_000);
     });
 
+    it("stops counting an allocation that was reversed", async () => {
+      const school = await makeSchool({ subdomain: "alpha" });
+      const student = await makeStudent(school, "2026/001");
+      const invoice = await makeInvoice(school, student, { totalCents: 2_500_000 });
+
+      const payment = await makePayment(school, student, { amountCents: 1_000_000 });
+      const allocation = await makeAllocation(school, payment, invoice, { amountCents: 1_000_000 });
+      await db
+        .update(allocations)
+        .set({ reversedAt: new Date(), reversalReason: "test" })
+        .where(eq(allocations.id, allocation.id));
+
+      const perInvoice = await inTenant(school.id, db =>
+        invoiceBalancesFor(db, [invoice.id]));
+
+      // Un-allocating returns the money to the credit pool — it still counts
+      // towards the student's balance, but no longer settles this invoice.
+      expect(perInvoice.get(invoice.id)).toMatchObject({
+        totalCents: 2_500_000,
+        paidCents: 0,
+        outstandingCents: 2_500_000,
+      });
+    });
+
+    it("stops counting allocations whose payment was reversed", async () => {
+      const school = await makeSchool({ subdomain: "alpha" });
+      const student = await makeStudent(school, "2026/001");
+      const invoice = await makeInvoice(school, student, { totalCents: 2_500_000 });
+
+      const payment = await makePayment(school, student, { amountCents: 1_000_000 });
+      await makeAllocation(school, payment, invoice, { amountCents: 1_000_000 });
+      await reversePayment(payment.id);
+
+      const perInvoice = await inTenant(school.id, db =>
+        invoiceBalancesFor(db, [invoice.id]));
+
+      /*
+       * The liveness rule has two halves: the allocation must stand AND its
+       * payment must stand. Reversing the payment invalidates the allocation
+       * without touching it — no dual-write to keep in step — and the invoice
+       * is outstanding again, which is correct: the money is gone.
+       */
+      expect(perInvoice.get(invoice.id)).toMatchObject({
+        totalCents: 2_500_000,
+        paidCents: 0,
+        outstandingCents: 2_500_000,
+      });
+    });
+
     it("owes nothing on a voided invoice that was already paid", async () => {
       const school = await makeSchool({ subdomain: "alpha" });
       const student = await makeStudent(school, "2026/001");
       const invoice = await makeInvoice(school, student, { totalCents: 2_500_000 });
-      await makePayment(school, student, {
-        amountCents: 1_000_000,
-        invoiceId: invoice.id,
-      });
+      const payment = await makePayment(school, student, { amountCents: 1_000_000 });
+      await makeAllocation(school, payment, invoice, { amountCents: 1_000_000 });
 
       await voidInvoice(invoice.id);
 
