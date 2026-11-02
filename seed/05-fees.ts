@@ -268,13 +268,18 @@ export async function seedFees(
       if (amountCents <= 0)
         continue;
 
-      await bursar.post("/payments", {
+      // Record first, allocate second — the two acts are separate endpoints
+      // now, and the seed exercises both the way a bursar would.
+      const payment = await bursar.post("/payments", {
         studentId: pupil.id,
-        invoiceId: invoice.id,
         method: rng.chance(0.7) ? "bank" : "cash",
         amountCents,
         reference: `SLIP${rng.int(100_000, 999_999)}`,
         receivedAt: instant(offsets.startsOn + rng.int(3, 40)).toISOString(),
+      });
+
+      await bursar.post(`/payments/${payment.id}/allocations`, {
+        allocations: [{ invoiceId: invoice.id, amountCents }],
       });
       paymentsRecorded += 1;
 

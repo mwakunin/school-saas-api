@@ -8,6 +8,7 @@ import app from "@/app";
 import db, { pool } from "@/db";
 import {
   academicYears,
+  allocations,
   enrollments,
   gradeLevels,
   invoiceLines,
@@ -448,12 +449,15 @@ export async function makeInvoice(
   return invoice;
 }
 
+/**
+ * A payment is only a receipt — it lands as a credit on the student's account
+ * and settles nothing by itself. Naming an invoice is `makeAllocation`.
+ */
 export async function makePayment(
   school: SeededSchool,
   student: { id: string },
   options: {
     amountCents: number;
-    invoiceId?: string;
     method?: "mpesa" | "bank" | "cash" | "cheque";
     receivedAt?: Date;
   },
@@ -463,7 +467,6 @@ export async function makePayment(
     .values({
       schoolId: school.id,
       studentId: student.id,
-      invoiceId: options.invoiceId,
       method: options.method ?? "cash",
       amountCents: options.amountCents,
       receivedAt: options.receivedAt ?? new Date(),
@@ -471,4 +474,33 @@ export async function makePayment(
     .returning();
 
   return payment;
+}
+
+/**
+ * Applies part or all of a payment to an invoice, straight on the owner
+ * connection — test setup, bypassing the service's invariant checks, so a
+ * test can build any state it needs (including over-payments) and assert on
+ * the reading side.
+ */
+export async function makeAllocation(
+  school: SeededSchool,
+  payment: { id: string; studentId: string; amountCents?: number },
+  invoice: { id: string },
+  options: { amountCents?: number; reversedAt?: Date } = {},
+) {
+  const [allocation] = await db
+    .insert(allocations)
+    .values({
+      schoolId: school.id,
+      studentId: payment.studentId,
+      paymentId: payment.id,
+      invoiceId: invoice.id,
+      amountCents: options.amountCents ?? payment.amountCents ?? 0,
+      reversedAt: options.reversedAt ?? null,
+      // The CHECK pairs the two — a reversal carries its reason.
+      reversalReason: options.reversedAt ? "test" : null,
+    })
+    .returning();
+
+  return allocation;
 }

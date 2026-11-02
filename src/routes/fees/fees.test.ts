@@ -483,13 +483,10 @@ describe("fees", () => {
       const { bursar, blue, kids } = await billedAcrossTwoClasses("alpha");
 
       // Part-pay one child, so the two views have something to disagree about.
-      const [invoice] = await db
-        .select()
-        .from(invoices)
-        .where(eq(invoices.studentId, kids[0].id));
+      // The payment lands as a credit on the account, which is the same
+      // balance arithmetic either way.
       await post("/payments", {
         studentId: kids[0].id,
-        invoiceId: invoice.id,
         method: "cash",
         amountCents: 500_000,
       }, jsonHeaders("alpha", bursar));
@@ -521,13 +518,8 @@ describe("fees", () => {
       const { bursar, blue, kids } = await billedAcrossTwoClasses("alpha");
 
       // One family massively overpays.
-      const [invoice] = await db
-        .select()
-        .from(invoices)
-        .where(eq(invoices.studentId, kids[0].id));
       await post("/payments", {
         studentId: kids[0].id,
-        invoiceId: invoice.id,
         method: "bank",
         amountCents: 9_000_000,
       }, jsonHeaders("alpha", bursar));
@@ -687,11 +679,10 @@ describe("fees", () => {
     }
 
     it("records a cash receipt and moves the balance", async () => {
-      const { bursar, kids, invoice } = await billed("alpha");
+      const { bursar, kids } = await billed("alpha");
 
       const res = await post("/payments", {
         studentId: kids[0].id,
-        invoiceId: invoice.id,
         method: "cash",
         amountCents: 500_000,
         reference: "RCPT-0001",
@@ -752,11 +743,10 @@ describe("fees", () => {
     });
 
     it("reverses a payment and restores the debt", async () => {
-      const { bursar, kids, invoice } = await billed("alpha");
+      const { bursar, kids } = await billed("alpha");
 
       const payment = await (await post("/payments", {
         studentId: kids[0].id,
-        invoiceId: invoice.id,
         method: "cheque",
         amountCents: 1_800_000,
       }, jsonHeaders("alpha", bursar))).json();
@@ -779,12 +769,11 @@ describe("fees", () => {
     });
 
     it("does not net families in credit against families who owe", async () => {
-      const { bursar, kids, invoice } = await billed("alpha");
+      const { bursar, kids } = await billed("alpha");
 
       // One family overpays substantially.
       await post("/payments", {
         studentId: kids[0].id,
-        invoiceId: invoice.id,
         method: "bank",
         amountCents: 5_000_000,
       }, jsonHeaders("alpha", bursar));
@@ -800,11 +789,10 @@ describe("fees", () => {
     });
 
     it("filters to families who owe", async () => {
-      const { bursar, kids, invoice } = await billed("alpha");
+      const { bursar, kids } = await billed("alpha");
 
       await post("/payments", {
         studentId: kids[0].id,
-        invoiceId: invoice.id,
         method: "cash",
         amountCents: 1_800_000,
       }, jsonHeaders("alpha", bursar));
@@ -861,16 +849,18 @@ describe("fees", () => {
         issuedOn: "2026-01-06",
       }, jsonHeaders("alpha", bursar));
 
-      // Settle one of the three in full.
+      // Settle one of the three in full: record, then name the invoice.
       const [settled] = await db
         .select()
         .from(invoices)
         .where(eq(invoices.studentId, kids[0].id));
-      await post("/payments", {
+      const payment = await (await post("/payments", {
         studentId: kids[0].id,
-        invoiceId: settled.id,
         method: "cash",
         amountCents: 1_800_000,
+      }, jsonHeaders("alpha", bursar))).json();
+      await post(`/payments/${payment.id}/allocations`, {
+        allocations: [{ invoiceId: settled.id, amountCents: 1_800_000 }],
       }, jsonHeaders("alpha", bursar));
 
       const res = await (await app.request("/invoices?outstandingOnly=true", {
@@ -895,26 +885,34 @@ describe("fees", () => {
 
       const [settled, partial, voided] = await db.select().from(invoices);
 
-      await post("/payments", {
+      // Each receipt is recorded first and allocated second — the two acts the
+      // allocation model separates.
+      const settledPayment = await (await post("/payments", {
         studentId: settled.studentId,
-        invoiceId: settled.id,
         method: "cash",
         amountCents: 1_800_000,
+      }, jsonHeaders("alpha", bursar))).json();
+      await post(`/payments/${settledPayment.id}/allocations`, {
+        allocations: [{ invoiceId: settled.id, amountCents: 1_800_000 }],
       }, jsonHeaders("alpha", bursar));
 
-      await post("/payments", {
+      const partialPayment = await (await post("/payments", {
         studentId: partial.studentId,
-        invoiceId: partial.id,
         method: "cash",
         amountCents: 800_000,
+      }, jsonHeaders("alpha", bursar))).json();
+      await post(`/payments/${partialPayment.id}/allocations`, {
+        allocations: [{ invoiceId: partial.id, amountCents: 800_000 }],
       }, jsonHeaders("alpha", bursar));
 
       // Paid in full and then voided: outstanding must be zero, not negative.
-      await post("/payments", {
+      const voidedPayment = await (await post("/payments", {
         studentId: voided.studentId,
-        invoiceId: voided.id,
         method: "cash",
         amountCents: 1_800_000,
+      }, jsonHeaders("alpha", bursar))).json();
+      await post(`/payments/${voidedPayment.id}/allocations`, {
+        allocations: [{ invoiceId: voided.id, amountCents: 1_800_000 }],
       }, jsonHeaders("alpha", bursar));
       await post(`/invoices/${voided.id}/void`, { reason: "duplicate" }, jsonHeaders("alpha", bursar));
 

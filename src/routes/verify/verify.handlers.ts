@@ -1,4 +1,4 @@
-import { eq } from "drizzle-orm";
+import { and, asc, eq, isNull } from "drizzle-orm";
 import * as HttpStatusCodes from "stoker/http-status-codes";
 
 import type { AppRouteHandler } from "@/lib/types";
@@ -6,6 +6,7 @@ import type { AppRouteHandler } from "@/lib/types";
 import db from "@/db";
 import {
   academicYears,
+  allocations,
   invoices,
   payments,
   reportCards,
@@ -97,6 +98,38 @@ async function termFor(termId: string) {
   return row ?? null;
 }
 
+/**
+ * The term a receipt settled, if it settled one.
+ *
+ * A payment no longer names an invoice — it is allocated afterwards, possibly
+ * across several invoices in several terms. The receipt names the FIRST term
+ * its live allocations touch, which is the one the paper receipt is about;
+ * a payment split across terms shows the one it was taken for. A credit on
+ * account settles nothing yet, and a reversed payment settles nothing any
+ * more — both answer null, and the receipt simply shows no term.
+ */
+async function settledTermFor(payment: typeof payments.$inferSelect) {
+  if (payment.reversedAt)
+    return null;
+
+  const [row] = await db
+    .select({ termId: invoices.termId })
+    .from(allocations)
+    .innerJoin(invoices, and(
+      eq(allocations.invoiceId, invoices.id),
+      eq(allocations.schoolId, invoices.schoolId),
+    ))
+    .where(and(
+      eq(allocations.paymentId, payment.id),
+      eq(allocations.schoolId, payment.schoolId),
+      isNull(allocations.reversedAt),
+    ))
+    .orderBy(asc(allocations.allocatedAt))
+    .limit(1);
+
+  return row ? await termFor(row.termId) : null;
+}
+
 export const verifyDocument: AppRouteHandler<VerifyDocumentRoute> = async (c) => {
   const { code } = c.req.valid("param");
 
@@ -167,12 +200,10 @@ export const verifyDocument: AppRouteHandler<VerifyDocumentRoute> = async (c) =>
       givenName: students.givenName,
       familyName: students.familyName,
       admissionNumber: students.admissionNumber,
-      termId: invoices.termId,
     })
     .from(payments)
     .innerJoin(students, eq(payments.studentId, students.id))
     .innerJoin(schools, eq(payments.schoolId, schools.id))
-    .leftJoin(invoices, eq(payments.invoiceId, invoices.id))
     .where(eq(payments.verificationCode, code))
     .limit(1);
 
@@ -186,7 +217,7 @@ export const verifyDocument: AppRouteHandler<VerifyDocumentRoute> = async (c) =>
      * spelling should show as corrected, and the admission number on the paper
      * is what actually identifies the account.
      */
-    const term = receipt.termId ? await termFor(receipt.termId) : null;
+    const term = await settledTermFor(receipt.payment);
     const reversed = receipt.payment.reversedAt !== null;
 
     return c.json({

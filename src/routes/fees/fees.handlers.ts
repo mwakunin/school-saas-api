@@ -1,4 +1,4 @@
-import { and, asc, count, desc, eq, inArray, isNotNull, isNull, sql } from "drizzle-orm";
+import { and, asc, count, desc, eq, inArray, isNull, sql } from "drizzle-orm";
 import * as HttpStatusCodes from "stoker/http-status-codes";
 import * as HttpStatusPhrases from "stoker/http-status-phrases";
 
@@ -6,6 +6,7 @@ import type { AppDb } from "@/db";
 import type { TenantRouteHandler } from "@/lib/types";
 
 import {
+  allocations,
   enrollments,
   feeItems,
   feeStructures,
@@ -35,6 +36,7 @@ import type {
   GetInvoiceRoute,
   ListBalancesRoute,
   ListClassBalancesRoute,
+  ListInvoiceAllocationsRoute,
   ListInvoicesRoute,
   ListPaymentsRoute,
   ListStructuresRoute,
@@ -503,20 +505,27 @@ export const listInvoices: TenantRouteHandler<ListInvoicesRoute> = async (c) => 
    * figures but loaded every invoice in the term to do it — a few hundred
    * invoices costing several hundred queries to render fifty.
    *
-   * The subquery below sums the non-reversed payments allocated to each
-   * invoice, so Postgres does the filtering and only the page is expanded.
-   * A voided invoice is excluded outright: it owes nothing by definition, so
-   * it can never be outstanding.
+   * The subquery below sums the live allocations against each invoice, so
+   * Postgres does the filtering and only the page is expanded. A voided
+   * invoice is excluded outright: it owes nothing by definition, so it can
+   * never be outstanding.
    */
   if (query.outstandingOnly) {
     const paidPerInvoice = db
       .select({
-        invoiceId: payments.invoiceId,
-        paid: sql<string>`sum(${payments.amountCents})`.as("paid"),
+        invoiceId: allocations.invoiceId,
+        paid: sql<string>`sum(${allocations.amountCents})`.as("paid"),
       })
-      .from(payments)
-      .where(and(isNull(payments.reversedAt), isNotNull(payments.invoiceId)))
-      .groupBy(payments.invoiceId)
+      .from(allocations)
+      .innerJoin(payments, and(
+        eq(allocations.paymentId, payments.id),
+        eq(allocations.schoolId, payments.schoolId),
+      ))
+      .where(and(
+        isNull(allocations.reversedAt),
+        isNull(payments.reversedAt),
+      ))
+      .groupBy(allocations.invoiceId)
       .as("paid_per_invoice");
 
     const matching = await db
@@ -656,6 +665,57 @@ export const voidInvoice: TenantRouteHandler<VoidInvoiceRoute> = async (c) => {
   return c.json((await invoiceDetail(db, id))!, HttpStatusCodes.OK);
 };
 
+export const listInvoiceAllocations: TenantRouteHandler<ListInvoiceAllocationsRoute> = async (c) => {
+  const { id } = c.req.valid("param");
+  const db = c.var.db;
+
+  const [invoice] = await db
+    .select({ id: invoices.id })
+    .from(invoices)
+    .where(eq(invoices.id, id));
+
+  if (!invoice) {
+    return c.json(
+      { message: HttpStatusPhrases.NOT_FOUND },
+      HttpStatusCodes.NOT_FOUND,
+    );
+  }
+
+  /*
+   * The settlement history is the pair, not the allocation alone: WHAT was
+   * applied is on the allocation, but HOW the money arrived — method,
+   * reference, when — lives on the payment. Reversed payments stay in the
+   * list with `paymentReversedAt` set, because a history that quietly
+   * forgets a reversal is a history a bursar cannot reconcile against.
+   */
+  const rows = await db
+    .select({
+      id: allocations.id,
+      schoolId: allocations.schoolId,
+      studentId: allocations.studentId,
+      paymentId: allocations.paymentId,
+      invoiceId: allocations.invoiceId,
+      amountCents: allocations.amountCents,
+      allocatedBy: allocations.allocatedBy,
+      allocatedAt: allocations.allocatedAt,
+      reversedAt: allocations.reversedAt,
+      reversalReason: allocations.reversalReason,
+      method: payments.method,
+      reference: payments.reference,
+      receivedAt: payments.receivedAt,
+      paymentReversedAt: payments.reversedAt,
+    })
+    .from(allocations)
+    .innerJoin(payments, and(
+      eq(allocations.paymentId, payments.id),
+      eq(allocations.schoolId, payments.schoolId),
+    ))
+    .where(eq(allocations.invoiceId, id))
+    .orderBy(asc(allocations.allocatedAt));
+
+  return c.json({ allocations: rows }, HttpStatusCodes.OK);
+};
+
 // ---------------------------------------------------------------------------
 // Payments
 // ---------------------------------------------------------------------------
@@ -670,7 +730,6 @@ export const recordPayment: TenantRouteHandler<RecordPaymentRoute> = async (c) =
       .values({
         schoolId: c.var.school.id,
         studentId: body.studentId,
-        invoiceId: body.invoiceId,
         method: body.method,
         amountCents: body.amountCents,
         reference: body.reference,
@@ -690,7 +749,7 @@ export const recordPayment: TenantRouteHandler<RecordPaymentRoute> = async (c) =
       entityType: "payment",
       entityId: created.id,
       summary: `Recorded ${body.method} payment of ${body.amountCents} cents`,
-      detail: { studentId: body.studentId, invoiceId: body.invoiceId ?? null },
+      detail: { studentId: body.studentId },
     });
 
     return c.json(created, HttpStatusCodes.CREATED);
@@ -698,7 +757,7 @@ export const recordPayment: TenantRouteHandler<RecordPaymentRoute> = async (c) =
   catch (err) {
     if (isForeignKeyViolation(err)) {
       return c.json(
-        fieldError(["studentId"], "No such student or invoice at this school"),
+        fieldError(["studentId"], "No such student at this school"),
         HttpStatusCodes.UNPROCESSABLE_ENTITY,
       );
     }
@@ -713,8 +772,20 @@ export const listPayments: TenantRouteHandler<ListPaymentsRoute> = async (c) => 
   const filters = [];
   if (query.studentId)
     filters.push(eq(payments.studentId, query.studentId));
-  if (query.invoiceId)
-    filters.push(eq(payments.invoiceId, query.invoiceId));
+  if (query.invoiceId) {
+    // A payment can settle several invoices now, so "which payments touched
+    // this invoice" is a live allocation, not a column on the payment.
+    filters.push(inArray(
+      payments.id,
+      db
+        .select({ id: allocations.paymentId })
+        .from(allocations)
+        .where(and(
+          eq(allocations.invoiceId, query.invoiceId),
+          isNull(allocations.reversedAt),
+        )),
+    ));
+  }
   if (!query.includeReversed)
     filters.push(isNull(payments.reversedAt));
 

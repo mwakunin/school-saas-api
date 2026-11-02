@@ -481,11 +481,11 @@ export const invoiceLines = pgTable('invoice_lines', {
 
 **Optional fee items are not billed in bulk.** Transport and lunch are real charges but only for the families that take them; invoicing every child for a bus they do not ride costs more trust than it collects. They are added per student.
 
-**Rule 5 protects records, not configuration.** `fee_structures` and `fee_items` are templates an invoice is generated *from*, and the invoice carries its own copies — so those two are the only fee tables the runtime role may `DELETE` from. Invoices void; payments reverse; neither deletes.
+**Rule 5 protects records, not configuration.** `fee_structures` and `fee_items` are templates an invoice is generated *from*, and the invoice carries its own copies — so those two are the only fee tables the runtime role may `DELETE` from. Invoices void; payments and allocations reverse; neither deletes.
 
 ### 5.8 Payments and M-Pesa reconciliation
 
-Two tables, and the separation is the entire feature.
+Two tables carry the separation this feature lives on — raw confirmations and ledger payments. A third, `allocations`, names where the money goes.
 
 ```ts
 // raw, append-only. everything Daraja sends. never edited.
@@ -509,11 +509,11 @@ export const mpesaTransactions = pgTable('mpesa_transactions', {
 });
 
 // ledger entry against a student. created when a transaction is matched.
+// banks the money as a credit on the student's account; settles nothing by itself.
 export const payments = pgTable('payments', {
   id: uuid('id').primaryKey().defaultRandom(),
   schoolId: uuid('school_id').notNull(),
   studentId: uuid('student_id').notNull().references(() => students.id),
-  invoiceId: uuid('invoice_id').references(() => invoices.id),  // null = credit on account
   mpesaTransactionId: uuid('mpesa_transaction_id')
     .references(() => mpesaTransactions.id),
   method: text('method')
@@ -524,7 +524,33 @@ export const payments = pgTable('payments', {
   receivedAt: timestamp('received_at').notNull(),
   reversedAt: timestamp('reversed_at'),
   reversalReason: text('reversal_reason'),
-}, (t) => [index().on(t.schoolId, t.studentId)]);
+}, (t) => [
+  index().on(t.schoolId, t.studentId),
+  unique().on(t.schoolId, t.id, t.studentId),  // lets allocations 3-column-FK to it
+]);
+
+// names the invoices a payment settles. a separate act from recording the money.
+export const allocations = pgTable('allocations', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  schoolId: uuid('school_id').notNull(),
+  studentId: uuid('student_id').notNull(),
+  paymentId: uuid('payment_id').notNull(),
+  invoiceId: uuid('invoice_id').notNull(),
+  amountCents: integer('amount_cents').notNull(),
+  allocatedBy: text('allocated_by').references(() => user.id),
+  allocatedAt: timestamp('allocated_at').defaultNow().notNull(),
+  reversedAt: timestamp('reversed_at'),
+  reversalReason: text('reversal_reason'),
+}, (t) => [
+  // both composite FKs carry student_id: payment-for-A → invoice-of-B is
+  // unrepresentable at the FK level, not merely refused in code
+  foreignKey({ columns: [t.schoolId, t.paymentId, t.studentId],
+    foreignColumns: [payments.schoolId, payments.id, payments.studentId] }),
+  foreignKey({ columns: [t.schoolId, t.invoiceId, t.studentId],
+    foreignColumns: [invoices.schoolId, invoices.id, invoices.studentId] }),
+  index().on(t.schoolId, t.paymentId),
+  index().on(t.schoolId, t.invoiceId),
+]);
 ```
 
 Rules:
@@ -538,6 +564,10 @@ Rules:
 - Because the raw row is never mutated, mis-allocation is always reversible and "where did this KES 15,000 go" is always answerable. **A trigger enforces this** — only `status` and `status_reason` may change — because a claim this load-bearing cannot rest on a comment. Reversing an M-Pesa payment returns its confirmation to the queue, which is the other half of that promise; a partial unique index allows exactly one *live* payment per confirmation, so a reversed one releases it without leaving the record.
 - **Credentials are encrypted at rest** with AES-256-GCM (`lib/crypto.ts`), versioned so the algorithm can change without guessing at the old format, and never returned by any endpoint — only whether they are set.
 - Each school uses **its own paybill/till**. Money must never route through our account — licensing problem and an instant trust objection.
+- **Recording a payment and allocating it are two acts, two endpoints.** `POST /payments` banks the money as a credit on the student's account; `POST /payments/{id}/allocations` names the term(s). A payment may split across several invoices, and a parent paying next term in advance is normal — the old single nullable `invoice_id` made both unrepresentable and forced the matcher to guess a term (it guessed wrong every time someone did).
+- **The two invariants no CHECK constraint can express** — Σ live allocations ≤ the payment's amount, and ≤ the invoice's total — are enforced in `lib/allocations.ts`, the only writer, inside the caller's transaction under row locks (the payment first, then the invoices ordered by id, so two writers can't deadlock). A refusal that resubmitting can fix is a 422 field error; one that can't (reversed payment, lost race) is a 409.
+- **Liveness is derived, never stored**: an allocation counts toward balances and capacity only while both it and its payment stand (`reversed_at IS NULL` on each). Reversing a payment therefore frees its invoice's capacity without touching the allocation — no dual-write to drift.
+- **Un-allocating is `POST /allocations/{id}/reverse`** (nothing hard-deletes; rule 5), and `GET /invoices/{id}/allocations` lists an invoice's settlements with each payment's method and liveness.
 
 ---
 
@@ -552,7 +582,7 @@ learning_areas, competencies
 assessments, assessment_scores, score_attachments
 term_results, report_cards, transition_certificates
 fee_structures, fee_items, invoices, invoice_lines
-mpesa_transactions, payments
+mpesa_transactions, payments, allocations
 sms_messages, audit_log
 ```
 

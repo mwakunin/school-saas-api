@@ -182,6 +182,8 @@ jobs:
             -e RESEND_API_KEY=x -e RESEND_FROM_EMAIL=noreply@example.test \
             -e IMAGEKIT_PUBLIC_KEY=x -e IMAGEKIT_PRIVATE_KEY=x \
             -e IMAGEKIT_URL_ENDPOINT=https://ik.example.test \
+            -e CREDENTIALS_ENCRYPTION_KEY=Y2ktb25seS1ub3QtYS1yZWFsLWtleS0zMi1ieXRlcyE= \
+            -e MPESA_C2B_BASE_URL=https://api.example.test \
             school-api:ci
           for i in $(seq 1 20); do
             if curl -fsS http://localhost:9999/ >/dev/null 2>&1; then

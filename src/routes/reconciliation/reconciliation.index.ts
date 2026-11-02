@@ -15,6 +15,8 @@ router
   .openapi(routes.listTransactions, handlers.listTransactions)
   .openapi(routes.getTransaction, handlers.getTransaction)
   .openapi(routes.allocate, handlers.allocate)
+  .openapi(routes.recordAllocations, handlers.recordAllocations)
+  .openapi(routes.reverseAllocation, handlers.reverseAllocation)
   .openapi(routes.reject, handlers.reject)
   .openapi(routes.requeue, handlers.requeue)
   .openapi(routes.getMpesaSettings, handlers.getMpesaSettings)

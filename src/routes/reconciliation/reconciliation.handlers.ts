@@ -5,7 +5,13 @@ import * as HttpStatusPhrases from "stoker/http-status-phrases";
 import type { AppDb } from "@/db";
 import type { TenantRouteHandler } from "@/lib/types";
 
-import { mpesaTransactions, schools, students } from "@/db/schema";
+import { allocations, mpesaTransactions, payments, schools, students } from "@/db/schema";
+import {
+  // Aliased: the route handlers below carry the resource's own names.
+  recordAllocations as allocatePayment,
+  AllocationRefusal,
+  reverseAllocation as unallocatePayment,
+} from "@/lib/allocations";
 import { recordAudit } from "@/lib/audit";
 import { balancesFor } from "@/lib/balances";
 import { encryptSecret, generateCallbackToken } from "@/lib/crypto";
@@ -33,8 +39,10 @@ import type {
   GetMpesaSettingsRoute,
   GetTransactionRoute,
   ListTransactionsRoute,
+  RecordAllocationsRoute,
   RejectRoute,
   RequeueRoute,
+  ReverseAllocationRoute,
   RunMatcherRoute,
 } from "./reconciliation.routes";
 
@@ -289,6 +297,141 @@ export const allocate: TenantRouteHandler<AllocateRoute> = async (c) => {
     .select()
     .from(mpesaTransactions)
     .where(eq(mpesaTransactions.id, id));
+
+  return c.json(updated, HttpStatusCodes.OK);
+};
+
+export const recordAllocations: TenantRouteHandler<RecordAllocationsRoute> = async (c) => {
+  const { id } = c.req.valid("param");
+  const body = c.req.valid("json");
+  const db = c.var.db;
+
+  // A clean 404 before the service runs; the service re-checks under the
+  // payment's lock, which is what holds when two bursars race.
+  const [payment] = await db
+    .select({ id: payments.id })
+    .from(payments)
+    .where(eq(payments.id, id));
+
+  if (!payment) {
+    return c.json(
+      { message: HttpStatusPhrases.NOT_FOUND },
+      HttpStatusCodes.NOT_FOUND,
+    );
+  }
+
+  let created: Awaited<ReturnType<typeof allocatePayment>>;
+
+  try {
+    created = await allocatePayment(db, {
+      schoolId: c.var.school.id,
+      paymentId: id,
+      allocatedBy: c.var.user!.id,
+      entries: body.allocations,
+    });
+  }
+  catch (err) {
+    if (err instanceof AllocationRefusal) {
+      // 409 for money that was never there to spend (reversed, vanished);
+      // 422 for a request the payment and invoices cannot absorb.
+      return err.conflict
+        ? c.json({ message: err.message }, HttpStatusCodes.CONFLICT)
+        : c.json(
+            fieldError([err.field], err.message),
+            HttpStatusCodes.UNPROCESSABLE_ENTITY,
+          );
+    }
+    throw err;
+  }
+
+  /*
+   * One entry per allocation, mirroring the payment reversal's audit: "which
+   * receipt settled this invoice" is exactly the question a parent's
+   * statement has to answer, and the rows alone cannot say who decided.
+   */
+  for (const row of created) {
+    await recordAudit(db, {
+      schoolId: c.var.school.id,
+      actorId: c.var.user!.id,
+      action: "allocation.recorded",
+      entityType: "allocation",
+      entityId: row.id,
+      summary: `Allocated ${row.amountCents} cents of a payment to an invoice`,
+      detail: {
+        paymentId: row.paymentId,
+        invoiceId: row.invoiceId,
+        studentId: row.studentId,
+        amountCents: row.amountCents,
+      },
+    });
+  }
+
+  return c.json({ allocations: created }, HttpStatusCodes.CREATED);
+};
+
+export const reverseAllocation: TenantRouteHandler<ReverseAllocationRoute> = async (c) => {
+  const { id } = c.req.valid("param");
+  const { reason } = c.req.valid("json");
+  const db = c.var.db;
+
+  const [allocation] = await db
+    .select({ reversedAt: allocations.reversedAt })
+    .from(allocations)
+    .where(eq(allocations.id, id));
+
+  if (!allocation) {
+    return c.json(
+      { message: HttpStatusPhrases.NOT_FOUND },
+      HttpStatusCodes.NOT_FOUND,
+    );
+  }
+
+  if (allocation.reversedAt) {
+    return c.json(
+      { message: "This allocation is already reversed" },
+      HttpStatusCodes.CONFLICT,
+    );
+  }
+
+  let updated;
+  try {
+    updated = await db.transaction(async (tx) => {
+      const row = await unallocatePayment(tx, { allocationId: id, reason });
+
+      if (!row)
+        return null;
+
+      await recordAudit(tx, {
+        schoolId: c.var.school.id,
+        actorId: c.var.user!.id,
+        action: "allocation.reversed",
+        entityType: "allocation",
+        entityId: row.id,
+        summary: `Un-allocated ${row.amountCents} cents from an invoice: ${reason}`,
+        detail: {
+          paymentId: row.paymentId,
+          invoiceId: row.invoiceId,
+          studentId: row.studentId,
+          reason,
+        },
+      });
+
+      return row;
+    });
+  }
+  catch (err) {
+    if (err instanceof AllocationRefusal && err.conflict) {
+      return c.json({ message: err.message }, HttpStatusCodes.CONFLICT);
+    }
+    throw err;
+  }
+
+  if (!updated) {
+    return c.json(
+      { message: HttpStatusPhrases.NOT_FOUND },
+      HttpStatusCodes.NOT_FOUND,
+    );
+  }
 
   return c.json(updated, HttpStatusCodes.OK);
 };

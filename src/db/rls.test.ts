@@ -381,40 +381,94 @@ describe("row-level security", () => {
       expect(pgErrorCode(err)).toBe("23503");
     });
 
-    it("refuses a payment naming one child against another child's invoice", async () => {
+    it("refuses an allocation pairing one child's payment with another child's invoice", async () => {
       const alpha = await makeSchool({ subdomain: "alpha" });
       const one = await makeStudent(alpha, "2026/001");
       const two = await makeStudent(alpha, "2026/002");
       const invoice = await makeInvoice(alpha, one, { totalCents: 1_800_000 });
+      const [payment] = await db.execute<{ id: string }>(sql`
+        INSERT INTO payments (school_id, student_id, method, amount_cents, received_at)
+        VALUES (${alpha.id}, ${two.id}, 'cash', 500000, now())
+        RETURNING id
+      `).then(r => r.rows);
 
       /*
        * Both students and the invoice belong to the SAME school, so tenancy is
        * not what is being tested — this is a pair of references that are each
        * individually true and wrong together.
        *
-       * With separate (school_id, student_id) and (school_id, invoice_id)
-       * keys this was accepted: the money then reads as credited to child two
-       * on the ledger and as settling child one's bill on the invoice, with
-       * nothing in the database disagreeing. The reference carries the student
-       * now, so the pair cannot come apart.
+       * An allocation carrying only the payment's student (or only the
+       * invoice's) would be accepted: the money then reads as credited to
+       * child two on the ledger and as settling child one's bill on the
+       * invoice, with nothing in the database disagreeing. Both allocation
+       * foreign keys include student_id, so the row would have to claim the
+       * same child on both sides — and here it cannot.
        */
       const err = await errorFrom(() => appDb.transaction(async (tx) => {
         await tx.execute(sql`SELECT set_config('app.school_id', ${alpha.id}, true)`);
         await tx.execute(sql`
-          INSERT INTO payments (school_id, student_id, invoice_id, method, amount_cents, received_at)
-          VALUES (${alpha.id}, ${two.id}, ${invoice.id}, 'cash', 500000, now())
+          INSERT INTO allocations (school_id, student_id, payment_id, invoice_id, amount_cents)
+          VALUES (${alpha.id}, ${two.id}, ${payment.id}, ${invoice.id}, 500000)
         `);
       }));
 
       expect(pgErrorCode(err)).toBe("23503");
     });
 
-    it("still allows a credit on account, which names no invoice", async () => {
+    it("allows an allocation whose student agrees on both sides", async () => {
+      const alpha = await makeSchool({ subdomain: "alpha" });
+      const student = await makeStudent(alpha, "2026/001");
+      const invoice = await makeInvoice(alpha, student, { totalCents: 1_800_000 });
+      const [payment] = await db.execute<{ id: string }>(sql`
+        INSERT INTO payments (school_id, student_id, method, amount_cents, received_at)
+        VALUES (${alpha.id}, ${student.id}, 'cash', 500000, now())
+        RETURNING id
+      `).then(r => r.rows);
+
+      const rows = await appDb.transaction(async (tx) => {
+        await tx.execute(sql`SELECT set_config('app.school_id', ${alpha.id}, true)`);
+        const r = await tx.execute(sql`
+          INSERT INTO allocations (school_id, student_id, payment_id, invoice_id, amount_cents)
+          VALUES (${alpha.id}, ${student.id}, ${payment.id}, ${invoice.id}, 500000)
+          RETURNING amount_cents
+        `);
+        return r.rows;
+      });
+
+      expect(rows).toHaveLength(1);
+    });
+
+    it("refuses an allocation pointing at another school's invoice", async () => {
+      const alpha = await makeSchool({ subdomain: "alpha" });
+      const beta = await makeSchool({ subdomain: "beta" });
+      const alphaStudent = await makeStudent(alpha, "2026/001");
+      const betaStudent = await makeStudent(beta, "2026/001");
+      const betaInvoice = await makeInvoice(beta, betaStudent, { totalCents: 1_800_000 });
+      const [payment] = await db.execute<{ id: string }>(sql`
+        INSERT INTO payments (school_id, student_id, method, amount_cents, received_at)
+        VALUES (${alpha.id}, ${alphaStudent.id}, 'cash', 500000, now())
+        RETURNING id
+      `).then(r => r.rows);
+
+      // Even with school_id, student_id and payment_id all alpha's, the
+      // invoice side of the composite key lives at beta and is not reachable.
+      const err = await errorFrom(() => appDb.transaction(async (tx) => {
+        await tx.execute(sql`SELECT set_config('app.school_id', ${alpha.id}, true)`);
+        await tx.execute(sql`
+          INSERT INTO allocations (school_id, student_id, payment_id, invoice_id, amount_cents)
+          VALUES (${alpha.id}, ${alphaStudent.id}, ${payment.id}, ${betaInvoice.id}, 500000)
+        `);
+      }));
+
+      expect(pgErrorCode(err)).toBe("23503");
+    });
+
+    it("still records a payment as a credit, which settles nothing by itself", async () => {
       const alpha = await makeSchool({ subdomain: "alpha" });
       const student = await makeStudent(alpha, "2026/001");
 
-      // invoice_id NULL disables the composite key for that row under MATCH
-      // SIMPLE, which is exactly what an unallocated payment needs.
+      // A payment names no invoice any more — it lands on the student's
+      // account and waits for an allocation to say what it settled.
       const rows = await appDb.transaction(async (tx) => {
         await tx.execute(sql`SELECT set_config('app.school_id', ${alpha.id}, true)`);
         const r = await tx.execute(sql`
