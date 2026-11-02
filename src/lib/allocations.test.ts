@@ -242,6 +242,72 @@ describe("recordAllocations", () => {
     expect(created).toHaveLength(1);
   });
 
+  it("folds two lines for one invoice into a single allocation", async () => {
+    const school = await makeSchool({ subdomain: "alpha" });
+    const student = await makeStudent(school, "2026/001");
+    const invoice = await makeInvoice(school, student, { totalCents: 5_000_000 });
+    const payment = await makePayment(school, student, { amountCents: 2_000_000 });
+
+    // A bursar keying "tuition 5,000 + lunch 7,000" against the same term.
+    // Two rows would collide with the one-live-per-pair index; one row of the
+    // sum is what was meant.
+    const created = await inTenant(school.id, tx =>
+      recordAllocations(tx, {
+        schoolId: school.id,
+        paymentId: payment.id,
+        allocatedBy: null,
+        entries: [
+          { invoiceId: invoice.id, amountCents: 500_000 },
+          { invoiceId: invoice.id, amountCents: 700_000 },
+        ],
+      }));
+
+    expect(created).toHaveLength(1);
+    expect(created[0]).toMatchObject({ invoiceId: invoice.id, amountCents: 1_200_000 });
+    expect(await liveAllocatedCents(payment.id)).toBe(1_200_000);
+  });
+
+  it("checks an invoice's capacity against the combined lines, not each one", async () => {
+    const school = await makeSchool({ subdomain: "alpha" });
+    const student = await makeStudent(school, "2026/001");
+    const invoice = await makeInvoice(school, student, { totalCents: 1_000_000 });
+    const payment = await makePayment(school, student, { amountCents: 2_000_000 });
+
+    // Each line fits the invoice on its own; together they over-settle it.
+    await expect(inTenant(school.id, tx =>
+      recordAllocations(tx, {
+        schoolId: school.id,
+        paymentId: payment.id,
+        allocatedBy: null,
+        entries: [
+          { invoiceId: invoice.id, amountCents: 600_000 },
+          { invoiceId: invoice.id, amountCents: 600_000 },
+        ],
+      }))).rejects.toMatchObject({ field: "amountCents", conflict: false });
+
+    expect(await liveAllocatedCents(payment.id)).toBe(0);
+  });
+
+  it("refuses a second live allocation to an invoice this payment already settles", async () => {
+    const school = await makeSchool({ subdomain: "alpha" });
+    const student = await makeStudent(school, "2026/001");
+    const invoice = await makeInvoice(school, student, { totalCents: 5_000_000 });
+    const payment = await makePayment(school, student, { amountCents: 2_000_000 });
+    await makeAllocation(school, payment, invoice, { amountCents: 500_000 });
+
+    // Topping up would leave two live rows for one pair. The bursar reverses
+    // the first and records the combined amount instead.
+    await expect(inTenant(school.id, tx =>
+      recordAllocations(tx, {
+        schoolId: school.id,
+        paymentId: payment.id,
+        allocatedBy: null,
+        entries: [{ invoiceId: invoice.id, amountCents: 500_000 }],
+      }))).rejects.toMatchObject({ field: "invoiceId", conflict: false });
+
+    expect(await liveAllocatedCents(payment.id)).toBe(500_000);
+  });
+
   describe("under concurrency", () => {
     it("makes the second writer of one payment see the first's work", async () => {
       const school = await makeSchool({ subdomain: "alpha" });

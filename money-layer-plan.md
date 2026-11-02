@@ -66,7 +66,7 @@ None of that needs revisiting. What follows builds on it.
 
 ### Gap 1 — a payment cannot say which invoice it settled (Pre-Phase-1 History)
 
-*(Note: This gap is now closed by the `allocations` table built in Phase 1.)*
+_(Note: This gap is now closed by the `allocations` table built in Phase 1.)_
 
 `payments.invoiceId` was a single nullable uuid, and:
 
