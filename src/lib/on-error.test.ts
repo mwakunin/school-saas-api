@@ -2,14 +2,22 @@ import { HTTPException } from "hono/http-exception";
 import { describe, expect, it } from "vitest";
 
 import { createRouter, createTestApp } from "@/lib/create-app";
+import { requestLogMessage } from "@/middlewares/pino-logger";
 
 import { summarizeError } from "./error-summary";
 
 /** What Drizzle's errors look like: the SQL, then every bound value. */
 const QUERY_ERROR = "Failed query: insert into \"guardians\" (\"phone\", \"name\") values ($1, $2)\nparams: +254712345678,Wanjiru Kamau";
 
+/** What the error handler logged, captured from the request's logger. */
+const logged: unknown[] = [];
+
 const router = createRouter();
 router.get("/boom", () => {
+  throw new Error(QUERY_ERROR);
+});
+router.get("/boom-logged", (c) => {
+  c.set("logger", { error: (payload: unknown) => logged.push(payload) } as unknown as typeof c.var.logger);
   throw new Error(QUERY_ERROR);
 });
 router.get("/refused", () => {
@@ -18,6 +26,20 @@ router.get("/refused", () => {
 const app = createTestApp(router);
 
 describe("the error handler", () => {
+  it("logs a summary of the error, never its parameters", async () => {
+    logged.length = 0;
+
+    await app.request("/boom-logged");
+
+    expect(logged).toEqual([{ err: summarizeError(new Error(QUERY_ERROR)) }]);
+    expect(JSON.stringify(logged)).not.toMatch(/\+254712345678|Wanjiru/);
+  });
+
+  it("keeps the request's own log line to a fixed message", () => {
+    expect(requestLogMessage({ error: new Error(QUERY_ERROR) })).toBe("Request failed");
+    expect(requestLogMessage({ error: undefined })).toBe("Request completed");
+  });
+
   it("answers an unhandled error with a fixed message and the request id, never its text", async () => {
     const res = await app.request("/boom");
 

@@ -1,9 +1,8 @@
 import { createRoute, z } from "@hono/zod-openapi";
-import { sql } from "drizzle-orm";
 import * as HttpStatusCodes from "stoker/http-status-codes";
 import { jsonContent } from "stoker/openapi/helpers";
 
-import db from "@/db";
+import { checkConnections } from "@/db";
 import { createRouter } from "@/lib/create-app";
 
 const HealthSchema = z.object({
@@ -20,8 +19,9 @@ const router = createRouter()
       path: "/health",
       summary: "Readiness check",
       description:
-        "Verifies the process is up AND that it can reach the database. Use "
-        + "this for load-balancer / container readiness probes, not `GET /`.",
+        "Verifies the process is up AND that each of its three database "
+        + "connections can run a query. Use this for load-balancer / container "
+        + "readiness probes, not `GET /`.",
       responses: {
         [HttpStatusCodes.OK]: jsonContent(HealthSchema, "Everything is reachable"),
         [HttpStatusCodes.SERVICE_UNAVAILABLE]: jsonContent(
@@ -31,33 +31,23 @@ const router = createRouter()
       },
     }),
     async (c) => {
-      let database: "up" | "down" = "up";
+      /*
+       * Every connection, not just the owner: each signs in as its own role,
+       * and the owner can be up while `school_app` (every school's requests)
+       * or `school_auth` (every sign-in) is not.
+       *
+       * Bounded on both halves, and bounded by Postgres rather than by a
+       * timer here: waiting for a connection is capped by the pool's
+       * `connectionTimeoutMillis`, and running the query by a
+       * transaction-local `statement_timeout` (db/index.ts). A readiness
+       * probe that can hang is worse than one that fails: the load balancer
+       * learns nothing either way, but a hung probe also holds a connection.
+       */
+      const connections = await checkConnections();
+      const database: "up" | "down" = connections.owner && connections.app && connections.auth ? "up" : "down";
 
-      try {
-        /*
-         * Bounded on both halves, and bounded by Postgres rather than by a
-         * timer here.
-         *
-         * Waiting for a connection is capped by the pool's
-         * `connectionTimeoutMillis` (see db/index.ts). Running the query is
-         * capped by a transaction-local `statement_timeout`, so a probe that
-         * outlives its welcome is cancelled server-side instead of being
-         * abandoned client-side while the backend keeps working — which is
-         * what a bare `Promise.race` would do, and why this is not one.
-         *
-         * A readiness probe that can hang is worse than one that fails: the
-         * load balancer learns nothing either way, but a hung probe also holds
-         * a connection while it does so.
-         */
-        await db.transaction(async (tx) => {
-          await tx.execute(sql`SET LOCAL statement_timeout = 2000`);
-          await tx.execute(sql`select 1`);
-        });
-      }
-      catch (err) {
-        database = "down";
-        c.var.logger.error({ err }, "health check: database unreachable");
-      }
+      if (database === "down")
+        c.var.logger.error({ connections }, "health check: a database connection is down");
 
       const body = {
         status: database === "up" ? "ok" as const : "degraded" as const,

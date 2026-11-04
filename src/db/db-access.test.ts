@@ -30,7 +30,6 @@ const OWNER_ALLOWLIST = new Map([
   ["db/index.ts", "defines it"],
   ["db/migrate.ts", "runs migrations, before any tenant exists"],
   ["middlewares/tenant.ts", "resolves subdomain -> school, the one bootstrap read"],
-  ["routes/health.route.ts", "liveness probe; reaches no tenant data"],
   ["routes/superadmin/superadmin.handlers.ts", "the cross-tenant plane by design"],
   [
     "routes/verify/verify.handlers.ts",
@@ -102,9 +101,10 @@ async function sourceFiles(dir: string): Promise<string[]> {
  * The connection module, however it is spelled.
  *
  * Anchored, unlike the pattern this replaced: `@/db/schema` and `@/lib/db-errors`
- * are different modules and must not match.
+ * are different modules and must not match. `index.js` too: bundler
+ * resolution maps it to `index.ts`, so it reaches the same connections.
  */
-const DB_MODULE = /^(?:@\/db|\.\.?\/(?:\.\.\/)*db)(?:\/index)?$/;
+const DB_MODULE = /^(?:@\/db|\.\.?\/(?:\.\.\/)*db)(?:\/index(?:\.js)?)?$/;
 
 /**
  * Every export a namespace-style import reaches.
@@ -366,6 +366,8 @@ describe("database access", () => {
     expect(dbImportsIn(`import { appDb } from "@/db";`)).toContain("appDb");
     expect(dbImportsIn(`import { appPool } from "../db";`)).toContain("appPool");
     expect(dbImportsIn(`import { authDb } from "@/db";`)).toContain("authDb");
+    expect(dbImportsIn(`import { authPool } from "@/db";`)).toContain("authPool");
+    expect(dbImportsIn(`export { authPool } from "@/db";`)).toContain("authPool");
     expect(dbImportsIn(`import { schools } from "@/db/schema";`)).toEqual([]);
   });
 
@@ -374,6 +376,7 @@ describe("database access", () => {
     ["named default rename", `import { default as ownerDb } from "@/db";`],
     ["named default rename via /index", `import { default as x } from "@/db/index";`],
     ["relative /index", `import db from "../db/index";`],
+    ["relative /index.js", `import db from "../db/index.js";`],
     ["no whitespace", `import{default as d}from"@/db";`],
   ])("sees through %s", (_case, source) => {
     expect(dbImportsIn(source)).toContain("default");

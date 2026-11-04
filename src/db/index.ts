@@ -103,4 +103,38 @@ export const authDb = drizzle({
 /** A tenant-scoped handle: the transaction `withTenant` opened, never the pool. */
 export type AppDb = Parameters<Parameters<typeof appDb.transaction>[0]>[0];
 
+/**
+ * Whether every connection can run a query: the readiness probe.
+ *
+ * All three, because each logs in as its own role: the owner can still be up
+ * while `school_app` or `school_auth` cannot sign in, and then no school's
+ * requests, or no sign-in, would work. Each probe is bounded by Postgres
+ * itself (`statement_timeout`) as well as by the pool's connection timeout,
+ * so a probe cannot hang. Ported from healthcare-api.
+ */
+export async function checkConnections(): Promise<{ owner: boolean; app: boolean; auth: boolean }> {
+  async function probe(target: Pool) {
+    const client = await target.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query("SET LOCAL statement_timeout = 2000");
+      await client.query("SELECT 1");
+      await client.query("COMMIT");
+      return true;
+    }
+    catch {
+      await client.query("ROLLBACK").catch(() => {});
+      return false;
+    }
+    finally {
+      client.release();
+    }
+  }
+
+  const [owner, app, auth] = await Promise.all(
+    [pool, appPool, authPool].map(target => probe(target).catch(() => false)),
+  );
+  return { owner, app, auth };
+}
+
 export default db;
