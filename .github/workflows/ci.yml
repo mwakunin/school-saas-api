@@ -137,6 +137,7 @@ jobs:
           NODE_ENV: test
           TEST_DATABASE_URL: postgresql://school:school@localhost:5435/fresh
           TEST_APP_DATABASE_URL: postgresql://school_app:school_app@localhost:5435/fresh
+          TEST_AUTH_DATABASE_URL: postgresql://school_auth:school_auth@localhost:5435/fresh
 
   docker:
     name: docker image builds
@@ -173,6 +174,7 @@ jobs:
           docker run -d --name api-smoke -p 9999:9999 \
             -e DATABASE_URL=postgresql://nobody:nobody@127.0.0.1:1/none \
             -e APP_DATABASE_URL=postgresql://nobody_app:nobody@127.0.0.1:1/none \
+            -e AUTH_DATABASE_URL=postgresql://nobody_auth:nobody@127.0.0.1:1/none \
             -e REDIS_URL=redis://127.0.0.1:6379 \
             -e BETTER_AUTH_SECRET=ci-only-secret-that-is-long-enough-32 \
             -e BETTER_AUTH_URL=https://example.test \

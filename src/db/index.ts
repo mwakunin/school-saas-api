@@ -3,12 +3,13 @@ import { Pool } from "pg";
 
 import env from "@/env";
 
+import * as authSchema from "./auth-schema";
 import { sslConfigFor } from "./connection";
 // schema.ts re-exports the Better-Auth-owned tables, so this is the whole model.
 import * as schema from "./schema";
 
 /**
- * Two connections, deliberately.
+ * Three connections, deliberately.
  *
  * `db` connects as the OWNER of the tables. Postgres exempts a table's owner
  * from row-level security, and exempts a superuser from it outright, so this
@@ -20,7 +21,13 @@ import * as schema from "./schema";
  * `appDb` connects as `school_app` (db/roles.sql): not the owner, not a
  * superuser, and therefore subject to the policies. Every request that acts
  * on behalf of a school goes through it, inside a transaction that has set
- * `app.school_id`. See middlewares/tenant.ts.
+ * `app.school_id`. See middlewares/tenant.ts. Of identity it sees only who a
+ * person is (name, email, phone), never a session or a password.
+ *
+ * `authDb` connects as `school_auth`, for Better Auth alone: the only role
+ * that can read sessions, password hashes and verification tokens, and one
+ * that holds nothing on the tenant tables. Identity is global, so those
+ * tables carry no tenant policies; privileges are what keep them apart.
  *
  * The split is the whole reason RLS is worth having here. With one connection
  * as the owner, the policies would still exist, still be reported by
@@ -78,6 +85,19 @@ export const appDb = drizzle({
   client: appPool,
   casing: "snake_case",
   schema,
+});
+
+export const authPool = surviveIdleFailures(new Pool({
+  connectionString: env.AUTH_DATABASE_URL,
+  ssl: sslConfigFor(env.AUTH_DATABASE_URL),
+  connectionTimeoutMillis: CONNECTION_TIMEOUT_MS,
+}), "auth");
+
+/** Better Auth's adapter, and only it (lib/auth.ts). */
+export const authDb = drizzle({
+  client: authPool,
+  casing: "snake_case",
+  schema: authSchema,
 });
 
 /** A tenant-scoped handle: the transaction `withTenant` opened, never the pool. */

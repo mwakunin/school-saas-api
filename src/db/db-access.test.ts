@@ -29,7 +29,6 @@ const SRC = path.resolve(import.meta.dirname, "..");
 const OWNER_ALLOWLIST = new Map([
   ["db/index.ts", "defines it"],
   ["db/migrate.ts", "runs migrations, before any tenant exists"],
-  ["lib/auth.ts", "identity is global; Better Auth owns those tables"],
   ["middlewares/tenant.ts", "resolves subdomain -> school, the one bootstrap read"],
   ["routes/health.route.ts", "liveness probe; reaches no tenant data"],
   ["routes/superadmin/superadmin.handlers.ts", "the cross-tenant plane by design"],
@@ -57,8 +56,16 @@ const OWNER_ALLOWLIST = new Map([
  */
 const APP_DB_ALLOWLIST = new Map([
   ["db/index.ts", "defines it"],
-  ["lib/auth.ts", "Better Auth's adapter; auth tables carry no policies"],
   ["middlewares/tenant.ts", "opens the tenant transaction"],
+]);
+
+/**
+ * Files permitted to import `authDb` / `authPool`: the one role that can read
+ * sessions, password hashes and verification tokens.
+ */
+const AUTH_DB_ALLOWLIST = new Map([
+  ["db/index.ts", "defines it"],
+  ["lib/auth.ts", "Better Auth's adapter, the only reason the connection exists"],
 ]);
 
 /** A path relative to src/, with forward slashes on every platform. */
@@ -103,14 +110,15 @@ const DB_MODULE = /^(?:@\/db|\.\.?\/(?:\.\.\/)*db)(?:\/index)?$/;
  * Every export a namespace-style import reaches.
  *
  * `import * as m` and `await import(...)` both hand back the whole module, so
- * `m.default` and `m.pool` are equally available. Reported under all four
- * names rather than a new one, so both allowlists judge them exactly as they
- * judge a direct import — and a file doing it has to justify itself on both.
+ * `m.default` and `m.pool` are equally available. Reported under every
+ * connection's name rather than a new one, so each allowlist judges them
+ * exactly as it judges a direct import — and a file doing it has to justify
+ * itself on all of them.
  */
-const ALL_CONNECTIONS = ["default", "pool", "appDb", "appPool"] as const;
+const ALL_CONNECTIONS = ["default", "pool", "appDb", "appPool", "authDb", "authPool"] as const;
 
 /** The named exports that ARE a connection. `AppDb` is a type and reaches none. */
-const CONNECTION_EXPORTS = new Set(["pool", "appDb", "appPool"]);
+const CONNECTION_EXPORTS = new Set(["pool", "appDb", "appPool", "authDb", "authPool"]);
 
 /**
  * Connections a file reaches through `@/db`, classified from the syntax tree.
@@ -320,13 +328,33 @@ describe("database access", () => {
     ).toEqual([]);
   });
 
+  it("keeps the auth connection out of everything but its allowlist", async () => {
+    const files = await sourceFiles(SRC);
+    const offenders: string[] = [];
+
+    for (const file of files) {
+      const rel = relativeToSrc(file);
+      const imports = dbImportsIn(await readFile(file, "utf8"));
+
+      const usesAuthDb = imports.includes("authDb") || imports.includes("authPool");
+      if (usesAuthDb && !AUTH_DB_ALLOWLIST.has(rel))
+        offenders.push(rel);
+    }
+
+    expect(
+      offenders,
+      "These import the auth connection, the one role that can read session "
+      + "tokens and password hashes. Only Better Auth may use it.",
+    ).toEqual([]);
+  });
+
   it("has no stale allowlist entries", async () => {
     // An allowlist that outlives its reason is how the next exception gets
     // waved through: the file is already listed, so nobody re-asks why.
     const files = await sourceFiles(SRC);
     const present = new Set(files.map(relativeToSrc));
 
-    for (const entry of [...OWNER_ALLOWLIST.keys(), ...APP_DB_ALLOWLIST.keys()])
+    for (const entry of [...OWNER_ALLOWLIST.keys(), ...APP_DB_ALLOWLIST.keys(), ...AUTH_DB_ALLOWLIST.keys()])
       expect(present, `${entry} is allowlisted but does not exist`).toContain(entry);
   });
 
@@ -337,6 +365,7 @@ describe("database access", () => {
     expect(dbImportsIn(`import db, { pool } from "@/db";`)).toContain("pool");
     expect(dbImportsIn(`import { appDb } from "@/db";`)).toContain("appDb");
     expect(dbImportsIn(`import { appPool } from "../db";`)).toContain("appPool");
+    expect(dbImportsIn(`import { authDb } from "@/db";`)).toContain("authDb");
     expect(dbImportsIn(`import { schools } from "@/db/schema";`)).toEqual([]);
   });
 

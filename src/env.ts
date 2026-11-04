@@ -68,8 +68,16 @@ const EnvSchema = z.object({
    * quietly pointed both at the owner would look completely healthy.
    */
   APP_DATABASE_URL: z.url(),
+  /**
+   * Better Auth's own connection (`school_auth`, see db/roles.sql): the only
+   * role that can read sessions and password hashes. A third role, so the one
+   * tenant handlers run as cannot reach them. Required to differ from both
+   * connections above.
+   */
+  AUTH_DATABASE_URL: z.url(),
   TEST_DATABASE_URL: z.url().optional(),
   TEST_APP_DATABASE_URL: z.url().optional(),
+  TEST_AUTH_DATABASE_URL: z.url().optional(),
   REDIS_URL: z.url(),
 
   // --- Auth (Better Auth) ---
@@ -296,16 +304,18 @@ const EnvSchema = z.object({
       });
     }
 
-    if (input.NODE_ENV === "test" && !input.TEST_APP_DATABASE_URL) {
-      ctx.addIssue({
-        code: "custom",
-        path: ["TEST_APP_DATABASE_URL"],
-        message: "Must be set when NODE_ENV is 'test'",
-      });
+    for (const key of ["TEST_APP_DATABASE_URL", "TEST_AUTH_DATABASE_URL"] as const) {
+      if (input.NODE_ENV === "test" && !input[key]) {
+        ctx.addIssue({
+          code: "custom",
+          path: [key],
+          message: "Must be set when NODE_ENV is 'test'",
+        });
+      }
     }
 
     /*
-     * The two connections must be different roles.
+     * The three connections must be three different roles.
      *
      * If APP_DATABASE_URL points at the owner, every RLS policy silently stops
      * applying and one school can read another's children's records — with no
@@ -313,9 +323,13 @@ const EnvSchema = z.object({
      * `pg_policies` listing that still looks correct. It is the single
      * highest-consequence misconfiguration in the system, so it fails at boot
      * rather than at the first cross-tenant read.
+     *
+     *   auth = owner  Better Auth could read every tenant table
+     *   auth = app    tenant handlers could read session tokens again
      */
     const owner = parseRole(input.DATABASE_URL);
     const app = parseRole(input.APP_DATABASE_URL);
+    const authRole = parseRole(input.AUTH_DATABASE_URL);
 
     /*
      * A missing username is rejected, not skipped.
@@ -329,6 +343,7 @@ const EnvSchema = z.object({
     for (const [key, role] of [
       ["DATABASE_URL", owner],
       ["APP_DATABASE_URL", app],
+      ["AUTH_DATABASE_URL", authRole],
     ] as const) {
       if (!role) {
         ctx.addIssue({
@@ -337,7 +352,7 @@ const EnvSchema = z.object({
           message:
             "Must name its role explicitly (postgresql://ROLE:password@host/db). "
             + "Without it the connecting role comes from the environment, and "
-            + "the two connections cannot be shown to differ.",
+            + "the connections cannot be shown to differ.",
         });
       }
     }
@@ -352,18 +367,34 @@ const EnvSchema = z.object({
           + `sharing it disables tenant isolation entirely — see db/roles.sql.`,
       });
     }
+
+    for (const [other, role] of [["DATABASE_URL", owner], ["APP_DATABASE_URL", app]] as const) {
+      if (authRole && role && authRole === role) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["AUTH_DATABASE_URL"],
+          message:
+            `Must connect as a different role from ${other} (both are '${role}'). `
+            + "Better Auth's role is the only one that may read sessions and "
+            + "password hashes, and nothing else — see db/roles.sql.",
+        });
+      }
+    }
   })
   .transform(input => ({
     ...input,
-    // Everything downstream reads DATABASE_URL / APP_DATABASE_URL; in test they
-    // resolve to the disposable test database so no caller has to remember the
-    // distinction.
+    // Everything downstream reads DATABASE_URL / APP_DATABASE_URL /
+    // AUTH_DATABASE_URL; in test they resolve to the disposable test database
+    // so no caller has to remember the distinction.
     DATABASE_URL: input.NODE_ENV === "test" && input.TEST_DATABASE_URL
       ? input.TEST_DATABASE_URL
       : input.DATABASE_URL,
     APP_DATABASE_URL: input.NODE_ENV === "test" && input.TEST_APP_DATABASE_URL
       ? input.TEST_APP_DATABASE_URL
       : input.APP_DATABASE_URL,
+    AUTH_DATABASE_URL: input.NODE_ENV === "test" && input.TEST_AUTH_DATABASE_URL
+      ? input.TEST_AUTH_DATABASE_URL
+      : input.AUTH_DATABASE_URL,
   }));
 
 export type env = z.infer<typeof EnvSchema>;
