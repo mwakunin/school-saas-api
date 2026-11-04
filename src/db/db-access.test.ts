@@ -61,6 +61,11 @@ const APP_DB_ALLOWLIST = new Map([
   ["middlewares/tenant.ts", "opens the tenant transaction"],
 ]);
 
+/** A path relative to src/, with forward slashes on every platform. */
+function relativeToSrc(file: string) {
+  return path.relative(SRC, file).split(path.sep).join("/");
+}
+
 async function sourceFiles(dir: string): Promise<string[]> {
   const entries = await readdir(dir, { withFileTypes: true });
   const found: string[] = [];
@@ -77,7 +82,7 @@ async function sourceFiles(dir: string): Promise<string[]> {
       continue;
 
     // Test helpers set up multiple schools on purpose.
-    if (path.relative(SRC, full).startsWith("test/"))
+    if (relativeToSrc(full).startsWith("test/"))
       continue;
 
     found.push(full);
@@ -278,7 +283,7 @@ describe("database access", () => {
     const offenders: string[] = [];
 
     for (const file of files) {
-      const rel = path.relative(SRC, file);
+      const rel = relativeToSrc(file);
       const imports = dbImportsIn(await readFile(file, "utf8"));
 
       const usesOwner = imports.includes("default") || imports.includes("pool");
@@ -299,7 +304,7 @@ describe("database access", () => {
     const offenders: string[] = [];
 
     for (const file of files) {
-      const rel = path.relative(SRC, file);
+      const rel = relativeToSrc(file);
       const imports = dbImportsIn(await readFile(file, "utf8"));
 
       const usesAppDb = imports.includes("appDb") || imports.includes("appPool");
@@ -319,7 +324,7 @@ describe("database access", () => {
     // An allowlist that outlives its reason is how the next exception gets
     // waved through: the file is already listed, so nobody re-asks why.
     const files = await sourceFiles(SRC);
-    const present = new Set(files.map(f => path.relative(SRC, f)));
+    const present = new Set(files.map(relativeToSrc));
 
     for (const entry of [...OWNER_ALLOWLIST.keys(), ...APP_DB_ALLOWLIST.keys()])
       expect(present, `${entry} is allowlisted but does not exist`).toContain(entry);
