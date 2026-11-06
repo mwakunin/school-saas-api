@@ -35,7 +35,7 @@
     "hono-pino": "^0.10.3",
     "ioredis": "^6.0.0",
     "pg": "^8.23.0",
-    "pino": "^9.7.0",
+    "pino": "^10.3.1",
     "pino-pretty": "^13.1.1",
     "qrcode": "^1.5.4",
     "rate-limiter-flexible": "^11.2.0",
