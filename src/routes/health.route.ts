@@ -36,18 +36,17 @@ const router = createRouter()
        * and the owner can be up while `school_app` (every school's requests)
        * or `school_auth` (every sign-in) is not.
        *
-       * Bounded on both halves, and bounded by Postgres rather than by a
-       * timer here: waiting for a connection is capped by the pool's
-       * `connectionTimeoutMillis`, and running the query by a
-       * transaction-local `statement_timeout` (db/index.ts). A readiness
-       * probe that can hang is worse than one that fails: the load balancer
-       * learns nothing either way, but a hung probe also holds a connection.
+       * Each probe has a deadline covering every step, and Postgres caps the
+       * query too (db/index.ts). A readiness probe that can hang is worse
+       * than one that fails: the load balancer learns nothing either way,
+       * but a hung probe also holds a connection.
        */
-      const connections = await checkConnections();
+      const { errors, ...connections } = await checkConnections();
       const database: "up" | "down" = connections.owner && connections.app && connections.auth ? "up" : "down";
 
+      // Each failure with its role: bad credentials, a missing privilege and a network fault read differently.
       if (database === "down")
-        c.var.logger.error({ connections }, "health check: a database connection is down");
+        c.var.logger.error({ connections, errors }, "health check: a database connection is down");
 
       const body = {
         status: database === "up" ? "ok" as const : "degraded" as const,

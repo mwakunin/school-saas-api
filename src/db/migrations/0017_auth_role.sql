@@ -10,6 +10,12 @@
 --
 -- Requires db/roles.sql to have created `school_auth` first; this migration
 -- fails loudly otherwise, which is the right outcome.
+--
+-- Rollout. The API is not live yet, so this lands with the code that signs in
+-- as `school_auth` and no old instance is running. On a live system it would
+-- cut off instances still running the old code, which sign in as
+-- `school_app`, until they were replaced: there it must be split, granting
+-- `school_auth` in one release and revoking from `school_app` in the next.
 
 REVOKE ALL ON "user", "session", "account", "verification" FROM school_app;
 --> statement-breakpoint
