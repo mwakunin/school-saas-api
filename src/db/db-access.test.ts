@@ -29,9 +29,7 @@ const SRC = path.resolve(import.meta.dirname, "..");
 const OWNER_ALLOWLIST = new Map([
   ["db/index.ts", "defines it"],
   ["db/migrate.ts", "runs migrations, before any tenant exists"],
-  ["lib/auth.ts", "identity is global; Better Auth owns those tables"],
   ["middlewares/tenant.ts", "resolves subdomain -> school, the one bootstrap read"],
-  ["routes/health.route.ts", "liveness probe; reaches no tenant data"],
   ["routes/superadmin/superadmin.handlers.ts", "the cross-tenant plane by design"],
   [
     "routes/verify/verify.handlers.ts",
@@ -57,9 +55,22 @@ const OWNER_ALLOWLIST = new Map([
  */
 const APP_DB_ALLOWLIST = new Map([
   ["db/index.ts", "defines it"],
-  ["lib/auth.ts", "Better Auth's adapter; auth tables carry no policies"],
   ["middlewares/tenant.ts", "opens the tenant transaction"],
 ]);
+
+/**
+ * Files permitted to import `authDb` / `authPool`: the one role that can read
+ * sessions, password hashes and verification tokens.
+ */
+const AUTH_DB_ALLOWLIST = new Map([
+  ["db/index.ts", "defines it"],
+  ["lib/auth.ts", "Better Auth's adapter, the only reason the connection exists"],
+]);
+
+/** A path relative to src/, with forward slashes on every platform. */
+function relativeToSrc(file: string) {
+  return path.relative(SRC, file).split(path.sep).join("/");
+}
 
 async function sourceFiles(dir: string): Promise<string[]> {
   const entries = await readdir(dir, { withFileTypes: true });
@@ -77,7 +88,7 @@ async function sourceFiles(dir: string): Promise<string[]> {
       continue;
 
     // Test helpers set up multiple schools on purpose.
-    if (path.relative(SRC, full).startsWith("test/"))
+    if (relativeToSrc(full).startsWith("test/"))
       continue;
 
     found.push(full);
@@ -90,22 +101,24 @@ async function sourceFiles(dir: string): Promise<string[]> {
  * The connection module, however it is spelled.
  *
  * Anchored, unlike the pattern this replaced: `@/db/schema` and `@/lib/db-errors`
- * are different modules and must not match.
+ * are different modules and must not match. `index.js` too: bundler
+ * resolution maps it to `index.ts`, so it reaches the same connections.
  */
-const DB_MODULE = /^(?:@\/db|\.\.?\/(?:\.\.\/)*db)(?:\/index)?$/;
+const DB_MODULE = /^(?:@\/db|\.\.?\/(?:\.\.\/)*db)(?:\/index(?:\.js)?)?$/;
 
 /**
  * Every export a namespace-style import reaches.
  *
  * `import * as m` and `await import(...)` both hand back the whole module, so
- * `m.default` and `m.pool` are equally available. Reported under all four
- * names rather than a new one, so both allowlists judge them exactly as they
- * judge a direct import — and a file doing it has to justify itself on both.
+ * `m.default` and `m.pool` are equally available. Reported under every
+ * connection's name rather than a new one, so each allowlist judges them
+ * exactly as it judges a direct import — and a file doing it has to justify
+ * itself on all of them.
  */
-const ALL_CONNECTIONS = ["default", "pool", "appDb", "appPool"] as const;
+const ALL_CONNECTIONS = ["default", "pool", "appDb", "appPool", "authDb", "authPool"] as const;
 
 /** The named exports that ARE a connection. `AppDb` is a type and reaches none. */
-const CONNECTION_EXPORTS = new Set(["pool", "appDb", "appPool"]);
+const CONNECTION_EXPORTS = new Set(["pool", "appDb", "appPool", "authDb", "authPool"]);
 
 /**
  * Connections a file reaches through `@/db`, classified from the syntax tree.
@@ -278,7 +291,7 @@ describe("database access", () => {
     const offenders: string[] = [];
 
     for (const file of files) {
-      const rel = path.relative(SRC, file);
+      const rel = relativeToSrc(file);
       const imports = dbImportsIn(await readFile(file, "utf8"));
 
       const usesOwner = imports.includes("default") || imports.includes("pool");
@@ -299,7 +312,7 @@ describe("database access", () => {
     const offenders: string[] = [];
 
     for (const file of files) {
-      const rel = path.relative(SRC, file);
+      const rel = relativeToSrc(file);
       const imports = dbImportsIn(await readFile(file, "utf8"));
 
       const usesAppDb = imports.includes("appDb") || imports.includes("appPool");
@@ -315,13 +328,33 @@ describe("database access", () => {
     ).toEqual([]);
   });
 
+  it("keeps the auth connection out of everything but its allowlist", async () => {
+    const files = await sourceFiles(SRC);
+    const offenders: string[] = [];
+
+    for (const file of files) {
+      const rel = relativeToSrc(file);
+      const imports = dbImportsIn(await readFile(file, "utf8"));
+
+      const usesAuthDb = imports.includes("authDb") || imports.includes("authPool");
+      if (usesAuthDb && !AUTH_DB_ALLOWLIST.has(rel))
+        offenders.push(rel);
+    }
+
+    expect(
+      offenders,
+      "These import the auth connection, the one role that can read session "
+      + "tokens and password hashes. Only Better Auth may use it.",
+    ).toEqual([]);
+  });
+
   it("has no stale allowlist entries", async () => {
     // An allowlist that outlives its reason is how the next exception gets
     // waved through: the file is already listed, so nobody re-asks why.
     const files = await sourceFiles(SRC);
-    const present = new Set(files.map(f => path.relative(SRC, f)));
+    const present = new Set(files.map(relativeToSrc));
 
-    for (const entry of [...OWNER_ALLOWLIST.keys(), ...APP_DB_ALLOWLIST.keys()])
+    for (const entry of [...OWNER_ALLOWLIST.keys(), ...APP_DB_ALLOWLIST.keys(), ...AUTH_DB_ALLOWLIST.keys()])
       expect(present, `${entry} is allowlisted but does not exist`).toContain(entry);
   });
 
@@ -332,6 +365,9 @@ describe("database access", () => {
     expect(dbImportsIn(`import db, { pool } from "@/db";`)).toContain("pool");
     expect(dbImportsIn(`import { appDb } from "@/db";`)).toContain("appDb");
     expect(dbImportsIn(`import { appPool } from "../db";`)).toContain("appPool");
+    expect(dbImportsIn(`import { authDb } from "@/db";`)).toContain("authDb");
+    expect(dbImportsIn(`import { authPool } from "@/db";`)).toContain("authPool");
+    expect(dbImportsIn(`export { authPool } from "@/db";`)).toContain("authPool");
     expect(dbImportsIn(`import { schools } from "@/db/schema";`)).toEqual([]);
   });
 
@@ -340,6 +376,7 @@ describe("database access", () => {
     ["named default rename", `import { default as ownerDb } from "@/db";`],
     ["named default rename via /index", `import { default as x } from "@/db/index";`],
     ["relative /index", `import db from "../db/index";`],
+    ["relative /index.js", `import db from "../db/index.js";`],
     ["no whitespace", `import{default as d}from"@/db";`],
   ])("sees through %s", (_case, source) => {
     expect(dbImportsIn(source)).toContain("default");
