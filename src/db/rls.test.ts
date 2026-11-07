@@ -1,10 +1,10 @@
 import { sql } from "drizzle-orm";
 import { beforeEach, describe, expect, it } from "vitest";
 
-import db, { appDb, appPool, pool } from "@/db";
+import db, { appDb, appPool, authPool, pool } from "@/db";
 import { TENANT_TABLES } from "@/db/schema";
 import { pgErrorCode } from "@/lib/db-errors";
-import { makeInvoice, makeSchool, makeStudent, resetDb } from "@/test/helpers";
+import { makeInvoice, makeSchool, makeStudent, nextEmail, resetDb, signUpWithEmail } from "@/test/helpers";
 
 /**
  * Postgres reports an RLS refusal as insufficient_privilege.
@@ -533,6 +533,71 @@ describe("row-level security", () => {
        */
       const after = await appDb.execute(sql`SELECT id FROM schools`);
       expect(after.rows).toEqual([]);
+    });
+  });
+
+  describe("identity, which carries no tenant policy", () => {
+    /*
+     * The auth tables cannot be scoped by school (one person may work at
+     * two), so privileges are what keep them apart: the role tenant handlers
+     * run as must not reach a session token or a password hash, and Better
+     * Auth's role must not reach a school's records. Ported from healthcare-api.
+     */
+    it.each([
+      ["SELECT token FROM session"],
+      ["SELECT password FROM account"],
+      ["SELECT value FROM verification"],
+      ["SELECT role FROM \"user\""],
+    ])("refuses the app role: %s", async (statement) => {
+      await signUpWithEmail(nextEmail());
+
+      const err = await errorFrom(() => appPool.query(statement));
+
+      expect(pgErrorCode(err)).toBe(INSUFFICIENT_PRIVILEGE);
+    });
+
+    it("lets the app role see who a person is, for a staff list or the portal", async () => {
+      const email = nextEmail();
+      const person = await signUpWithEmail(email, "correct-horse-battery", "Achieng Otieno");
+
+      const { rows } = await appPool.query(
+        "SELECT id, name, email, phone_number FROM \"user\" WHERE id = $1",
+        [person.id],
+      );
+
+      expect(rows).toEqual([{ id: person.id, name: "Achieng Otieno", email, phone_number: null }]);
+    });
+
+    it("gives the app role no write on identity at all", async () => {
+      for (const table of ["user", "session", "account", "verification"]) {
+        for (const privilege of ["INSERT", "UPDATE", "DELETE"]) {
+          const { rows } = await appPool.query<{ has: boolean }>(
+            "SELECT has_table_privilege(current_user, $1, $2) AS has",
+            [`"${table}"`, privilege],
+          );
+          expect(rows[0].has, `school_app has ${privilege} on ${table}`).toBe(false);
+        }
+      }
+    });
+
+    it("gives the auth role nothing on any school table", async () => {
+      for (const table of ["schools", ...TENANT_TABLES]) {
+        for (const privilege of ["SELECT", "INSERT", "UPDATE", "DELETE"]) {
+          const { rows } = await authPool.query<{ has: boolean }>(
+            "SELECT has_table_privilege(current_user, $1, $2) AS has",
+            [table, privilege],
+          );
+          expect(rows[0].has, `school_auth has ${privilege} on ${table}`).toBe(false);
+        }
+      }
+    });
+
+    it("connects the auth role as neither superuser nor BYPASSRLS", async () => {
+      const { rows } = await authPool.query<{ usename: string; usesuper: boolean; usebypassrls: boolean }>(
+        "SELECT usename, usesuper, usebypassrls FROM pg_user WHERE usename = current_user",
+      );
+
+      expect(rows[0]).toEqual({ usename: "school_auth", usesuper: false, usebypassrls: false });
     });
   });
 });

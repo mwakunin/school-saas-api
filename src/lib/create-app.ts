@@ -2,7 +2,7 @@ import type { Schema } from "hono";
 
 import { OpenAPIHono } from "@hono/zod-openapi";
 import { requestId } from "hono/request-id";
-import { notFound, onError, serveEmojiFavicon } from "stoker/middlewares";
+import { notFound, serveEmojiFavicon } from "stoker/middlewares";
 import { defaultHook } from "stoker/openapi";
 
 import { withSession } from "@/middlewares/auth";
@@ -12,6 +12,7 @@ import { rateLimits } from "@/middlewares/rate-limit";
 import type { AppBindings, AppOpenAPI, TenantBindings } from "./types";
 
 import { auth } from "./auth";
+import { onError } from "./on-error";
 
 export function createRouter() {
   return new OpenAPIHono<AppBindings>({

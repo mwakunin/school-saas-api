@@ -1,4 +1,15 @@
--- The unprivileged role the application serves traffic as.
+-- The two unprivileged roles the application connects as.
+--
+--   school_app   serves every tenant request. Subject to row-level security.
+--   school_auth  Better Auth's alone: the only role that can read sessions,
+--                password hashes and verification tokens. It holds nothing on
+--                the tenant tables.
+--
+-- Why the auth role is split from the app role: the auth tables cannot carry
+-- tenant policies (identity is global: one person may work at two schools),
+-- so whatever role can read them can read every school's sessions. Keeping
+-- that out of the role tenant handlers run as means a bug in one handler
+-- cannot reach a session token. Ported from healthcare-api.
 --
 -- Why this exists at all: Postgres row-level security does not apply to a
 -- table's OWNER, and is bypassed outright by a SUPERUSER. The local Docker
@@ -20,8 +31,9 @@
 --   CI          an explicit psql step (.github/workflows/ci.yml)
 --   Neon        psql "$ADMIN_URL" -f db/roles.sql
 --
--- The password here is a local-development default. Production must set its
+-- The passwords here are local-development defaults. Production must set its
 -- own out of band:  ALTER ROLE school_app PASSWORD '...';
+--                   ALTER ROLE school_auth PASSWORD '...';
 --
 -- ---------------------------------------------------------------------------
 -- DEPLOYMENT REQUIREMENT for the OTHER connection (DATABASE_URL)
@@ -51,10 +63,16 @@ BEGIN
       LOGIN PASSWORD 'school_app'
       NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS;
   END IF;
+
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'school_auth') THEN
+    CREATE ROLE school_auth
+      LOGIN PASSWORD 'school_auth'
+      NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS;
+  END IF;
 END
 $$;
 
--- Lets the role reach the schema at all. Table privileges are granted by the
+-- Lets the roles reach the schema at all. Table privileges are granted by the
 -- migration that creates the tables, alongside the policies that constrain
 -- them — a grant written here would drift out of step with the schema.
-GRANT USAGE ON SCHEMA public TO school_app;
+GRANT USAGE ON SCHEMA public TO school_app, school_auth;

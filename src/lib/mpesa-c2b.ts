@@ -1,4 +1,5 @@
 import { Buffer } from "node:buffer";
+import { createHash } from "node:crypto";
 
 import env from "@/env";
 
@@ -79,23 +80,49 @@ export function serialiseCredentials(credentials: DarajaCredentials): string {
  * hand school B a token minted for school A — every call then failing, or
  * worse, succeeding against the wrong paybill.
  *
- * Keyed by consumer key, which is what the token is actually minted for. Two
- * schools sharing an aggregator's key legitimately share a token.
+ * Keyed by the whole credential, consumer key and secret together. Keyed by
+ * the consumer key alone, a school that saved another's key with any secret
+ * would be handed that school's cached token, and call Daraja as it without
+ * ever knowing its secret. Two schools sharing an aggregator's full credential
+ * still share a token. The key is a hash, so no secret sits in the clear as a
+ * map key. Ported back from healthcare-api, where review found it.
  */
 const tokenCache = new Map<string, { value: string; expiresAt: number }>();
+/** A token request already on its way, shared by callers that miss the cache together. */
+const inFlight = new Map<string, Promise<string>>();
 
 /** Exposed for tests — cached tokens would otherwise leak between cases. */
 export function resetC2bTokenCache() {
   tokenCache.clear();
+  inFlight.clear();
 }
 
+function cacheKeyOf(credentials: DarajaCredentials): string {
+  return createHash("sha256").update(`${credentials.consumerKey}\0${credentials.consumerSecret}`).digest("base64url");
+}
+
+/**
+ * One request per credential at a time: callers that miss the cache together
+ * share it, rather than each minting a token Daraja may answer by revoking
+ * the last. A failure is not kept, so the next caller asks again.
+ */
 export async function accessTokenFor(
   credentials: DarajaCredentials,
 ): Promise<string> {
-  const cached = tokenCache.get(credentials.consumerKey);
+  const cacheKey = cacheKeyOf(credentials);
+  const cached = tokenCache.get(cacheKey);
   if (cached && Date.now() < cached.expiresAt)
     return cached.value;
 
+  const pending = inFlight.get(cacheKey);
+  if (pending)
+    return pending;
+  const request = mintToken(credentials, cacheKey).finally(() => inFlight.delete(cacheKey));
+  inFlight.set(cacheKey, request);
+  return request;
+}
+
+async function mintToken(credentials: DarajaCredentials, cacheKey: string): Promise<string> {
   const basic = Buffer
     .from(`${credentials.consumerKey}:${credentials.consumerSecret}`)
     .toString("base64");
@@ -121,7 +148,7 @@ export async function accessTokenFor(
     throw new MpesaError("Daraja token response had no access_token", res.status, body);
 
   const ttlSeconds = Number(body.expires_in ?? 3599);
-  tokenCache.set(credentials.consumerKey, {
+  tokenCache.set(cacheKey, {
     value: body.access_token,
     // 60s of headroom so a token cannot expire mid-flight.
     expiresAt: Date.now() + Math.max(ttlSeconds - 60, 0) * 1000,
