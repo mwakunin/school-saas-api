@@ -1,6 +1,36 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { parseC2bConfirmation, parseTransTime } from "./mpesa-c2b";
+import { accessTokenFor, parseC2bConfirmation, parseTransTime, resetC2bTokenCache } from "./mpesa-c2b";
+
+describe("daraja access tokens", () => {
+  beforeEach(() => {
+    resetC2bTokenCache();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("are reused only by a caller holding the same key and secret", async () => {
+    // Daraja mints a token per Basic credential.
+    let minted = 0;
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (_input, init) => {
+      minted += 1;
+      const auth = new Headers(init?.headers).get("authorization") ?? "";
+      return Response.json({ access_token: `token-for-${auth}`, expires_in: "3599" });
+    });
+
+    const first = await accessTokenFor({ consumerKey: "shared-key", consumerSecret: "secret-a" });
+    expect(await accessTokenFor({ consumerKey: "shared-key", consumerSecret: "secret-a" })).toBe(first);
+    expect(minted).toBe(1);
+
+    // Another school's key with a guessed secret is not handed the cached token.
+    const guessed = await accessTokenFor({ consumerKey: "shared-key", consumerSecret: "guessed" });
+
+    expect(minted).toBe(2);
+    expect(guessed).not.toBe(first);
+  });
+});
 
 /**
  * Safaricom's C2B confirmation, as it actually arrives.
