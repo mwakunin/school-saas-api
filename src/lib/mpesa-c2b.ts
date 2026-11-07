@@ -88,16 +88,24 @@ export function serialiseCredentials(credentials: DarajaCredentials): string {
  * map key. Ported back from healthcare-api, where review found it.
  */
 const tokenCache = new Map<string, { value: string; expiresAt: number }>();
+/** A token request already on its way, shared by callers that miss the cache together. */
+const inFlight = new Map<string, Promise<string>>();
 
 /** Exposed for tests — cached tokens would otherwise leak between cases. */
 export function resetC2bTokenCache() {
   tokenCache.clear();
+  inFlight.clear();
 }
 
 function cacheKeyOf(credentials: DarajaCredentials): string {
   return createHash("sha256").update(`${credentials.consumerKey}\0${credentials.consumerSecret}`).digest("base64url");
 }
 
+/**
+ * One request per credential at a time: callers that miss the cache together
+ * share it, rather than each minting a token Daraja may answer by revoking
+ * the last. A failure is not kept, so the next caller asks again.
+ */
 export async function accessTokenFor(
   credentials: DarajaCredentials,
 ): Promise<string> {
@@ -106,6 +114,15 @@ export async function accessTokenFor(
   if (cached && Date.now() < cached.expiresAt)
     return cached.value;
 
+  const pending = inFlight.get(cacheKey);
+  if (pending)
+    return pending;
+  const request = mintToken(credentials, cacheKey).finally(() => inFlight.delete(cacheKey));
+  inFlight.set(cacheKey, request);
+  return request;
+}
+
+async function mintToken(credentials: DarajaCredentials, cacheKey: string): Promise<string> {
   const basic = Buffer
     .from(`${credentials.consumerKey}:${credentials.consumerSecret}`)
     .toString("base64");

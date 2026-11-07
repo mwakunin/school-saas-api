@@ -30,6 +30,33 @@ describe("daraja access tokens", () => {
     expect(minted).toBe(2);
     expect(guessed).not.toBe(first);
   });
+
+  it("are asked for once by callers that miss the cache together", async () => {
+    let minted = 0;
+    vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
+      minted += 1;
+      return Response.json({ access_token: `token-${minted}`, expires_in: "3599" });
+    });
+
+    const credentials = { consumerKey: "busy-key", consumerSecret: "s" };
+    const tokens = await Promise.all([accessTokenFor(credentials), accessTokenFor(credentials), accessTokenFor(credentials)]);
+
+    expect(minted).toBe(1);
+    expect(new Set(tokens).size).toBe(1);
+  });
+
+  it("are asked for again after a failed request, which is never cached", async () => {
+    let attempts = 0;
+    vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
+      attempts += 1;
+      return attempts === 1 ? new Response("down", { status: 503 }) : Response.json({ access_token: "second", expires_in: "3599" });
+    });
+
+    const credentials = { consumerKey: "flaky-key", consumerSecret: "s" };
+    await expect(accessTokenFor(credentials)).rejects.toThrow("Daraja token request failed (503)");
+
+    expect(await accessTokenFor(credentials)).toBe("second");
+  });
 });
 
 /**
